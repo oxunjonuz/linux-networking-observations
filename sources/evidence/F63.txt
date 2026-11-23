@@ -1,0 +1,2295 @@
+===== LETTER_SECTION_F63.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload on a GRO aggregate: the checksum field a rule reads
+ depends on a device bit, and skb_segment_list() ships a rule's write unpaid
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+nft_payload evaluates on whatever skb the hook receives.  With Generic
+Receive Offload that skb is sometimes not the packet the sender wrote: three
+UDP datagrams that share a 5-tuple become ONE skb before ip6_rcv, and the
+first datagram's payload is the only part of it that is linear data — the
+rest is frag_list.  Two things follow that a rule can observe, both measured
+on 7.3.4 with three netns (sender, router, receiver) and 26 arms per boot,
+byte-identical across two boots:
+
+1. The checksum field the rule reads depends on a device bit, not on the
+   traffic.  A linear aggregate is completed with
+       uh->len   = total UDP length
+       uh->check = ~udp_v6_check(total, saddr, daddr, 0)
+   (udp6_gro_complete(), linear branch), while a fraglist aggregate only gets
+       udp_set_len(uh, skb->len - nhoff)
+   and keeps the FIRST datagram's checksum field.  Same three datagrams,
+   same rule, same table: the rule sees 0x00c3 on a router with
+   rx-udp-gro-forwarding and 0xfcc2 on a router with rx-gro-list.  A rule that
+   matches or rewrites @th,6,2 therefore behaves differently on two routers
+   that agree on everything a rule can name.
+
+2. A store made on an aggregate is not paid for by the fraglist splitter.
+   __udp_gso_segment() takes __udp_gso_segment_list() whenever
+       skb_pagelen(skb) - sizeof(struct udphdr) == skb_info->gso_size
+   and that branch calls skb_segment_list(), which copies no payload and
+   computes no checksum -- "features" is passed in and never consulted.  On an
+   exit device WITHOUT any checksum offload, a rule's 4-byte payload write
+   reaches the wire with the sender's pseudo-header seed in the checksum field
+   (0xfcc3/0xfcc3/0xfcc3 for three untouched datagrams, the first of which the
+   rule modified), while the same write on a LINEAR aggregate of the same
+   datagrams is hashed by skb_checksum_help() (0x426f/0xf1af/0xf0af).  The
+   receiver drops neither, because skb_segment_list() leaves the fragments
+   CHECKSUM_PARTIAL and UDP does not verify PARTIAL -- so the datagram with a
+   wrong checksum is delivered, and a rule that rewrites the checksum field
+   itself (0xdead) is delivered as well, whereas the same store on the linear
+   shape is hashed into three wrong checksums and all three datagrams are
+   dropped.
+
+The branch is also chosen by the rule's own write.  A store that crosses the
+end of the aggregate's linear part (the head is exactly one segment) pulls
+bytes out of frag_list, so skb_pagelen() changes, the geometry test above
+fails, __skb_linearize() + skb_segment() run instead, and the exit device now
+pays for every segment -- including the two the rule never touched.  Four
+bytes of offset decide who pays for the whole aggregate.
+
+Reproducer and the full grid: 26 arms over {linear, fraglist} x {device with,
+without checksum offload} x {store in payload, in length, in checksum, past the
+head} x {CHECKSUM_PARTIAL, CHECKSUM_NONE provenance}, using veth only (a real
+NIC was not available; the "device without offload" is a veth with
+NETIF_F_HW_CSUM cleared, which also clears NETIF_F_GSO_UDP_L4).
+
+Signed-off-by: ...
+
+
+===== SUMMARY.md =====
+# F63 — агрегат это пакет, который правило не слало: GRO решает, что читает правило, а разрезающий, который ничего не копирует, не платит
+
+Ход 585. Ядер не собирал: всё на том же `7.3.4-T563` (`1efbc957…2033`).
+Прибор `differ585`, режим `aggr` — **26 плеч в каждой из двух загрузок**, три
+netns (отправитель, маршрутизатор = мы, приёмник). После нормализации MAC и
+метки потока обе загрузки совпадают **побайтово в каждом кадре и в каждом
+счётчике**.
+
+Долг был назван в F62 §11 дословно: ветка `SKB_GSO_FRAGLIST`
+(`udp_rcv_segment()` → `__udp_gso_segment_list()` → `skb_segment_list()`) не
+достигнута — «она требует GRO на приёме, а не GSO на проводе». Здесь эта
+ветка достигнута, и вопрос у неё один: **кто платит за запись, если пакет,
+который видит правило, собран не отправителем, а приёмником.**
+
+## 1. Три вещи, без которых GRO на veth не бывает вовсе
+
+Первые шесть дымов не мерили ничего: три кадра приезжали тремя пакетами при
+любых битах. Причин оказалось три, и все — не в правиле.
+
+| что | где | почему |
+|---|---|---|
+| veth **рождается с выключенным GRO** | `veth_disable_gro(dev)` в `veth_newlink` (`drivers/net/veth.c:1879,1925`) | без `NETIF_F_GRO` у устройства **нет NAPI**, и биты формы (57/59) не делают ничего |
+| бит формы на приёме — не то же, что бит на проводе | `udp_gro_receive()` | `rx-udp-gro-forwarding` (59) работает только когда **сокета нет** (forwarded), а для локального потока нужен либо `UDP_GRO` у сокета, либо `rx-gro-list` (57) |
+| биты формы вообще не читаются, пока не включён `udpv6_encap_needed` | `net/ipv4/udp.c:3014` — `UDP_GRO` зовёт `udp_tunnel_encap_enable(sk)` | только под этой статической ветвью `udp6_gro_receive()` вообще ищет сокет; без неё `sk == NULL` и решает бит 59 |
+
+Плюс четвёртая, из-за которой агрегаты не собирались *детерминированно*:
+`gro_flush_timeout` (20 мс) + `napi_defer_hard_irqs = 1` на принимающем
+устройстве. Без них каждый `dev_queue_xmit` заканчивается `local_bh_enable()`,
+softirq успевает прогнать NAPI, и три `sendto()` подряд дают три опроса по
+одному пакету. С ними — один.
+
+## 2. Кто делает агрегат: три бита и один сокет
+
+Три датаграммы 512 байт, один и тот же 5-tuple, приёмник — D.
+
+| плечо | бит устройства | сокет | что видит стек D | что видит приложение |
+|---|---|---|---|---|
+| `A_none_a` | — | 5000 plain | 3 пакета по 520 | 3×512 |
+| `C_UFWD_local` | `rx-udp-gro-forwarding` | 5000 plain | **3 пакета** — бит не работает при живом сокете | 3×512 |
+| `C_FLIST` | `rx-gro-list` | 5000 plain | **1 пакет 1544** (фраглист) | 3×512 |
+| `C_GRO_SOCK` | `rx-udp-gro-forwarding` | 5001 `UDP_GRO` | **1 пакет 1544** (линейный) | **1×1536**, cmsg 512 |
+| `C_FG_SOCK` | `rx-gro-list` | 5001 `UDP_GRO` | 1 пакет 1544 (линейный: бит сокета старше) | 1×1536, cmsg 512 |
+| `B_UFWD_x0` | 59 на **входе маршрутизатора** | — (forwarded) | 1 пакет 1544 | 3×512 |
+| `B_FLIST_x0` | 57 на входе маршрутизатора | — (forwarded) | 1 пакет 1544 (фраглист) | 3×512 |
+
+Три вывода, каждый — измеренный, не прочитанный:
+
+1. `rx-udp-gro-forwarding` — это бит **для чужого трафика**: при живом
+   локальном сокете он не срабатывает (`C_UFWD_local` = 3 пакета), а на
+   входе маршрутизатора, где сокета нет, — срабатывает (`B_UFWD_x0`).
+2. Форму выбирает **самый сильный** из трёх: бит сокета `UDP_GRO` перебивает
+   `rx-gro-list` (`C_FG_SOCK` — линейный агрегат, а не фраглист).
+3. Наличие `UDP_GRO`-сокета в netns включает статическую ветку и меняет
+   судьбу **чужих** потоков: без него `sk == NULL` и решает бит 59.
+
+## 3. Что видит правило: один пакет, и у него две разные шапки
+
+Плечи `B_*`: правило стоит на forward-двери, а агрегат собран на входе
+маршрутизатора (x0). Счётчик правила — **1**, длина сообщения — **1584**,
+и в нём три полезных нагрузки подряд (смещения 48, 560, 1072 — заголовков
+фрагментов внутри агрегата нет: `skb_gro_receive*` их срезает).
+
+| плечо | форма | `uh->len`, которую читает правило | `uh->check`, которую читает правило |
+|---|---|---|---|
+| `B_UFWD_x0` | линейный | 1544 | **`00c3`** = `seed(1544)` — переписана завершением GRO |
+| `B_FLIST_x0` | фраглист | 1544 | **`fcc2`** = `seed(520)` — первая датаграмма, не тронута |
+
+То есть **форма агрегата видна правилу в поле суммы**: одна и та же тройка
+датаграмм даёт `00c3` или `fcc2` в зависимости от бита устройства, которое
+приняло трафик. Правило, которое читает или пишет `@th,6,2`, ведёт себя
+по-разному на двух маршрутизаторах с одинаковой таблицей.
+
+## 4. Кто платит, когда агрегат режут: фраглист не платит
+
+Одна и та же запись `@th,8,4 = a0a1a2a3` (первые четыре байта первой
+полезной нагрузки), одна и та же выходная дверь без `HW_CSUM` (y2), два
+агрегата разной формы:
+
+| плечо | форма | кадры на проводе | `uh->check` на проводе | доставлено |
+|---|---|---|---|---|
+| `B_UFWD_w_b` | линейный | 574/574/574 | **`426f`/`f1af`/`f0af`** — посчитаны (`skb_checksum_help`) | 3 |
+| `B_FLIST_w_b` | фраглист | 574/574/574 | **`fcc3`/`fcc3`/`fcc3`** — засев отправителя, не тронут | 3 |
+
+`426f` — ровно то число, которое F62 измерил для той же полезной нагрузки и
+той же записи на линейном GSO-кадре: плательщик тот же. А на фраглисте
+`skb_segment_list()` не копирует ни байта и не считает ничего — даже на
+устройстве, которое сумму посчитать не может. Дверь не платит, потому что
+её об этом не спросили: ветка `__udp_gso_segment_list()` получает `features`
+и не смотрит в них.
+
+Ещё две вещи в тех же кадрах: hop limit `63/63/63` у линейного и
+**`63/64/64`** у фраглиста — работа маршрутизатора (`ip6_forward()`
+уменьшает hop limit) видна только в первом пакете агрегата, потому что
+остальные несут собственные заголовки.
+
+## 5. Запись в длину: разрезающий её стирает
+
+`@th,4,2 = 0020` на агрегате (uh->len 1544 → 32):
+
+| плечо | дверь | что стало | доставлено |
+|---|---|---|---|
+| `B_FLIST_len_a` | a (агрегат идёт целиком) | D видит 1598-байтный кадр с `uh->len=32`, обрезает до 32, `udp_rcv_segment` говорит `-EINVAL` | **0, +3** |
+| `B_FLIST_len_b` | b (разрезает `__udp_gso_segment_list`) | `udp_set_len_short(uh, 8 + mss)` переписывает длину головы обратно в 520 | **3, 0** |
+
+Одна и та же запись при одной и той же форме: на двери, которая режет,
+она **исчезает с провода** (все три кадра несут 520), на двери, которая не
+режет, она доезжает и убивает все три датаграммы. Счётчик правила при этом
+говорит «1» в обоих случаях.
+
+## 6. Запись в сумму: линейный считает мусор, фраглист везёт мусор
+
+`@th,6,2 = dead`, та же дверь b:
+
+| плечо | форма | кадры | доставлено |
+|---|---|---|---|
+| `B_FLIST_chk_b` | фраглист | **`dead`**/`fcc3`/`fcc3` | **3, 0** |
+| `B_UFWD_chk_b` | линейный | `14c6`/`13c6`/`12c6` | **0, +3** |
+| `B_FLIST_chk0_b` | фраглист, `0000` | **`0000`**/`fcc3`/`fcc3` | **2, +1** |
+
+`14c6` — это `skb_checksum_help()` над датаграммой, в поле которой уже
+стоит `dead`: `~fold(H(520, dead) + груз)`. Сумма «посчитана», но верна она
+только если в поле лежал засев псевдозаголовка, — поэтому все три
+датаграммы недействительны и умирают. А `dead`, доехавший как есть, приёмник
+не проверяет (кадр `CHECKSUM_PARTIAL`) — доезжают все три, включая ту, у
+которой сумма заведомо мусор. Нулевую сумму приёмник отвергает сам, до
+всякой проверки: `udpv6_rcv()` (`B_FLIST_chk0_b`, две из трёх).
+
+## 7. Четыре байта за концом головы переключают ветку
+
+`@th,520,4` — та же база и та же дверь b, но запись ложится **за** линейной
+частью головы агрегата, в полезную нагрузку второй датаграммы:
+
+| плечо | что стало с формой | кадры | доставлено |
+|---|---|---|---|
+| `B_FLIST_w_b` (`@th,8,4`) | геометрия цела → ветка `__udp_gso_segment_list` | `fcc3`/`fcc3`/`fcc3` (ничего не посчитано) | 3 |
+| `B_FLIST_pull_b` (`@th,520,4`) | `__pskb_pull_tail` съел 4 байта из второго фрагмента → `skb_pagelen-8 != gso_size` → `__skb_linearize` + `skb_segment` | **`f2af`/`a1ce`/`f0af`** (посчитано всё, включая две нетронутые датаграммы) | 3 |
+
+Четыре байта разницы в смещении решают, кто платит за весь агрегат: до них
+не платит никто, после — платит дверь и платит за троих. На двери a тот же
+сдвиг виден иначе: агрегат уходит целиком, а его `uh->check` уже `fcc2`
+(засев для 1544), то есть **завершение линейного пути переписало поле** —
+геометрия изменилась до того, как D стал резать.
+
+## 8. Когда платил отправитель, GRO проверяет и отказывает
+
+Провенанса `P` — три кадра с настоящими суммами, `CHECKSUM_NONE`:
+
+| плечо | запись | что сделал GRO | доставлено |
+|---|---|---|---|
+| `P_FLIST_none` | — | проверил суммы, собрал фраглист (1 пакет 1544) | 3 |
+| `P_FLIST_w` | `@th,8,4` на каждой | **проверил, увидел сломанную сумму, отказал** (3 пакета 520) | **0, +3** |
+
+Та же запись на провенансе `PARTIAL` (плечи `A_w`, `C_FLIST_w`) не мешает
+ничему: GRO не проверяет то, за что уже «заплатил» другой. То есть запись
+правила видна приёмнику **только тогда, когда отправитель платил сам**.
+
+## Предсказания: я их не замораживал, и это надо назвать долгом
+
+В этом ходу я не написал `predictions_585.md` до запуска. Семантика
+прибора была неизвестна настолько, что **дым был экспериментом**: шесть
+дымов подряд меняли и прибор, и мою модель (см. ошибки ниже). Модель в
+`tools/verify585.py` написана **после** замера, и её 1818 проверок — это
+сверка с замороженными байтами логов, а не предсказание. Это отступление от
+правила проекта (F60: «прочитал — не значит измерил»), и оно записано как
+долг: следующий ход начинается с замороженных предсказаний.
+
+## Ошибки хода, все мои
+
+1. **Счётчик цепочки-свидетеля читал регистр, а не пакеты**: `NFTA_PAYLOAD_DREG
+   == 1 == NFTA_COUNTER_PACKETS`, и мой парсер брал первое совпадение по типу
+   атрибута — все три правила показывали «16» (номер регистра), стабильно и
+   одинаково. Класс F40 №2 (лог, который врёт о своём содержимом). Починено
+   проверкой имени выражения до чтения данных.
+2. **Свой же тап выключал измеряемый GRO**: `dev_queue_xmit_nit()` клонирует
+   skb для AF_PACKET, а `veth_xdp_rcv()` на приёме проверяет
+   `skb_shared(skb) || skb_unclone()` и в этом случае зовёт
+   `netif_receive_skb()` — то есть **без GRO**. Три дыма подряд «GRO не
+   работал» из-за моего собственного свидетеля на выходной двери.
+3. **Биты формы выставлялись после трафика**: обработчик `'p'` в дочернем
+   процессе читал `c[2]`, а команда ехала в `c[1]` — каждое плечо мерило
+   форму предыдущего (и каждое плечо ещё и ждало 20 с ответа).
+4. **`veth` рождается без GRO**, а я включал только биты 57/59: NAPI не
+   существовал, агрегации не было ни при каких битах.
+5. **MTU 1500**: агрегат 1584 байта не прошёл бы forward-дверь; MTU 9000 на
+   всех шести устройствах. И `/sys/class/net` в свежем netns показывает
+   **чужие** устройства — понадобился второй sysfs, смонтированный внутри.
+6. **Модель верификатора была неверна восемь раз** (все ловились прогоном):
+   поле отправителя считалось после записи; `partial` считался свойством
+   источника, а не последней двери; фраглист-ветка брала поле фрагмента для
+   головы; линейная ветка не переписывала поле на засев агрегата; смещение
+   1120 в логе — это полезная нагрузка третьей датаграммы, а не её
+   заголовок; `UDP_GRO`-сокет читается в `b0`, а не в `a0`; нулевая сумма
+   запрещена в IPv6 сама по себе; `skb_segment_list()` оставляет фрагменты
+   `PARTIAL`, поэтому их не проверяют.
+
+## Чем проверено
+
+| | |
+|---|---|
+| `tools/verify585.py` | **1818 проверок, 0 расхождений** — провенанс (sha ядра из шапки и из файла, initrd, differ **извлечённый из initramfs**), 14 якорей исходника, таблица плеч **из исходника прибора**, и каждое плечо обеих загрузок: счётчик правила, длина и **все 1584 байта** сообщения NFLOG (шапка агрегата, длины, поле суммы, три полезных нагрузки по смещениям), кадры на тапе приёмника (длина, IPv6-payload, hop limit, длина и сумма UDP, **все байты**), три счётчика-свидетеля по длине IPv6, длины и число прочитанных датаграмм, `Udp6InDatagrams`/`Udp6InErrors`, побайтовая детерминированность двух загрузок |
+| `tools/verify585_selftest.sh` | **25/25** — базовая линия зелёная, 23 односоставные мутации краснят без traceback, `noop` зелёный, отсутствующий лог — красный, не крэш |
+| `tools/f585_summary.py` | `summary.json` из логов: 26 плеч × 2 загрузки |
+| коллекция, форма писем, регрессия | см. `VERIFY_REPORT.md` |
+
+## 11. Что не измерено, прямо
+
+* **Настоящего NIC нет ни разу за проект**: оба выхода — veth, у которого
+  биты снимаются рукой. Кадр «агрегат целиком» (1598 байт) на проводе — это
+  veth, а не Ethernet.
+* Только три датаграммы и только 512 байт; `UDP_GRO_CNT_MAX`, разные длины
+  в одном агрегате, `mss`, не делящий груз, и `MAX_GRO_SKBS` не тронуты.
+* Только IPv6/UDP; TCP-GRO, `CHECKSUM_COMPLETE`, VLAN-теги над агрегатом,
+  туннели (`encap_mark`) и `napi_defer_hard_irqs` > 1 не тронуты.
+* `skb_segment_list()` с *разными* адресами/портами у соседних фрагментов
+  (`__udpv6_gso_segment_list_csum`) не достигнут: GRO такие пакеты не
+  сливает, а другого источника фраглиста у нас нет.
+* Внутренняя арифметика `gso_make_checksum()`/`skb_checksum_help()` измерена
+  как **результат** (14 кадров), а не по частям.
+* **Не уязвимость**: все правила ставил root в начальном user ns.
+
+## 12. Файлы
+
+`findings/F63-gro-aggregate/{SUMMARY.md, summary.json, VERIFY_REPORT.md,
+LETTER_SECTION_F63.txt}` · `vm/{differ585_add.c, differ585.c,
+build_f63_differ.sh, make_initramfs585.sh, build/differ585}` ·
+`tools/{f63_run.sh, verify585.py, verify585_selftest.sh, f585_mutate.py,
+f585_summary.py}` · логи `logs/f63_{rep1,rep2}.log`.
+
+
+===== summary.json =====
+{
+ "answer_short": "A fraglist splitter copies nothing and pays nothing (skb_segment_list ignores features); a linear one pays for all three; four bytes of store offset switch the branch.",
+ "arms": 26,
+ "boots": [
+  {
+   "arms": [
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 520
+      }
+     ],
+     "i": 0,
+     "lgplen": 560,
+     "lgudp": "aa3c13880208fd43",
+     "name": "A_none_a",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64835,
+     "uhlen": 520,
+     "w1544": 0,
+     "w520": 3
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 61997,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 61741,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 61485,
+       "uhlen": 520
+      }
+     ],
+     "i": 1,
+     "lgplen": 560,
+     "lgudp": "aa3c13880208f22d",
+     "name": "A_none_b",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 61997,
+     "uhlen": 520,
+     "w1544": 0,
+     "w520": 6
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 520
+      }
+     ],
+     "i": 2,
+     "lgplen": 560,
+     "lgudp": "aa3c13880208fd43",
+     "name": "C_UFWD_local",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64835,
+     "uhlen": 520,
+     "w1544": 0,
+     "w520": 9
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 64,
+       "iplen": 1544,
+       "uhck": 64835,
+       "uhlen": 1544
+      }
+     ],
+     "i": 3,
+     "lgplen": 560,
+     "lgudp": "aa3c13880208fd43",
+     "name": "C_FLIST",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64835,
+     "uhlen": 520,
+     "w1544": 1,
+     "w520": 9
+    },
+    {
+     "b0": 1536,
+     "bg0": 512,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 64,
+       "iplen": 1544,
+       "uhck": 324,
+       "uhlen": 1544
+      }
+     ],
+     "i": 4,
+     "lgplen": 560,
+     "lgudp": "aa3c13890208fd43",
+     "name": "C_GRO_SOCK",
+     "reads": [
+      0,
+      0,
+      0,
+      0
+     ],
+     "udp": 1,
+     "udperr": 0,
+     "uhck": 64835,
+     "uhlen": 520,
+     "w1544": 2,
+     "w520": 9
+    },
+    {
+     "b0": 1536,
+     "bg0": 512,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 64,
+       "iplen": 1544,
+       "uhck": 324,
+       "uhlen": 1544
+      }
+     ],
+     "i": 5,
+     "lgplen": 560,
+     "lgudp": "aa3c13890208fd43",
+     "name": "C_FG_SOCK",
+     "reads": [
+      0,
+      0,
+      0,
+      0
+     ],
+     "udp": 1,
+     "udperr": 0,
+     "uhck": 64835,
+     "uhlen": 520,
+     "w1544": 3,
+     "w520": 9
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 63,
+       "iplen": 1544,
+       "uhck": 195,
+       "uhlen": 1544
+      }
+     ],
+     "i": 6,
+     "lgplen": 1584,
+     "lgudp": "aa3c1388060800c3",
+     "name": "B_UFWD_x0",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 195,
+     "uhlen": 1544,
+     "w1544": 4,
+     "w520": 9
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 63,
+       "iplen": 1544,
+       "uhck": 64706,
+       "uhlen": 1544
+      }
+     ],
+     "i": 7,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880608fcc2",
+     "name": "B_FLIST_x0",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64706,
+     "uhlen": 1544,
+     "w1544": 5,
+     "w520": 9
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      }
+     ],
+     "i": 8,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880608fcc3",
+     "name": "B_FLIST_x0_b",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64707,
+     "uhlen": 1544,
+     "w1544": 5,
+     "w520": 12
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 520
+      }
+     ],
+     "i": 9,
+     "lgplen": 560,
+     "lgudp": "aa3c13880208fd43",
+     "name": "A_w",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64835,
+     "uhlen": 520,
+     "w1544": 5,
+     "w520": 15
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 64,
+       "iplen": 1544,
+       "uhck": 64835,
+       "uhlen": 1544
+      }
+     ],
+     "i": 10,
+     "lgplen": 560,
+     "lgudp": "aa3c13880208fd43",
+     "name": "C_FLIST_w",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64835,
+     "uhlen": 520,
+     "w1544": 6,
+     "w520": 15
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 63,
+       "iplen": 1544,
+       "uhck": 195,
+       "uhlen": 1544
+      }
+     ],
+     "i": 11,
+     "lgplen": 1584,
+     "lgudp": "aa3c1388060800c3",
+     "name": "B_UFWD_w",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 195,
+     "uhlen": 1544,
+     "w1544": 7,
+     "w520": 15
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 17007,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 61871,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 61615,
+       "uhlen": 520
+      }
+     ],
+     "i": 12,
+     "lgplen": 1584,
+     "lgudp": "aa3c1388060800c4",
+     "name": "B_UFWD_w_b",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 196,
+     "uhlen": 1544,
+     "w1544": 7,
+     "w520": 18
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 63,
+       "iplen": 1544,
+       "uhck": 64706,
+       "uhlen": 1544
+      }
+     ],
+     "i": 13,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880608fcc2",
+     "name": "B_FLIST_w_a",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64706,
+     "uhlen": 1544,
+     "w1544": 8,
+     "w520": 18
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      }
+     ],
+     "i": 14,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880608fcc3",
+     "name": "B_FLIST_w_b",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64707,
+     "uhlen": 1544,
+     "w1544": 8,
+     "w520": 21
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 32
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 32
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 32
+      }
+     ],
+     "i": 15,
+     "lgplen": 560,
+     "lgudp": "aa3c13880020fd43",
+     "name": "A_len",
+     "reads": [
+      24,
+      24,
+      24,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64835,
+     "uhlen": 32,
+     "w1544": 8,
+     "w520": 24
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 32
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 32
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 32
+      }
+     ],
+     "i": 16,
+     "lgplen": 560,
+     "lgudp": "aa3c13880020fd43",
+     "name": "C_FLIST_len",
+     "reads": [
+      24,
+      24,
+      24,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64835,
+     "uhlen": 32,
+     "w1544": 8,
+     "w520": 27
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 63,
+       "iplen": 1544,
+       "uhck": 64706,
+       "uhlen": 32
+      }
+     ],
+     "i": 17,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880020fcc2",
+     "name": "B_FLIST_len_a",
+     "reads": [
+      0,
+      0,
+      0,
+      0
+     ],
+     "udp": 0,
+     "udperr": 3,
+     "uhck": 64706,
+     "uhlen": 32,
+     "w1544": 9,
+     "w520": 27
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      }
+     ],
+     "i": 18,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880020fcc3",
+     "name": "B_FLIST_len_b",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64707,
+     "uhlen": 32,
+     "w1544": 9,
+     "w520": 30
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 57005,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      }
+     ],
+     "i": 19,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880608dead",
+     "name": "B_FLIST_chk_b",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 57005,
+     "uhlen": 1544,
+     "w1544": 9,
+     "w520": 33
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 5318,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 5062,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 4806,
+       "uhlen": 520
+      }
+     ],
+     "i": 20,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880608dead",
+     "name": "B_UFWD_chk_b",
+     "reads": [
+      0,
+      0,
+      0,
+      0
+     ],
+     "udp": 0,
+     "udperr": 3,
+     "uhck": 57005,
+     "uhlen": 1544,
+     "w1544": 9,
+     "w520": 36
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 0,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      }
+     ],
+     "i": 21,
+     "lgplen": 1584,
+     "lgudp": "aa3c138806080000",
+     "name": "B_FLIST_chk0_b",
+     "reads": [
+      512,
+      512,
+      0,
+      0
+     ],
+     "udp": 2,
+     "udperr": 1,
+     "uhck": 0,
+     "uhlen": 1544,
+     "w1544": 9,
+     "w520": 39
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 63,
+       "iplen": 1544,
+       "uhck": 64706,
+       "uhlen": 1544
+      }
+     ],
+     "i": 22,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880608fcc2",
+     "name": "B_FLIST_pull_a",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64706,
+     "uhlen": 1544,
+     "w1544": 10,
+     "w520": 39
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 62127,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 41422,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 61615,
+       "uhlen": 520
+      }
+     ],
+     "i": 23,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880608fcc3",
+     "name": "B_FLIST_pull_b",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64707,
+     "uhlen": 1544,
+     "w1544": 10,
+     "w520": 42
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 63,
+       "iplen": 1544,
+       "uhck": 62128,
+       "uhlen": 1544
+      }
+     ],
+     "i": 24,
+     "lgplen": 560,
+     "lgudp": "aa3c13880208f2b0",
+     "name": "P_FLIST_none",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 62128,
+     "uhlen": 520,
+     "w1544": 11,
+     "w520": 42
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 62128,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 61872,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 61616,
+       "uhlen": 520
+      }
+     ],
+     "i": 25,
+     "lgplen": 560,
+     "lgudp": "aa3c13880208f2b0",
+     "name": "P_FLIST_w",
+     "reads": [
+      0,
+      0,
+      0,
+      0
+     ],
+     "udp": 0,
+     "udperr": 3,
+     "uhck": 62128,
+     "uhlen": 520,
+     "w1544": 11,
+     "w520": 45
+    }
+   ],
+   "tag": "logs/f63_rep1.log"
+  },
+  {
+   "arms": [
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 520
+      }
+     ],
+     "i": 0,
+     "lgplen": 560,
+     "lgudp": "aa3c13880208fd43",
+     "name": "A_none_a",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64835,
+     "uhlen": 520,
+     "w1544": 0,
+     "w520": 3
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 61997,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 61741,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 61485,
+       "uhlen": 520
+      }
+     ],
+     "i": 1,
+     "lgplen": 560,
+     "lgudp": "aa3c13880208f22d",
+     "name": "A_none_b",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 61997,
+     "uhlen": 520,
+     "w1544": 0,
+     "w520": 6
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 520
+      }
+     ],
+     "i": 2,
+     "lgplen": 560,
+     "lgudp": "aa3c13880208fd43",
+     "name": "C_UFWD_local",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64835,
+     "uhlen": 520,
+     "w1544": 0,
+     "w520": 9
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 64,
+       "iplen": 1544,
+       "uhck": 64835,
+       "uhlen": 1544
+      }
+     ],
+     "i": 3,
+     "lgplen": 560,
+     "lgudp": "aa3c13880208fd43",
+     "name": "C_FLIST",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64835,
+     "uhlen": 520,
+     "w1544": 1,
+     "w520": 9
+    },
+    {
+     "b0": 1536,
+     "bg0": 512,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 64,
+       "iplen": 1544,
+       "uhck": 324,
+       "uhlen": 1544
+      }
+     ],
+     "i": 4,
+     "lgplen": 560,
+     "lgudp": "aa3c13890208fd43",
+     "name": "C_GRO_SOCK",
+     "reads": [
+      0,
+      0,
+      0,
+      0
+     ],
+     "udp": 1,
+     "udperr": 0,
+     "uhck": 64835,
+     "uhlen": 520,
+     "w1544": 2,
+     "w520": 9
+    },
+    {
+     "b0": 1536,
+     "bg0": 512,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 64,
+       "iplen": 1544,
+       "uhck": 324,
+       "uhlen": 1544
+      }
+     ],
+     "i": 5,
+     "lgplen": 560,
+     "lgudp": "aa3c13890208fd43",
+     "name": "C_FG_SOCK",
+     "reads": [
+      0,
+      0,
+      0,
+      0
+     ],
+     "udp": 1,
+     "udperr": 0,
+     "uhck": 64835,
+     "uhlen": 520,
+     "w1544": 3,
+     "w520": 9
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 63,
+       "iplen": 1544,
+       "uhck": 195,
+       "uhlen": 1544
+      }
+     ],
+     "i": 6,
+     "lgplen": 1584,
+     "lgudp": "aa3c1388060800c3",
+     "name": "B_UFWD_x0",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 195,
+     "uhlen": 1544,
+     "w1544": 4,
+     "w520": 9
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 63,
+       "iplen": 1544,
+       "uhck": 64706,
+       "uhlen": 1544
+      }
+     ],
+     "i": 7,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880608fcc2",
+     "name": "B_FLIST_x0",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64706,
+     "uhlen": 1544,
+     "w1544": 5,
+     "w520": 9
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      }
+     ],
+     "i": 8,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880608fcc3",
+     "name": "B_FLIST_x0_b",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64707,
+     "uhlen": 1544,
+     "w1544": 5,
+     "w520": 12
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 520
+      }
+     ],
+     "i": 9,
+     "lgplen": 560,
+     "lgudp": "aa3c13880208fd43",
+     "name": "A_w",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64835,
+     "uhlen": 520,
+     "w1544": 5,
+     "w520": 15
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 64,
+       "iplen": 1544,
+       "uhck": 64835,
+       "uhlen": 1544
+      }
+     ],
+     "i": 10,
+     "lgplen": 560,
+     "lgudp": "aa3c13880208fd43",
+     "name": "C_FLIST_w",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64835,
+     "uhlen": 520,
+     "w1544": 6,
+     "w520": 15
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 63,
+       "iplen": 1544,
+       "uhck": 195,
+       "uhlen": 1544
+      }
+     ],
+     "i": 11,
+     "lgplen": 1584,
+     "lgudp": "aa3c1388060800c3",
+     "name": "B_UFWD_w",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 195,
+     "uhlen": 1544,
+     "w1544": 7,
+     "w520": 15
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 17007,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 61871,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 61615,
+       "uhlen": 520
+      }
+     ],
+     "i": 12,
+     "lgplen": 1584,
+     "lgudp": "aa3c1388060800c4",
+     "name": "B_UFWD_w_b",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 196,
+     "uhlen": 1544,
+     "w1544": 7,
+     "w520": 18
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 63,
+       "iplen": 1544,
+       "uhck": 64706,
+       "uhlen": 1544
+      }
+     ],
+     "i": 13,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880608fcc2",
+     "name": "B_FLIST_w_a",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64706,
+     "uhlen": 1544,
+     "w1544": 8,
+     "w520": 18
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      }
+     ],
+     "i": 14,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880608fcc3",
+     "name": "B_FLIST_w_b",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64707,
+     "uhlen": 1544,
+     "w1544": 8,
+     "w520": 21
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 32
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 32
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 32
+      }
+     ],
+     "i": 15,
+     "lgplen": 560,
+     "lgudp": "aa3c13880020fd43",
+     "name": "A_len",
+     "reads": [
+      24,
+      24,
+      24,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64835,
+     "uhlen": 32,
+     "w1544": 8,
+     "w520": 24
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 32
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 32
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64835,
+       "uhlen": 32
+      }
+     ],
+     "i": 16,
+     "lgplen": 560,
+     "lgudp": "aa3c13880020fd43",
+     "name": "C_FLIST_len",
+     "reads": [
+      24,
+      24,
+      24,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64835,
+     "uhlen": 32,
+     "w1544": 8,
+     "w520": 27
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 63,
+       "iplen": 1544,
+       "uhck": 64706,
+       "uhlen": 32
+      }
+     ],
+     "i": 17,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880020fcc2",
+     "name": "B_FLIST_len_a",
+     "reads": [
+      0,
+      0,
+      0,
+      0
+     ],
+     "udp": 0,
+     "udperr": 3,
+     "uhck": 64706,
+     "uhlen": 32,
+     "w1544": 9,
+     "w520": 27
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      }
+     ],
+     "i": 18,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880020fcc3",
+     "name": "B_FLIST_len_b",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64707,
+     "uhlen": 32,
+     "w1544": 9,
+     "w520": 30
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 57005,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      }
+     ],
+     "i": 19,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880608dead",
+     "name": "B_FLIST_chk_b",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 57005,
+     "uhlen": 1544,
+     "w1544": 9,
+     "w520": 33
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 5318,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 5062,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 4806,
+       "uhlen": 520
+      }
+     ],
+     "i": 20,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880608dead",
+     "name": "B_UFWD_chk_b",
+     "reads": [
+      0,
+      0,
+      0,
+      0
+     ],
+     "udp": 0,
+     "udperr": 3,
+     "uhck": 57005,
+     "uhlen": 1544,
+     "w1544": 9,
+     "w520": 36
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 0,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 64,
+       "iplen": 520,
+       "uhck": 64707,
+       "uhlen": 520
+      }
+     ],
+     "i": 21,
+     "lgplen": 1584,
+     "lgudp": "aa3c138806080000",
+     "name": "B_FLIST_chk0_b",
+     "reads": [
+      512,
+      512,
+      0,
+      0
+     ],
+     "udp": 2,
+     "udperr": 1,
+     "uhck": 0,
+     "uhlen": 1544,
+     "w1544": 9,
+     "w520": 39
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 63,
+       "iplen": 1544,
+       "uhck": 64706,
+       "uhlen": 1544
+      }
+     ],
+     "i": 22,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880608fcc2",
+     "name": "B_FLIST_pull_a",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64706,
+     "uhlen": 1544,
+     "w1544": 10,
+     "w520": 39
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 1,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 62127,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 41422,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 61615,
+       "uhlen": 520
+      }
+     ],
+     "i": 23,
+     "lgplen": 1584,
+     "lgudp": "aa3c13880608fcc3",
+     "name": "B_FLIST_pull_b",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 64707,
+     "uhlen": 1544,
+     "w1544": 10,
+     "w520": 42
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 1598,
+       "hop": 63,
+       "iplen": 1544,
+       "uhck": 62128,
+       "uhlen": 1544
+      }
+     ],
+     "i": 24,
+     "lgplen": 560,
+     "lgudp": "aa3c13880208f2b0",
+     "name": "P_FLIST_none",
+     "reads": [
+      512,
+      512,
+      512,
+      0
+     ],
+     "udp": 3,
+     "udperr": 0,
+     "uhck": 62128,
+     "uhlen": 520,
+     "w1544": 11,
+     "w520": 42
+    },
+    {
+     "b0": 0,
+     "bg0": 0,
+     "ch": 3,
+     "frames": [
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 62128,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 61872,
+       "uhlen": 520
+      },
+      {
+       "flen": 574,
+       "hop": 63,
+       "iplen": 520,
+       "uhck": 61616,
+       "uhlen": 520
+      }
+     ],
+     "i": 25,
+     "lgplen": 560,
+     "lgudp": "aa3c13880208f2b0",
+     "name": "P_FLIST_w",
+     "reads": [
+      0,
+      0,
+      0,
+      0
+     ],
+     "udp": 0,
+     "udperr": 3,
+     "uhck": 62128,
+     "uhlen": 520,
+     "w1544": 11,
+     "w520": 45
+    }
+   ],
+   "tag": "logs/f63_rep2.log"
+  }
+ ],
+ "claim": "GRO hands the rule a packet the sender never sent: the checksum field the rule reads, and who pays when the aggregate is split, are decided by a device bit and by the rule's own write offset.",
+ "finding": "F63",
+ "kernel": "7.3.4-T563",
+ "kernel_sha": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+ "mode": "aggr",
+ "turn": 585
+}

@@ -1,0 +1,582 @@
+===== LETTER_SECTION_F37.txt =====
+STATUS: NOT SENT  (material for the netfilter-devel letter; sending is the owner's decision)
+
+Subject: nftables: what a payload store accepted by the link-layer guard actually
+writes, measured on a frame that carries its 802.1Q tag
+
+Three points, each measured on 7.3.4 with nftables 1.1.7, one hook (bridge
+prerouting), one veth pair, one frame per arm.  Nothing here is a vulnerability:
+the rule is installed by root in the initial user ns.
+
+1. For a tagged frame the `@ll` offsets are wire offsets, and the four bytes the
+   guard opens up are the tag.
+
+   nft_payload_set_eval() subtracts vlan_hlen from the skb offset and
+   nft_ll_write_ok() adds it back, so `@ll,16,2` on a frame whose tag the receive
+   path pulled into skb metadata writes frame byte 16..17 -- the *inner*
+   ethertype, which is exactly what an operator counting on the tagged frame
+   expects.  Measured on the wire (the frame the egress driver is handed):
+
+       control       8100 0064 0800 ...   (64 bytes)
+       @ll,16,2=0806 8100 0064 0806 ...   (64 bytes, tag untouched)
+       @ll,14,2=0099 8100 0099 0800 ...   (the TCI)
+       @ll,12,4=81000000 8100 0000 0800 ...
+       @ll,16,2 on an untagged frame: refused (16+2 > 14), counter 0
+
+2. A two-byte store can leave a frame with no ethertype at all while the kernel
+   still treats it as IPv4.
+
+   `@ll,12,2 = 0` is accepted on a tagged frame (nft_payload_set_vlan() case
+   h_vlan_proto, len 2) and sets skb->vlan_proto = 0 while skb->vlan_tci keeps
+   its value.  Since vlan_hw_offload_capable() knows only 0x8100 and 0x8021ad,
+   validate_xmit_vlan() then inserts the tag itself on *every* device:
+
+       frame on the wire:  00 00 00 64 08 00 ...   (ethertype 0x0000)
+       skb->protocol:      0x0800 (unchanged), the bridge keeps forwarding it
+       far side:           eth_type_trans() reads 0x0000, IpInReceives +0
+
+   So the frame a peer receives is not IPv4 by its own bytes while every
+   nftables expression that reads skb->protocol still calls it IPv4.  On a
+   forwarded frame this is a 2-byte rule that silently breaks the ethertype of
+   everything it matches.
+
+3. The transport guard is reachable from the bridge family and is envelope-blind;
+   it also has a second refusal in front of it that is not a guard.
+
+   nft_do_chain_bridge() builds its pktinfo from eth_hdr(skb)->h_proto (the inner
+   ethertype), so a transport-base store works in a bridge chain.  36 cells per
+   envelope at the bridge prerouting hook:
+
+       proto 6 (TCP)  31/36 live, dead: (10,4) (12,1) (12,2) (12,4)  <- doff=12
+                                                 and (24,4)           <- skb length
+       proto 17 (UDP) 35/36 live, dead: (24,4)
+
+   The same set with and without the tag, but the bytes land at wire offset
+   38+off when the frame is tagged and 34+off when it is not: the guard's
+   coordinates are skb coordinates and the tag is not in the skb.  The extra
+   dead cell is skb_ensure_writable(20 + off + len) against a 46-byte datagram,
+   i.e. a length bound, not a policy.
+
+   Second-order, and the reason I mention it at all: two base chains at one hook
+   do not share pktinfo.  `pre` (prio 0) writing @ll,16,2=0806 makes the frame's
+   inner ethertype 0x0806, and `post` (prio 10) then builds its pktinfo from
+   those bytes, falls into nft_set_pktinfo_unspec(), and its transport store is
+   silently refused (counter 0, no bytes) while the frame itself is delivered.
+
+Measurement method, for anyone who wants to check it: ETHTOOL_SFEATURES can
+clear NETIF_F_HW_VLAN_CTAG_TX on a veth from userspace (ethtool_set_features()
+does not require an ndo_set_features op), after which validate_xmit_vlan() puts
+the tag into the frame and the TX-side AF_PACKET tap sees the real bytes; with
+the bit set the same frame is 60 bytes and tagless, which is why this was hard
+to see before.
+
+-- measured, not read: 765 independent checks over two boots, every captured
+frame compared byte for byte with a model of validate_xmit_vlan() and
+skb_vlan_untag().
+
+
+===== SUMMARY.md =====
+# F37 — the tag as bytes: one feature bit, and what the accepted stores write
+
+Turn 559. F36 ended with a limit it could not get past: on a veth the 802.1Q
+tag lives in skb metadata, both AF_PACKET taps run either after
+`skb_vlan_untag()` or after `validate_xmit_vlan()`, and veth advertises
+`NETIF_F_HW_VLAN_CTAG_TX` — so "the bytes of the tag on the wire" was not
+measurable at all, and the byte claim of F36 §6 rested on
+`skb_reorder_vlan_header()`.
+
+The way out needs no driver. `net/ethtool/ioctl.c:ethtool_set_features()`
+writes `dev->wanted_features` and calls `__netdev_update_features()`; it never
+asks for an `ndo_set_features` op. One bit can therefore be taken away from a
+veth from userspace, and then `net/core/dev.c:validate_xmit_vlan()` has to put
+the tag back into the frame itself:
+
+	if (skb_vlan_tag_present(skb) &&
+	    !vlan_hw_offload_capable(features, skb->vlan_proto))
+		skb = __vlan_hwaccel_push_inside(skb);
+
+## 1. One bit, and the frame changes
+
+The same instrument, the same eight arms, three states of
+`NETIF_F_HW_VLAN_CTAG_TX` (bit 7) on `r1` — the port the bridge transmits on.
+The request is `ETHTOOL_SFEATURES(valid = 1<<7, requested = 0)` and then the
+same with `requested = 1<<7`; the return value is an `ETHTOOL_F_*` mask, not an
+errno, so "accepted, no `F_UNSUPPORTED`, no `F_WISH`" is the statement that the
+bit is in `hw_features` and really moved.
+
+<!-- gen:bit -->
+| stage | r1 avail bit 7 | r1 active bit 7 | SFEATURES rc | tagged control on the wire |
+|---|---|---|---|---|
+| init (nothing asked) | 1 | 1 | — | — |
+| clear | 1 | 0 | 0 (F_UNSUPPORTED=0, F_WISH=0) | 64 bytes: `810000640800` |
+| restore | 1 | 1 | 0 (F_UNSUPPORTED=0, F_WISH=0) | 60 bytes: `08004500002e` |
+| clear2 | 1 | 0 | 0 (F_UNSUPPORTED=0, F_WISH=0) | 64 bytes: `810000640800` |
+<!-- end:bit -->
+
+Two things are visible only together. First, the bit *moves*: 1 → 0 → 1 → 0,
+with the request accepted every time and no `F_WISH` ("recorded but the device
+did not take it"), which is what "veth has no `ndo_set_features`" means
+operationally. Second, the frame decides with it: the tagged control leaves the
+port as **60 bytes with no tag at all** while the bit is set, and as
+**64 bytes with `8100 0064` at 12..15** the moment it is cleared — and back to
+60 when it is restored. So F36's sentence "the tag cannot be shown in the bytes"
+was a property of a default feature mask, not of AF_PACKET.
+
+## 2. What each accepted store writes, on the wire
+
+Same chain, same frame, one rule `[store @ll][log][counter][accept]`,
+`policy accept`. The `wire` columns are the TX tap on `r1` (which runs in
+`xmit_one()`, i.e. after `validate_xmit_skb()`), the `far` columns are the RX
+tap on `r0` (which runs after `skb_vlan_untag()`). `ipin` is `IpInReceives` of
+the whole netns — a verdict oracle only in the `on` rows, see §6.
+
+<!-- gen:wire -->
+| state of bit 7 | arm | store | wire len | wire 12..17 | far len | far 12..17 | ipin |
+|---|---|---|---|---|---|---|---|
+| on | `ctl` | none | 60 | `08004500002e` | 60 | `08004500002e` | 0 |
+| on | `s16_2` | (16,2)=`0806` | 60 | `08064500002e` | 60 | `08064500002e` | 0 |
+| on | `s14_99` | (14,2)=`0099` | 60 | `08004500002e` | 60 | `08004500002e` | 0 |
+| on | `s14_0` | (14,2)=`0000` | 60 | `08004500002e` | 60 | `08004500002e` | 2 |
+| on | `s12_2z` | (12,2)=`0000` | 64 | `000000640800` | 64 | `000000640800` | 0 |
+| on | `s12_4z` | (12,4)=`81000000` | 60 | `08004500002e` | 60 | `08004500002e` | 2 |
+| on | `ctl_plain` | none | 60 | `08004500002e` | 60 | `08004500002e` | 2 |
+| on | `s16_2_plain` | (16,2)=`0806` | 60 | `08004500002e` | 60 | `08004500002e` | 2 |
+| clear | `ctl` | none | 64 | `810000640800` | 60 | `08004500002e` | 0 |
+| clear | `s16_2` | (16,2)=`0806` | 64 | `810000640806` | 60 | `08064500002e` | 0 |
+| clear | `s14_99` | (14,2)=`0099` | 64 | `810000990800` | 60 | `08004500002e` | 0 |
+| clear | `s14_0` | (14,2)=`0000` | 64 | `810000000800` | 60 | `08004500002e` | 2 |
+| clear | `s12_2z` | (12,2)=`0000` | 64 | `000000640800` | 64 | `000000640800` | 0 |
+| clear | `s12_4z` | (12,4)=`81000000` | 64 | `810000000800` | 60 | `08004500002e` | 2 |
+| clear | `ctl_plain` | none | 60 | `08004500002e` | 60 | `08004500002e` | 2 |
+| clear | `s16_2_plain` | (16,2)=`0806` | 60 | `08004500002e` | 60 | `08004500002e` | 2 |
+| restored | `ctl` | none | 60 | `08004500002e` | 60 | `08004500002e` | 0 |
+| restored | `s16_2` | (16,2)=`0806` | 60 | `08064500002e` | 60 | `08064500002e` | 0 |
+| restored | `s14_99` | (14,2)=`0099` | 60 | `08004500002e` | 60 | `08004500002e` | 0 |
+| restored | `s14_0` | (14,2)=`0000` | 60 | `08004500002e` | 60 | `08004500002e` | 2 |
+| restored | `s12_2z` | (12,2)=`0000` | 64 | `000000640800` | 64 | `000000640800` | 0 |
+| restored | `s12_4z` | (12,4)=`81000000` | 60 | `08004500002e` | 60 | `08004500002e` | 2 |
+| restored | `ctl_plain` | none | 60 | `08004500002e` | 60 | `08004500002e` | 2 |
+| restored | `s16_2_plain` | (16,2)=`0806` | 60 | `08004500002e` | 60 | `08004500002e` | 2 |
+<!-- end:wire -->
+
+Read down the `clear` block, which is the one where the tag is in the frame:
+
+* `(16,2)` writes the **inner ethertype** — bytes 16..17 go `0800 → 0806` while
+  the tag at 12..15 stays untouched. This is the store whose bytes F36 could
+  only infer, and it lands exactly where an operator counting on the tagged
+  frame would say it does: `@ll,16,2` is the ethertype of a tagged frame.
+* `(14,2)` writes the **TCI** at 14..15 (`0064 → 0099`, vid 153): the operator's
+  offset is right, and the wire carries the VLAN id the rule wrote.
+* `(12,4)` is `__vlan_hwaccel_put_tag()` — proto and TCI together
+  (`8100 0000`, a priority tag with vid 0).
+* `(12,2) = 0000` writes **only the tag's protocol**, and that is the arm worth
+  the whole instrument: the frame leaves with `00 00 00 64` where the tag was,
+  i.e. an ethertype of `0x0000`, on **every** device — `validate_xmit_vlan()`
+  cannot offload `vlan_proto == 0` (nobody can: `vlan_hw_offload_capable()`
+  knows only 0x8100 and 0x8021ad), so the core inserts the tag itself even on a
+  veth with the offload left alone. The far tap then also sees 64 bytes, and
+  the far side's `eth_type_trans()` reads `0x0000` — `IpInReceives` does not
+  move. Inside the kernel `skb->protocol` still says 0x0800 and the bridge keeps
+  forwarding the frame as IPv4. The same arm is the only one whose result does
+  not change with the offload bit: the `on` and `clear` rows are identical.
+* `(16,2)` on a **plain** frame is refused (`16 + 2 > 14`): counter 0, no bytes,
+  in every state. The tag is what makes those four bytes writable.
+
+The far tap is the same frame *after* the receive-side untag, which is why its
+`12..17` window shows `0800`/`0806` where the wire shows `8100 0064 …`: the two
+taps are two different instruments, and only the TX one can see a tag.
+
+## 3. `@ih` inside a tagged frame
+
+F36's own debt, and the answer is not "dead". `nft_do_chain_bridge()`
+(`nft_chain_filter.c:239`) builds its pktinfo from `eth_hdr(skb)->h_proto`,
+which after untagging is the **inner** ethertype, so a transport-base store is
+parsed and alive in the bridge family. 36 cells per combo, bit 7 cleared, one
+boot: `p6*` is an IPv4 datagram with `proto = 6` (so `nft_th_write_ok()` applies),
+`u*` the same with `proto = 17`.
+
+<!-- gen:grid -->
+| combo | proto | tag | live/36 | dead cells | live byte on the wire | on the far tap |
+|---|---|---|---|---|---|---|
+| `p6T` | 6 | yes | **31/36** | (10,4) (12,1) (12,2) (12,4) (24,4) | `38+off` | `34+off` |
+| `p6P` | 6 | no | **31/36** | (10,4) (12,1) (12,2) (12,4) (24,4) | `34+off` | `34+off` |
+| `uT` | 17 | yes | **35/36** | (24,4) | `38+off` | `34+off` |
+| `uP` | 17 | no | **35/36** | (24,4) | `34+off` | `34+off` |
+<!-- end:grid -->
+
+Three findings, and one of them corrected my own prediction:
+
+1. **The doff guard is exactly what the source says and nothing else.** For TCP
+   the dead cells are the writes covering transport byte 12 (`(10,4)`, `(12,1)`,
+   `(12,2)`, `(12,4)`) — `doff = offsetof(struct tcphdr, ack_seq) + 4 = 12` —
+   and for UDP the same cells are **alive**, because `nft_th_write_ok()` returns
+   true immediately when `pkt->tprot != IPPROTO_TCP`. The guard is about the
+   protocol, not about the envelope.
+2. **There is a second refusal, and it is not a guard.** Cell `(24,4)` is dead in
+   *all four* combos, including UDP: the store's skb offset is `20 + 24 = 44`
+   and it wants 48 bytes, but the datagram is only 46 — `skb_ensure_writable()`
+   refuses, and the rule dies with it. I predicted UDP would be 36/36; it is
+   35/36, and the missing cell is a length, not a policy.
+3. **The guard is in skb coordinates and the wire is 4 bytes longer.** Every live
+   cell writes at wire offset `38+off` when the frame is tagged and `34+off`
+   when it is plain, while the live/dead decision is bit-for-bit identical
+   between `p6T` and `p6P`. That is the same 4 bytes the `@ll` guard opens up
+   with its `vlan_hlen` term: the tag is not in the skb, so every offset the
+   expressions compute is a skb offset, and the xmit path re-inserts the tag in
+   front of them.
+
+## 4. The envelope belongs to a moment, not to a frame
+
+Two base chains at one hook: `pre` (prio 0) and `post` (prio 10), the transport
+store `@ih,0,2 = 0x1f90` living in `post`.
+
+<!-- gen:chain -->
+| arm | what `pre` writes | post's store | wire 12..17 | wire 38..39 |
+|---|---|---|---|---|
+| `a_none` | nothing | alive (counter 1) | `810000640800` | `1f90` |
+| `b_et` | (16,2)=`0806` | **dead (counter 0)** | `810000640806` | `9c40` |
+| `c_tci` | (14,2)=`0099` | alive (counter 1) | `810000990800` | `1f90` |
+<!-- end:chain -->
+
+`pre` writing the inner ethertype with `@ll,16,2` is enough to **kill** the
+store in `post` (counter 0, nothing written): the second chain builds its own
+pktinfo from the bytes of the frame, sees `0x0806`, falls into
+`nft_set_pktinfo_unspec()`, and `pkt->flags` no longer has
+`NFT_PKTINFO_L4PROTO`. `pre` writing metadata only — `(14,2) = 0099` — leaves
+`post` alive. So "the guard's envelope" is not a property of the frame as it
+arrived; a store earlier in the same hook can take it away.
+
+## 5. Errors of this turn, all mine
+
+1. **The ETHTOOL command numbers, from memory.** I wrote
+   `ETHTOOL_GFEATURES = 0x3b`, `SFEATURES = 0x3c`; in this uapi they are
+   **0x3a** and **0x3b** (0x3c is `GCHANNELS`). Every device answered `-22` and
+   the first smoke was all zero. The fix is trivial; the lesson is the same one
+   F36 wrote down — a constant I remember is not a constant I checked.
+2. **`ETHTOOL_DEV_FEATURE_WORDS` is 2 here, not 3.** `GFEATURES` clamps a
+   too-large `size`, `SFEATURES` refuses it (`-EINVAL`), and `NETDEV_FEATURE_COUNT`
+   is 64 because two enum members are aliases
+   (`NETIF_F_TSO_BIT = NETIF_F_GSO_SHIFT`, `NETIF_F_GSO_LAST = …_ACCECN_BIT`).
+   The verifier now derives both the bit number and the word count from
+   `include/linux/netdev_features.h` by evaluating the enum, and checks the
+   guest's `nwords` against it.
+3. **`f557_flush(…, NULL)` segfaults.** The helper writes `*acks`
+   unconditionally; every earlier turn always passed a pointer. The chain
+   section died on its first line (`segfault at 0 … error 6`), the boot is in
+   the log and the section was re-run after the fix.
+4. **P5 was half wrong** (UDP 36/36 → 35/36, see §3.2): my model had one refusal
+   where the code has two.
+5. **The verifier was wrong before it was useful**, twice: the enum count (66
+   names, 2 aliases) reddened 12 checks on correct data, and every parsed line
+   carried a trailing `\r` (**CRLF, ninth time in this project**), which
+   reddened 11 more.
+6. **A mid-run log parsed as a finished battery.** I ran the verifier against
+   `rep1` while its VM was still in the grid and got "uT 9/36" — the numbers
+   were mine, not the kernel's. The verifier now requires the `MODE_EXIT f559=0`
+   line, so a truncated log fails loudly instead of looking like a result.
+
+## 6. What is not measured
+
+One kernel (T558, unchanged from F36 — no build this turn), one hook (bridge
+prerouting), one veth pair in the bridge and one sender outside it, one frame
+per arm. The offload was cleared on the **egress** port only: the peer `r0`
+still advertises `NETIF_F_HW_VLAN_CTAG_RX`, so a frame whose tag was inserted by
+`validate_xmit_vlan()` reaches it with the tag in the bytes and no metadata
+saying so — the far side's IP stack then parses the IP header four bytes early.
+That is a real consequence of removing the TX offload on one side only, and it
+has a measurement cost: **`IpInReceives` is a verdict oracle only while the
+offload is on**; in the `clear` state it says "reached `ip_rcv`", not
+"accepted". Also untouched: GSO/`CHECKSUM_PARTIAL`, QinQ/`0x9100`,
+IPv6-in-VLAN, bridge VLAN filtering, `netdev`/`arp`/`inet` families, and every
+store with a checksum update. Not a vulnerability: the rule is installed by root
+in the initial user ns. The consequences are a rewritten inner ethertype on a
+forwarded frame and a frame that leaves with ethertype `0x0000` while the
+kernel's own view of the packet still says IPv4.
+
+## 7. What is worth putting in the letter
+
+Three claims, each measured above:
+
+1. For a tagged frame the `@ll` offsets **are** wire offsets: the guard's
+   `vlan_hlen` term is what makes the operator's arithmetic right, and the four
+   bytes it opens up are exactly the tag (`8100 0064`) — including its protocol
+   field, which a 2-byte store can set to zero.
+2. `@ll,12,2 = 0` makes the frame leave with ethertype `0x0000` on every device
+   (the core inserts the tag because no device can offload `vlan_proto == 0`),
+   while `skb->protocol` still says 0x0800 — the kernel's view and the wire
+   disagree, and the far side does not see an IPv4 frame.
+3. The transport guard is reachable from the bridge family (it parses the inner
+   ethertype), is envelope-blind, and has a second, unrelated refusal in front of
+   it — the skb's own length.
+
+## 8. Verified
+
+| | |
+|---|---|
+| `tools/verify559.py` | every captured frame compared **byte for byte** with a model written from the source: `validate_xmit_vlan()`/`vlan_hw_offload_capable()` for the wire view, `skb_vlan_untag()` for the far view, the `vlan_hlen` subtraction for the store; 14 wire/far views × 3 states, 144 grid cells, 3 chain arms, the feature bit derived from `netdev_features.h`, provenance (kernel sha from the log against the file on disk, the differ extracted from the initrd against the built binary), `MODE_EXIT`, 0 splats, rep1 == rep2 |
+| `tools/verify559_selftest.sh` | baseline green + 15 mutations of a single field in a copy of the logs, each of which must redden the verifier with a `FAIL` line (a `Traceback` does not count as caught) |
+| `tools/f37_summary.py` | every table in this file is generated from the logs; `tools/audit_f37_doc.py` re-derives them and refuses a document that drifted, and shows it can fail on three single-cell substitutions |
+| collection | `collect_all.py` + `verify_collection.py` re-run after this finding |
+| regressions | `verify558.py`, `verify557.py`, `verify556.py`, `verify555.py`, `verify553.py`, `verify552.py` |
+
+Files: `findings/F37-tag-on-the-wire/{SUMMARY.md, summary.json, VERIFY_REPORT.md}`,
+`vm/{differ559_add.c, differ559.c, build_f37_differ.sh, make_initramfs559.sh, build/differ559}`,
+`tools/{f37_run.sh, verify559.py, verify559_selftest.sh, f37_mutate.py,
+f37_summary.py, audit_f37_doc.py}`, logs `logs/f37_{rep1,rep2}.log`,
+`research/predictions_559.md`.
+
+**Letters untouched.** F29+F30, F31, F32, F36 and this turn all stay NOT SENT;
+sending is the owner's decision, not mine.
+
+
+===== summary.json =====
+{
+ "answer_short": "One bit (NETIF_F_HW_VLAN_CTAG_TX on the egress port, clearable from userspace with ETHTOOL_SFEATURES because veth has no ndo_set_features) decides whether the 802.1Q tag exists in the frame at all: with it the tagged control leaves as 60 bytes with no tag, without it as 64 bytes with 8100 0064 at 12..15, and back. With the tag in the frame the @ll offsets are wire offsets: (16,2) rewrites the inner ethertype while the tag stays, (14,2) writes the TCI, and (12,2)=0000 zeroes the tag's protocol so the frame leaves with ethertype 0x0000 on every device while skb->protocol still says 0x0800. The transport base IS alive at the bridge (31/36 for TCP, 35/36 for UDP), the doff guard is protocol-bound and envelope-blind, and a second refusal - the skb's own length - takes cell (24,4) in all four combos. Two chains at one hook: pre writing the inner ethertype kills post's transport store.",
+ "bit": {
+  "name": "NETIF_F_HW_VLAN_CTAG_TX",
+  "number": 7,
+  "rx": {
+   "name": "NETIF_F_HW_VLAN_CTAG_RX",
+   "number": 8
+  }
+ },
+ "cells": {
+  "chain_arms": 3,
+  "grid_cells": 144,
+  "states": 3,
+  "wire_arms_per_state": 8
+ },
+ "debts": [
+  "one hook (bridge prerouting), one veth pair in the bridge, one sender",
+  "the offload was cleared on the egress port only; the peer keeps CTAG_RX, so IpInReceives is a verdict oracle only in the 'on' state",
+  "no GSO/CHECKSUM_PARTIAL, no QinQ/0x9100, no IPv6-in-VLAN, no bridge vlan filtering",
+  "no netdev/arp/inet family, no store with a checksum update"
+ ],
+ "feature_words": 2,
+ "finding": "F37-tag-on-the-wire",
+ "identities": {
+  "grid_p6T_eq_p6P_deadset": true,
+  "s12_2z_same_in_on_and_clear": true,
+  "wire_ctl_on_eq_restored": true
+ },
+ "kernel": {
+  "bzImage_sha256": "459f02a507ac748f7ae7b13aaa4982852520cf2d01347b1b9c2519af2bc65843",
+  "config_sha256": "9226f5f260f393ab7326ffa07091c105ff8fba7e82919bcb048d61aaf33e2a12",
+  "note": "no kernel was built this turn: F36's T558, unchanged",
+  "tree": "src/linux-7.3.4-T558"
+ },
+ "letters": "NOT SENT (F29+F30, F31, F32, F36, and this turn)",
+ "logs": {
+  "rep1": {
+   "chain_live": {
+    "a_none": "1",
+    "b_et": "0",
+    "c_tci": "1"
+   },
+   "f559_lines": 175,
+   "feature": {
+    "clear": "0",
+    "clear2": "0",
+    "init": "1",
+    "restore": "1"
+   },
+   "grid_dead": {
+    "p6P": [
+     "(10,4)",
+     "(12,1)",
+     "(12,2)",
+     "(12,4)",
+     "(24,4)"
+    ],
+    "p6T": [
+     "(10,4)",
+     "(12,1)",
+     "(12,2)",
+     "(12,4)",
+     "(24,4)"
+    ],
+    "uP": [
+     "(24,4)"
+    ],
+    "uT": [
+     "(24,4)"
+    ]
+   },
+   "grid_live": {
+    "p6P": 31,
+    "p6T": 31,
+    "uP": 35,
+    "uT": 35
+   },
+   "initrd_sha256": "b4e22e1d6c2b098080661159205b088469174c57769215ddeb0f4da1ba1d68db",
+   "ipin": {
+    "clear": {
+     "ctl": "0",
+     "s12_2z": "0",
+     "s12_4z": "2",
+     "s14_0": "2"
+    },
+    "on": {
+     "ctl": "0",
+     "s12_2z": "0",
+     "s12_4z": "2",
+     "s14_0": "2"
+    }
+   },
+   "kernel_sha256": "459f02a507ac748f7ae7b13aaa4982852520cf2d01347b1b9c2519af2bc65843",
+   "mode_exit": [
+    "=== MODE_EXIT f559=0 ==="
+   ],
+   "set_rc": {
+    "clear": [
+     "0",
+     "0",
+     "0"
+    ],
+    "clear2": [
+     "0",
+     "0",
+     "0"
+    ],
+    "restore": [
+     "0",
+     "0",
+     "0"
+    ]
+   },
+   "splats": 0,
+   "wire_len": {
+    "clear": {
+     "ctl": "64",
+     "s12_2z": "64",
+     "s12_4z": "64",
+     "s14_0": "64",
+     "s14_99": "64",
+     "s16_2": "64"
+    },
+    "on": {
+     "ctl": "60",
+     "s12_2z": "64",
+     "s12_4z": "60",
+     "s14_0": "60",
+     "s14_99": "60",
+     "s16_2": "60"
+    },
+    "restored": {
+     "ctl": "60",
+     "s12_2z": "64",
+     "s12_4z": "60",
+     "s14_0": "60",
+     "s14_99": "60",
+     "s16_2": "60"
+    }
+   }
+  },
+  "rep2": {
+   "chain_live": {
+    "a_none": "1",
+    "b_et": "0",
+    "c_tci": "1"
+   },
+   "f559_lines": 175,
+   "feature": {
+    "clear": "0",
+    "clear2": "0",
+    "init": "1",
+    "restore": "1"
+   },
+   "grid_dead": {
+    "p6P": [
+     "(10,4)",
+     "(12,1)",
+     "(12,2)",
+     "(12,4)",
+     "(24,4)"
+    ],
+    "p6T": [
+     "(10,4)",
+     "(12,1)",
+     "(12,2)",
+     "(12,4)",
+     "(24,4)"
+    ],
+    "uP": [
+     "(24,4)"
+    ],
+    "uT": [
+     "(24,4)"
+    ]
+   },
+   "grid_live": {
+    "p6P": 31,
+    "p6T": 31,
+    "uP": 35,
+    "uT": 35
+   },
+   "initrd_sha256": "b4e22e1d6c2b098080661159205b088469174c57769215ddeb0f4da1ba1d68db",
+   "ipin": {
+    "clear": {
+     "ctl": "0",
+     "s12_2z": "0",
+     "s12_4z": "2",
+     "s14_0": "2"
+    },
+    "on": {
+     "ctl": "0",
+     "s12_2z": "0",
+     "s12_4z": "2",
+     "s14_0": "2"
+    }
+   },
+   "kernel_sha256": "459f02a507ac748f7ae7b13aaa4982852520cf2d01347b1b9c2519af2bc65843",
+   "mode_exit": [
+    "=== MODE_EXIT f559=0 ==="
+   ],
+   "set_rc": {
+    "clear": [
+     "0",
+     "0",
+     "0"
+    ],
+    "clear2": [
+     "0",
+     "0",
+     "0"
+    ],
+    "restore": [
+     "0",
+     "0",
+     "0"
+    ]
+   },
+   "splats": 0,
+   "wire_len": {
+    "clear": {
+     "ctl": "64",
+     "s12_2z": "64",
+     "s12_4z": "64",
+     "s14_0": "64",
+     "s14_99": "64",
+     "s16_2": "64"
+    },
+    "on": {
+     "ctl": "60",
+     "s12_2z": "64",
+     "s12_4z": "60",
+     "s14_0": "60",
+     "s14_99": "60",
+     "s16_2": "60"
+    },
+    "restored": {
+     "ctl": "60",
+     "s12_2z": "64",
+     "s12_4z": "60",
+     "s14_0": "60",
+     "s14_99": "60",
+     "s16_2": "60"
+    }
+   }
+  }
+ },
+ "turn": 559
+}

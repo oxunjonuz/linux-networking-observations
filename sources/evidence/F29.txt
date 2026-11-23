@@ -1,0 +1,273 @@
+===== SUMMARY.md =====
+# F29 — страж защищает базу, а не байт: тот же doff внутри туннеля двигается на всех пяти ядрах
+
+Ход 551. F28 закрыл вопрос «сколько форм nft компилируется в запись по байту 12» —
+14 форм, и все 14 на 7.3/7.3.4 молча не выполняются, потому что `nft_th_write_ok()`
+смотрит на диапазон `[offset, offset+len)` **относительно базы transport**. В самом
+этом чтении был второй вопрос, который я не измерял: база `inner` до стража не
+доходит вовсе — в `nft_payload_set_eval()` для неё нет вызова, и позвать его нельзя,
+потому что `pkt->tprot` — это *внешний* протокол, а `priv->offset` для этой базы
+отсчитывается от конца внешнего UDP/GRE-заголовка, а не от какого-либо L4.
+
+Сегодняшний ход отвечает на это кадром. **Тот же байт — doff настоящего TCP-заголовка
+внутри туннеля — двигается через `@ih` на всех пяти ядрах, включая 7.2.15, обе
+предложенные правки (P548 и P549) и 7.3.4; а через `@th` он же на 7.3/7.3.4/G/P
+не двигается.** Это не два дефекта, это одно свойство: проверка написана на
+координату, а координата зависит от базы и от туннеля.
+
+## 1. Один байт, три туннеля, три координаты
+
+`nft_payload_inner_offset()` для UDP даёт `thoff + 8` — то есть начало *туннельного*
+заголовка, а не внутреннего IP. Значит смещение одной и той же величины (doff
+внутреннего TCP) — функция формы туннеля. Всё посчитано из кадра, а не задано:
+
+| кадр | база inner (skb) | внутренний TCP | doff-байт | `@ih` для doff | байт в кадре |
+|---|---|---|---|---|---|
+| plain (без туннеля) | 54 (`thoff + hdrlen`), за концом кадра | 34 | 46 | — | — |
+| vxlan (udp:4789 + 8) | 42 | 84 | 96 | 54 | **96** |
+| geneve opt_len 2 (udp:6081 + 16) | 42 | 92 | 104 | 62 | **104** |
+| ipip (proto 4) | 34 | 54 | 66 | 32 | **66** |
+
+Три числа в последней колонке — три координаты одного байта. Ни одно из них не
+равно 12, и ни одно из них ядро не вычисляет: для базы `inner` оно не знает ни
+внутреннего протокола, ни где начинается внутренний L4.
+
+## 2. Пять ядер, один и тот же байт через две базы (стоковый nft 1.1.7, гость)
+
+`nchg` — сколько байт кадра на дальней стороне отличается от кадра без правила
+(цепь `policy accept`, поэтому «отказано» видно как *неизменённый* кадр, а не как
+отсутствие пакета — это F28-й различие, и я на нём сегодня ошибся, см. §7).
+
+| форма (текст правила) | Q 7.2.15 | R 7.3 | B 7.3.4 | G +P549 | P +P548 |
+|---|---|---|---|---|---|
+| `@th,96,8 set 0x60` (plain, doff) | 46:50>60 | **нет** | **нет** | **нет** | **нет** |
+| `@th,104,8 set 0x02` (plain, flags) | 47:18>02 | 47:18>02 | 47:18>02 | 47:18>02 | 47:18>02 |
+| `@ih,432,8 set 0x60` (vxlan, doff) | 96:50>60 | 96:50>60 | 96:50>60 | 96:50>60 | 96:50>60 |
+| `@ih,440,8 set 0x02` (vxlan, flags) | 97:18>02 | ×5 | ×5 | ×5 | ×5 |
+| `@ih,432,16 set 0x6018` (vxlan, 2 байта) | 96:50>60 | ×5 | ×5 | ×5 | ×5 |
+| `@ih,496,8 set 0x60` (geneve opt 2) | 104:50>60 | ×5 | ×5 | ×5 | ×5 |
+| `@ih,256,8 set 0x60` (ipip) | 66:50>60 | ×5 | ×5 | ×5 | ×5 |
+| `@ih,432,8` на кадре без туннеля | нет | нет | нет | нет | нет |
+| `@ih,0,8` (флаги VXLAN) / `@ih,64,8` (внутренний eth) | 42:08>64 / 50:02>aa | ×5 | ×5 | ×5 | ×5 |
+
+Два контроля в этой таблице сильнее остальных: `@ih,432,8` на кадре без туннеля
+**не делает ничего** (база разрешается за конец кадра, выражение обрывается), а
+`@ih,0,8` и `@ih,64,8` двигают то, что лежит ниже внутреннего IP — значит это
+вообще не «магия внутреннего заголовка», а честная запись по смещению от конца
+внешнего UDP.
+
+**Что nft сам печатает об этом** (`--debug=netlink`), то есть что уходит на провод:
+
+```
+[ payload load 2b @ inner header + 54 => reg 1 ]
+[ bitwise reg 1 = ( reg 1 & 0x00ff ) ^ 0x6000 ]
+[ payload write reg 1 => 2b @ inner header + 54 csum_type 0 csum_off 0 csum_flags 0x1 ]
+```
+
+Биты в тексте правила (432) превращаются в байты (54) — nft делит на 8 сам; запись
+однобайтовая, но nft расширяет её до выровненного 2-байтового окна
+read-modify-write, поэтому байт-сосед остаётся благодаря маске. И `csum_flags 0x1`
+(`NFT_PAYLOAD_L4CSUM_PSEUDOHDR`) ставится **на каждую** запись с базой inner
+(`netlink_linearize.c`), а `csum_type 0` — потому что назвать внутреннюю сумму в
+синтаксисе нечем.
+
+## 3. Предикат стража измерен, а не выведен: 23 плеча, цепь `policy drop` + accept после записи
+
+Доставка пакета и есть ответ «стража не было» (отказ ставит `NFT_BREAK`, и `accept`
+после записи не достигается).
+
+| плечи | Q | R | B | G | P |
+|---|---|---|---|---|---|
+| transport, диапазон задевает байт 12 (`11.2`, `12.1`, `12.2`, `12.4`, `12.same`) | **5/5 доставлено** | **0/5** | **0/5** | **0/5** | **0/5** |
+| transport, `13.1` (не задевает) | 1/1 | 1/1 | 1/1 | 1/1 | 1/1 |
+| **inner, 10 плеч** (`50.8` … `56.2`, geneve `62.1`, ipip `32.1`, `54.2`, `54.4`) | **10/10** | **10/10** | **10/10** | **10/10** | **10/10** |
+| inner на кадре без туннеля (`plain.54.1`) | 0/1 | 0/1 | 0/1 | 0/1 | 0/1 |
+
+`covers12` для базы inner в логе стоит `-1` — не «нет», а «ядро такого числа не
+считает»: у него нет ни базы, ни длины внутреннего заголовка.
+
+## 4. Следствие: вердикт не пропускается
+
+`policy drop`, правило `<запись> counter accept`:
+
+| правило | Q | R | B | G | P |
+|---|---|---|---|---|---|
+| `@th,96,8 set 0x60 counter accept` (plain) | доставлено, counter **1** | отброшено, **0** | 0 | 0 | 0 |
+| `@ih,432,8 set 0x60 counter accept` (vxlan) | доставлено, counter **1** | **1** | **1** | **1** | **1** |
+| `counter accept` без записи | 1 | 1 | 1 | 1 | 1 |
+| без правила вовсе | нет пакета, счётчика нет | ×5 | | | |
+| `@ih,432,8 … accept` на кадре без туннеля | отброшено, 0 | ×5 | | | |
+
+То есть снаружи F27-й молчаливый no-op не только не пишет байт — он ещё и съедает
+вердикт правила; внутри туннеля за то же самое правило байт пишется и вердикт
+выполняется.
+
+## 5. Внутренняя контрольная сумма: дефект чётности F26 тоже не про базу
+
+`csum type inet`, `csum_offset` = 58 (`@ih`-смещение внутренней TCP-суммы):
+
+| плечо | смещение внутри внутреннего TCP | Q | R | B | G | P |
+|---|---|---|---|---|---|---|
+| `i.50.8`, `i.52.2`, `i.54.1`, `i.54.2`, `i.54.4`, `i.56.2`, `D.align.54` | чётное | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `i.53.2`, `i.55.1`, `D.odd.55` | **нечётное** | ✗ | ✗ | ✗ | ✗ | **✓** |
+| `D.none.55` (без фикса) | — | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `D.saddr.34` (смена saddr, псевдозаголовок) | чётное | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+`✓` = сумма на проводе сходится (пересчитано из кадра в Python, не взято у прибора).
+Отсюда два независимых утверждения: (1) дефект чётности F26 ***не*** специфичен для
+базы transport — он воспроизводится на базе inner ровно по тому же правилу; (2)
+фикс P548 (`csum_shift`, когда `(offset - hdr_off)` нечётно) закрывает и её, потому
+что он про порядок байт, а не про координату. А страж P549 не закрывает базу inner,
+потому что он как раз про координату. **Две правки независимы и ни одна не
+покрывает чужую дырку.**
+
+Отдельная строка, которую не надо смешивать: для базы inner
+`nft_payload_csum_write_ok()` возвращает `true` **без всякой проверки**, с
+комментарием «*offset is not validated, offset cannot be negative so real l3/l4
+headers cannot be mangled*». Измерение говорит обратное: `@ih 34` — это saddr
+внутреннего IPv4, `@ih 42` — начало внутреннего TCP, `@ih 58` — его контрольная
+сумма. Плечи `D.ip.22`/`D.ip.23` пишут в начало внутреннего IP-заголовка (в том
+числе в его `tot_len`) и всё равно получают «исправление» TCP-суммы, которой эти
+байты не покрыты — сумма становится неверной на всех пяти ядрах, а у `ip.22`
+внутренняя длина перестаёт разбираться вовсе (прибор честно печатает `itcsum=-1`).
+
+## 6. Опровергнутый прогноз — и это тоже результат
+
+P11: «на кадре VXLAN с *настоящей* внешней UDP-суммой обновление
+`L4CSUM_PSEUDOHDR` при нечётном смещении испортит внешнюю сумму» — **опровергнуто**.
+Обе руки (`@ih,432,8` и `@ih,440,8`) дают на проводе **верную** внешнюю UDP-сумму
+(13d5→03d5 и 13d5→13eb; пересчитано из кадра). Значит `nft_payload_l4csum_update()`
+в обеих чётностях работает правильно — в отличие от `nft_payload_csum_inet()`. Это
+не тот же код с тем же дефектом: два пути по-разному обходятся с порядком байт, и
+это стоит записать в письмо как «не чините то, что не сломано».
+
+## 7. Ошибки хода, все мои
+
+1. **Таблицы ожиданий в верификаторе были ключёваны с префиксом** (`"B.t.12.1"`,
+   `"C.th.do6"`), а поиск шёл по имени без префикса — двадцать с лишним проверок
+   ожиданий **молча не выполнялись**, и первый «0 failed» был слабее, чем выглядел.
+   Нашёл селфтест, не я.
+2. Проверка внешней UDP-суммы обнуляла поле перед свёрткой — все кадры читались как
+   битые; из-за этого я сначала «увидел» подтверждение P11 на испорченной арифметике
+   и только второй загрузкой получил правду.
+3. Датамные и кадровые координаты смешаны в верификаторе (96 против 82) — 18
+   красных проверок позиции, пока не развёл.
+4. `itcsum` для кадра без туннеля считался по внешнему TCP с внутренним
+   псевдозаголовком (косметика: 0 вместо −1).
+5. В секции A я ждал `cap=0` у отказанной записи — но у цепи `policy accept`, и
+   отказ виден как *неизменённый кадр*, а не как отсутствие пакета. Ошибка была в
+   верификаторе, а не в ядре (F28 мерил consequence отдельной цепью именно поэтому).
+6. Переименовал руки по ходу: смещение 22 — это **начало внутреннего IP-заголовка**,
+   а не saddr; `D.saddr.22/23` стали `D.ip.22/23`, а настоящий saddr — `D.saddr.34`.
+7. Мутация селфтеста писала `cap[96]` в 94-байтовую датаграмму — снова кадр против
+   датаграммы.
+8. Разбор cpio в верификаторе провенанса с неверным срезом поля `filesize` — поймал
+   до первого числа.
+
+## 8. Что не измерено, прямо
+
+Только IPv4-снаружи и три формы туннеля (VXLAN, GENEVE с opt_len 2, IPIP); GRE в
+этом ходе не мерился (F22 мерил там чтения, записи — нет). Внутри — только TCP;
+SCTP/UDP внутри, фрагменты, bridge/netdev-семейства не тронуты. `@ih` как *чтение*
+(nft шлёт load+mask+write) отдельно не изолировано. Внешняя UDP-сумма измерена на
+двух смещениях и одной ширине записи. Master не загружался: `nft_payload.c` в
+`v7.4-rc2-563-g97d73c8251` побайтно равен 7.3.4 — это утверждение F27 о файле, здесь
+не перепроверялось загрузкой. Память не затронута: 0 строк `KASAN/BUG:/Oops/WARNING:`
+в шести засчитанных загрузках (пять ядер, 7.3.4 — дважды).
+
+**Это не уязвимость**: правило ставит root в начальном user ns; последствие —
+свои же пакеты с испорченным внутренним заголовком и (в руках netlink-клиента) с
+испорченной суммой. Но это ровно та половина класса F27/F28, которую нельзя
+закрыть тем же фиксом, и в письмо она идёт отдельным пунктом с просьбой: проверять
+статические `offset/len/csum` на init (F28) **и** либо явно разрешить базу inner в
+документации как «сырую», либо считать для неё внутренний протокол.
+
+
+===== summary.json =====
+{
+  "finding": "F29",
+  "turn": 551,
+  "title": "The byte-12 guard protects a base, not a byte: the same TCP data-offset byte moves through the inner base on every measured kernel",
+  "date": "2026-11-15",
+  "question": "F28 closed the inventory of transport-base stores that die against nft_th_write_ok() on 7.3+. Does the same byte -- the doff byte of a real inner TCP header -- move when it is named through the inner base of a forwarded tunnel frame?",
+  "answer": "Yes, on all five measured kernels, including 7.2.15, 7.3, 7.3.4, 7.3.4+P549 (the refined guard) and 7.3.4+P548 (the parity fix). nft_payload_set_eval() never calls the guard for NFT_PAYLOAD_INNER_HEADER, and cannot: pkt->tprot is the outer protocol and priv->offset for that base is measured from the end of the outer UDP/GRE header.",
+  "frames": {
+    "plain": "eth+ip4+TCP (identical to the F27/F28 probe)",
+    "vxlan": "eth+ip4+UDP:4789+VXLAN8+eth+ip4+TCP, inner TCP doff byte at frame 96",
+    "geneve2": "eth+ip4+UDP:6081+GENEVE(opt_len 2)+eth+ip4+TCP, doff byte at frame 104",
+    "ipip": "eth+ip4(proto 4)+ip4+TCP, doff byte at frame 66",
+    "vxudp": "vxlan frame carrying a real (valid, non-zero) outer UDP checksum"
+  },
+  "coordinates": {
+    "inner_base_skb": {"vxlan": 42, "geneve2": 42, "ipip": 34},
+    "ih_offset_of_doff_byte": {"vxlan": 54, "geneve2": 62, "ipip": 32},
+    "frame_byte_of_doff": {"vxlan": 96, "geneve2": 104, "ipip": 66}
+  },
+  "kernels": {
+    "Q": "7.2.15 (no guard)",
+    "R": "7.3",
+    "B": "7.3.4 (two boots)",
+    "G": "7.3.4 + P549 (nft_th_write_ok compares the doff nibble)",
+    "P": "7.3.4 + P548 (csum_shift when the store starts at an odd offset)"
+  },
+  "results": {
+    "stock_nft_th_do6": {"Q": "applied (46:50>60)", "R": "no change", "B": "no change", "G": "no change", "P": "no change"},
+    "stock_nft_ih_vx_do6": {"Q": "96:50>60", "R": "96:50>60", "B": "96:50>60", "G": "96:50>60", "P": "96:50>60"},
+    "stock_nft_ih_geneve_do6": {"Q": "104:50>60", "R": "same", "B": "same", "G": "same", "P": "same"},
+    "stock_nft_ih_ipip_do6": {"Q": "66:50>60", "R": "same", "B": "same", "G": "same", "P": "same"},
+    "stock_nft_ih_on_plain_frame": "no change on all five (inner offset resolves past the frame)",
+    "netlink_inner_arms_delivered": {"Q": "10/10", "R": "10/10", "B": "10/10", "G": "10/10", "P": "10/10"},
+    "netlink_transport_arms_covering_12_delivered": {"Q": "5/5", "R": "0/5", "B": "0/5", "G": "0/5", "P": "0/5"},
+    "verdict_counter_with_policy_drop": {
+      "th.do6": {"Q": "delivered, counter 1", "R": "dropped, 0", "B": "dropped, 0", "G": "dropped, 0", "P": "dropped, 0"},
+      "ih.vx.do6": {"Q": "delivered, 1", "R": "delivered, 1", "B": "delivered, 1", "G": "delivered, 1", "P": "delivered, 1"}
+    },
+    "inner_tcp_checksum_with_csum_inet": {
+      "even_store_offsets": "valid on all five",
+      "odd_store_offsets": {"Q": "invalid", "R": "invalid", "B": "invalid", "G": "invalid", "P": "valid (parity fix)"},
+      "no_fixup": "invalid on all five",
+      "pseudo_header_change_at_ih_34": "valid on all five",
+      "store_outside_the_covered_region_at_ih_22_23": "checksum corrupted on all five: nft_payload_csum_write_ok() returns true for the inner base without looking"
+    }
+  },
+  "source_reading": {
+    "nft_payload_set_eval::INNER": "offset = nft_payload_inner_offset(pkt); if (offset < 0) goto err; -- no nft_th_write_ok()",
+    "nft_payload_csum_write_ok::INNER": "returns true, comment claims 'real l3/l4 headers cannot be mangled' -- measured false (@ih 22 is the inner IPv4 header, @ih 42 the inner TCP header)",
+    "nft_payload_inner_offset": "UDP -> thoff + sizeof(udphdr); GRE -> thoff + options; IPIP -> thoff",
+    "netlink_linearize.c": "every inner-base payload statement sets NFT_PAYLOAD_L4CSUM_PSEUDOHDR; csum_type stays 0 because nft has no syntax for the inner checksum"
+  },
+  "predictions": {
+    "file": "research/predictions_551.md",
+    "confirmed": ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P12"],
+    "refuted": {
+      "P11": "expected the L4CSUM_PSEUDOHDR update to break the OUTER UDP checksum at an odd store offset; measured: both an even (13d5->03d5) and an odd (13d5->13eb) store leave it exactly correct -- nft_payload_l4csum_update() is right in both parities, unlike nft_payload_csum_inet()"
+    }
+  },
+  "verification": {
+    "verify551.py": "1802 checks, 0 failed -- kernels by sha256, the differ and nft binary parsed out of the initrd, every frame re-parsed in Python with its own checksum arithmetic, every netlink geometry read from nft's own message, changed bytes derived from the captured datagram, parity recomputed",
+    "verify551_selftest.sh": "13 mutations, baseline green, each mutation reddens the check that owns the line",
+    "audit_f29_doc.py": "163 cells of SUMMARY tables and prose numbers recomputed from the logs, 0 mismatches",
+    "determinism": "two boots of 7.3.4 produce identical F551 lines (table names normalised)",
+    "splat": "0 KASAN/BUG:/Oops/WARNING: lines in the six counted boots"
+  },
+  "not_measured": [
+    "GRE as an inner-base store target (F22 measured reads there, not writes)",
+    "inner UDP/SCTP, inner fragments, bridge/netdev families",
+    "the @ih load half (nft emits load+mask+write) in isolation",
+    "the outer UDP checksum measured at only two offsets and one store width",
+    "master not booted: nft_payload.c in v7.4-rc2-563-g97d73c8251 equals 7.3.4 per F27's file comparison, not re-checked by boot"
+  ],
+  "severity": "not a vulnerability: the rule needs root in the initial user namespace; the consequence is one's own forwarded packets carrying a semantically corrupt inner TCP header, or (with a hand-written client) a wrong checksum",
+  "files": {
+    "summary": "findings/F29-inner-store-base/SUMMARY.md",
+    "battery": "vm/differ551_add.c",
+    "build": "vm/build_f29_differ.sh",
+    "runner": "tools/f29_run.sh",
+    "verifier": "tools/verify551.py",
+    "selftest": "tools/verify551_selftest.sh",
+    "audit": "tools/audit_f29_doc.py",
+    "predictions": "research/predictions_551.md",
+    "logs": ["logs/f29_B_rep1.log", "logs/f29_B_rep2.log", "logs/f29_Q_rep1.log",
+             "logs/f29_R_rep1.log", "logs/f29_G_rep1.log", "logs/f29_P_rep1.log"]
+  }
+}

@@ -1,0 +1,285 @@
+===== LETTER_SECTION_F65.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload and a GRO flow that nothing follows: two packets for
+ one send, and a byte cap that counts one byte more than the payload
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+F65 -- the packet that nothing follows
+
+A UDP datagram that begins a GRO flow and is not followed by another one is
+not delivered when it is sent.  On 7.3.4-T563 with x0's gro_flush_timeout at
+200 ms it reaches the forward chain 201 ms later, and a datagram that starts a
+new flow inside the poll that the timer itself runs reaches it one flush period
+after that: 402 ms, against 201 ms for the aggregate that preceded it in the
+same send.  The rule sees one send as two packets: an aggregate whose uh->len
+is the sum of three datagrams (0x04d0, a length no datagram in it has, with the
+first datagram's own CHECKSUM_PARTIAL seed 0xfcc2 in the checksum field) and a
+plain packet carrying the sender's untouched header (0x0208, 0xfcc2).
+
+A two-byte store into the UDP length field then has three fates, decided by the
+shape and not by the door: on a fraglist through a door that segments in
+software the splitter puts the head's length back (udp_set_len_short(8+mss)) and
+every datagram is delivered (512, 512, 200, 24); on a fraglist through a door
+that keeps GSO, and on a linear aggregate, every segment's checksum is computed
+against the stored number and the aggregate dies whole (3 errors, only the
+24-byte leftover delivered).
+
+The byte cap that ends aggregation is 65536 and it counts one byte more than the
+payload: 64 datagrams merge up to payload 1022 (64 x 1023 < 65536) and at 1023
+the 64th is refused (63 + 1).  UDP_GRO_CNT_MAX = 64 binds only below payload
+1023; above it the byte cap binds first, and at payload 1200 the aggregate is
+54 + 10.  The zero-length branch of udp_set_len() at GRO_LEGACY_MAX_SIZE is
+therefore unreachable for UDP on this kernel: both merge paths refuse at
+65536, so the largest UDP length a rule can read here is 0xff88 (65416).
+
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+
+===== SUMMARY.md =====
+# F65 — the packet that nothing follows: one send, two packets, two headers,
+# and a byte cap that counts one byte more than the payload
+
+Kernel `7.3.4-T563` (`1efbc957…2033`), the same image as F41..F64; nothing rebuilt.
+Instrument `vm/differ587_add.c` (generated `vm/differ587.c` from `differ586.c`),
+modes `flow` (9 arms) and `cap` (16 arms), **two boots × two attempts per arm**,
+three netns, F64's topology unchanged: `S` sends, the parent is the router
+(`x0` in, `y1`/`y2` out, one rule per arm in `ip6` table `f85p` chain `fwd`),
+`D` receives with a plain socket on 5000 and a `UDP_GRO` socket on 5001, a
+witness chain in its own netns, taps on `y3`/`y4`.
+
+Predicted before the first run: `research/predictions_587.md`
+(`6473a89f178f32225d2468aee27a5e7c80c1af133cfcf387f454b77089c8e5a2`).
+
+**What is new in the instrument.** F64's reader gave up 42 ms after it started,
+and the reason it missed the packet that nothing follows is exactly that. This
+receiver polls both sockets every 2 ms for **700 ms** and stamps every datagram
+it gets, so "when" is a number and not a guess. (The nft counter is no help: one
+`GETRULE` dump costs ~100 ms, which cannot time a 200 ms timer.)
+
+## 1. The datagram that nothing follows waits for the flush timer — and then one tick more
+
+| arm | datagrams | what the rule counts | packets the rule sees | when the socket gets them |
+|---|---|---|---|---|
+| `l_one_a` | 1×512 | **1** | 560 bytes, `uh->len` `0x0208` | **201 ms** |
+| `l_one_b` | 1×512 (`y2`) | 1 | 560, `0x0208` | 201 ms |
+| `l_two_a` | 2×512 | 1 | 1072, `0x0408` | 200–202 ms |
+| `l_two_u` | 2×512 (linear) | 1 | 1072, `0x0408`, check **seed(1032)** | 200 ms |
+| `l_mid_a` | 512,512,200,512 | **2** | 1272 (`0x04d0`) + 560 (`0x0208`) | **201, 201, 201, then 402** |
+| `l_mid_b` | the same (`y2`) | 2 | the same two | 200, 200, 200, then 400 |
+
+Two mechanisms, both measured:
+
+* **the first packet of a send is late by the deferred NAPI.** `x0` has
+  `gro_flush_timeout` 200 ms and `napi_defer_hard_irqs` 1 (F63's setting), so
+  the poll that would deliver the completed aggregate runs only when the timer
+  fires: every arm's first datagram arrives at **186–207 ms**, never at 0.
+* **the leftover is one flush period behind the aggregate it did not join.**
+  `l_mid_a`: the aggregate of three is completed by the *mismatch* (the 200-byte
+  datagram ends the flow), but it is delivered in the poll that the timer
+  schedules, and the fourth datagram — added to the fresh flow list in that same
+  poll — is kept by `__gro_flush_chain(flush_old = true)` because its
+  `age == jiffies` (`net/core/gro.c`), so it leaves on the **next** tick:
+  402 ms. In an arm where a second poll runs with `work_done = 0`
+  (`gro_flush_normal(gro, false)`) the same leftover leaves at once — the
+  difference between 205 ms (`l_mid_len_a`) and 402 ms (`l_mid_a`) is that
+  branch, and both were measured.
+
+F64's `g_mid_a` missed this datagram because its reader stopped 42 ms after it
+started; the datagram was not lost, it was 200 ms behind.
+
+## 2. One send, two packets, two headers — and the rule cannot tell which is which
+
+`l_mid_a`, one socket, four `sendto` calls, one rule instance:
+
+| packet | IPv6 payload length | `uh->len` | `uh->check` |
+|---|---|---|---|
+| the aggregate of three | `0x04d0` (1232 = 8+512+512+200) | `0x04d0` | `fcc2` = **seed(520)** — the first datagram's own seed |
+| the leftover | `0x0208` (520) | `0x0208` | `fcc2` = seed(520) |
+
+The aggregate's length is a number **no datagram in it has**; its checksum
+field is the *head datagram's* seed on the fraglist path and seed(whole) on the
+linear one (`l_two_u`: `uh->check` = seed(1032)). Which of the two the rule
+reads is decided by a device bit (`rx-gro-list` vs `rx-udp-gro-forwarding`) that
+the rule cannot see — F63's finding, now measured on a two-datagram send.
+
+## 3. A store into the length field: the shape decides, not the door
+
+`@th,4,2 = 0020` on the mid profile. The rule writes both packets — the
+aggregate (field `0x0020`, skb still 1232 bytes) and the leftover (`0x0020`,
+skb 520 bytes) — and then three different fates follow:
+
+| arm | shape / door | delivered | `Udp6InErrors` |
+|---|---|---|---|
+| `l_mid_len_a` | fraglist, `y1` (GSO kept) | **1**: the 24-byte leftover | **+3** |
+| `l_mid_len_b` | fraglist, `y2` (software split) | **4**: 512, 512, 200, **24** | 0 |
+| `l_mid_len_u` | linear, `y2` | **1**: the 24-byte leftover | **+3** |
+
+P5 predicted that the splitter "erases" the store on the aggregate and all
+three datagrams are delivered. **Refuted**: only the fraglist path through a
+door that segments in software erases it — `__udp_gso_segment_list()` puts the
+head's length back with `udp_set_len_short(uh, 8+mss)` and `skb_segment_list()`
+copies nothing. The other two shapes compute each segment's checksum against
+the *stored* number (`csum16_sub(uh->check, uh->len)`), so every segment is
+wrong and the aggregate dies whole. The 24-byte datagram is the same cell F64
+measured for a lone packet; here it arrives **after** the aggregate's three
+deaths, in the same send, under the same rule.
+
+## 4. The byte cap: 65536 counts one byte more than the payload — boundary at 1023/1024
+
+The count cap `UDP_GRO_CNT_MAX = 64` is not what binds for long datagrams.
+Measured (one aggregate per arm, message length = 40 + `uh->len`):
+
+| arm | payload | merged | `uh->len` | the rest |
+|---|---|---|---|---|
+| `k512x64_a` | 512 | 64 | `0x8008` (8+32768) | — |
+| `k961x64_a` | 961 | 64 | `0xf048` (8+61504) | — |
+| `k1016x64_a` | 1016 | 64 | `0xfe08` (8+65024) | — |
+| `k1022x64_a` | 1022 | **64** | `0xff88` (8+65408) | — |
+| `k1023x64_a` | 1023 | **63** | `0xfbc9` (8+64449) | own packet, `uh->len` `0x0407` |
+| `k1024x64_a` | 1024 | 63 | `0xfc08` | own packet, `0x0408` |
+| `k1200x64_a` | 1200 | **54** | `0xfd28` (8+64800) | second aggregate of 10, `0x2ee8` |
+| `k961x65_a` | 961 ×65 | 64 | `0xf048` | the 65th alone, `0x03c9` |
+
+The bisection is exact: 64 datagrams merge while `64 × (payload + 1) < 65536`,
+i.e. up to payload **1022**; at **1023** the 64th is refused. The cap is
+`65536` and it counts **one byte more than the payload per datagram**
+(`skb_gro_receive_list()`: `p->len + skb->len >= 65536`). My prediction said the
+boundary was at 961/962 (I counted the whole skb, 62+payload); that is
+**refuted**, and the six bisection arms were added *after* the first run — they
+test a derivation from source (`skb_pull(skb, skb_gro_offset(skb))` leaves the
+payload), and the derivation is wrong by one byte. What the byte is, is a named
+debt.
+
+`k961x65_a` separates the two caps: the same two packets as `k1023x64_a`, but
+for the opposite reason — 64 fit by bytes, and the 65th is refused by the
+**count**.
+
+## 5. BIG TCP's zero length is unreachable for UDP on this kernel
+
+No arm shows `uh->len == 0` or an IPv6 payload length of 0; the largest message
+measured is 65 520 bytes (`k1022x64_a`). Both merge paths refuse at
+`>= 65536`: `skb_gro_receive()` for any non-TCP flow
+(`if (unlikely(p->len + len >= GRO_LEGACY_MAX_SIZE)) { if (proto != IPPROTO_TCP
+|| encapsulated) return -E2BIG; }`) and `skb_gro_receive_list()`
+unconditionally. So `udp_set_len()`'s
+`len < GRO_LEGACY_MAX_SIZE ? htons(len) : 0` always takes the first branch and
+`udp_get_len()`'s `skb_is_gso` branch is dead for UDP GRO here. That is an
+answer about **reachability**, not a bug — and it closes the debt F64 named.
+
+## 6. The delivery split is a race, and it is not a checksum failure
+
+For arms where 64 datagrams arrive as one GSO skb on `y1` (the receiver splits
+them itself) **and** on `y2`, the socket received between **29 and 64** of them
+and `Udp6InErrors` rose by the difference: `k1200x64_a` 54+10, `k1200x64_b`
+54+10 (56+8 in the other boot), `k1022x64_a` 29+35, `k512x64_a` **64+0**. The
+conservation `delivered + errors == datagrams` holds in all 100 measured
+attempts, and the delivered ones start at index 0; the *size* of the prefix
+varies between two attempts of the same arm and between boots. It is not a
+checksum error (that would be deterministic): the candidate is the receive
+queue's memory limit charged segment by segment while a burst is enqueued
+faster than the reader drains it. **Named debt, not a conclusion.**
+
+## Predictions: 6 held, 5 refuted or narrowed
+
+Held: P1 (the lone packet is the sender's own header), P2 (fraglist seed vs
+linear seed), P3 (the mismatch completes the aggregate at once, the leftover
+waits), P4 (the leftover is late by the timer — 402 vs 201 ms, and the
+`flush_old = false` branch at 205 ms), P7/P8 (the cap arithmetic of
+`k961x65_a` and `k1200x64_a`), P12 (every `sendto` returns its length).
+
+Refuted or narrowed: **P5** (the store is erased only on the fraglist+software
+split; the other two shapes kill the aggregate), **P6** (the byte boundary is
+1023/1024, not 961/962), **P9** (BIG TCP is unreachable — held — but the
+largest measured length is 65 520, not 61 512), **P10** (door `b` does *not*
+always deliver everything: 54+10 in one boot, 56+8 in the other), **P11**
+(`Udp6InDatagrams` equals the datagram count only when nothing is dropped; for
+bursts it equals the delivered prefix).
+
+## Errors of the turn, all mine
+
+1. **F64's parent taps never opened** — the globals `F585_TA`/`F585_TB` start at
+   fd 0 and `f586_taps()` only opens a tap whose fd is negative, so every
+   `an`/`anall` in F64 was a dead witness. Found by this verifier; the fix
+   (`fd = -1`) is in `f587_setup()`, and even with it the parent taps stayed
+   empty in this build — all frame bytes below come from the *receiver's* tap.
+2. **The counter trace was useless**: `f555_count()` costs ~100 ms per call, so
+   a 25 ms sampling loop measured its own latency (the first smoke reported
+   "1@198" for everything). Replaced by per-datagram stamps in `D`.
+3. **P6's unit was wrong** (whole skb instead of payload) and the correcting
+   arms 1017..1022 were added *after* the first run: they are measurements, not
+   predictions, and are labelled so.
+4. **I killed a running boot by PID** while adding those arms — the PID was the
+   `timeout` wrapper of rep1, not a stray process (the F57 lesson, seventh
+   time in the project).
+5. **The verifier crashed instead of going red** twice (`slots()` indexing past
+   the profile when a mutated `n` exceeded it; `pkt_view()` unpacking three
+   values after a five-line rewrite) — both found by the selftest.
+6. **The verifier's model was wrong six times**: zero-padded RCV slots, the
+   flow label at IPv6 bytes 1..3 (not 3..5), the frame offset 14 (not 16),
+   `wany` counting frames on `y2` and packets on `y1`, the stored field vs the
+   skb length in the message, and the hop limit of a `skb_segment_list()` tail
+   (64, not 63).
+
+## What is verified
+
+| | |
+|---|---|
+| `tools/verify587.py` | **1723 checks, 0 failures** over both boots — provenance (kernel sha, initrd, differ **extracted from the initramfs**), 22 source anchors, the arm table **read out of `vm/differ587_add.c`**, the GRO model (shapes, message lengths, `uh->len`, checksum seeds, first payload bytes, frames on the door with every byte compared except the kernel's flow label, hop limits, `tp_status`), the socket's lengths and payload indices, conservation of delivered+errors, the timing bounds, and cross-boot determinism on every field that is not a race |
+| `tools/verify587_selftest.py` | **25/25** — baseline and no-op green, 23 single-clause mutations red without a traceback; two mutations were rejected by the selftest itself as "pattern absent" before being fixed |
+| collection | see `RESEARCH_LOG.md` |
+
+## What is not measured, directly
+
+* the mechanism behind the delivery split (queue budget? skb truesize? the
+  reader's pace?) — the numbers are in §6 and no claim is built on them;
+* **what the extra byte in the byte cap is**;
+* the parent taps (§Errors 1): why an `AF_PACKET` socket bound to `y1` in the
+  parent netns sees nothing, while the same call in `D` works;
+* `CHECKSUM_COMPLETE`, TCP-GRO, tunnels, a real NIC (still none in the project);
+* the `l_mid_a` shape instability: in 1 of 4 attempt-pairs the same four
+  datagrams became **1 + 2 + 1** packets instead of **3 + 1**, because a poll
+  boundary fell between two `sendto()` calls. That is a property of when the
+  sender's calls are batched, not of the datagrams — the verifier accepts any
+  shape a poll boundary can produce and reports the distribution.
+
+**Not a vulnerability**: all rules were installed by root in the initial user
+namespace (F57: the only context where a payload store is accepted at all).
+
+Files: `findings/F65-flow-starter/{SUMMARY.md, summary.json, VERIFY_REPORT.md,
+LETTER_SECTION_F65.txt}`; `vm/{differ587_add.c, differ587.c,
+build_f65_differ.sh, make_initramfs587.sh, build/differ587}`;
+`tools/{f65_run.sh, verify587.py, verify587_selftest.py, verify587_selftest.sh}`;
+`research/predictions_587.md`; logs `logs/f65_{rep1,rep2}.log`.
+
+
+===== summary.json =====
+{
+  "turn": 587,
+  "finding": "F65-flow-starter",
+  "kernel": "7.3.4-T563",
+  "kernel_sha256": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+  "instrument": "vm/differ587_add.c (modes flow: 9 arms, cap: 16 arms), 2 boots x 2 attempts",
+  "predictions": "research/predictions_587.md",
+  "predictions_sha256": "6473a89f178f32225d2468aee27a5e7c80c1af133cfcf387f454b77089c8e5a2",
+  "headline": {
+    "leftover_late_ms": {"l_mid_a": [201, 201, 201, 402], "l_mid_b": [200, 200, 200, 400]},
+    "first_datagram_ms_range": [186, 207],
+    "byte_cap_boundary_payload": {"k1022x64_a": 64, "k1023x64_a": 63, "k1024x64_a": 63},
+    "byte_cap_unit": "payload + 1 byte; 65536",
+    "big_tcp_udp_reachable": false,
+    "largest_message_bytes": 65520,
+    "store_into_length": {"l_mid_len_a": {"delivered": 1, "errors": 3},
+                          "l_mid_len_b": {"delivered": 4, "errors": 0},
+                          "l_mid_len_u": {"delivered": 1, "errors": 3}},
+    "delivery_split_range_of_64": [29, 64]
+  },
+  "predictions_result": {"held": ["P1", "P2", "P3", "P4", "P7", "P8", "P12"],
+                         "refuted": ["P5", "P6", "P10", "P11"], "narrowed": ["P9"]},
+  "verification": {"verify587": "1723 checks, 0 failures",
+                   "verify587_selftest": "25/25",
+                   "cross_boot": "every non-race field identical"},
+  "known_defects": ["parent AF_PACKET taps never open (also in F64)",
+                    "delivery split of a burst is a race, mechanism not measured",
+                    "what the extra byte of the byte cap is"]
+}

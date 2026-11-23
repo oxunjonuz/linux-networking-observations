@@ -1,0 +1,500 @@
+===== LETTER_SECTION_F56.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload: a static transport-store check is enforced at runtime,
+ and 14 nft spellings die silently (`tcp flags set` regressed in v7.3)
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+References: <the same Message-Id>
+
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+Theme: whether a four-byte tag is a byte of the frame or a word in the skb is
+decided by an offload capability, not by the protocol -- and on a bridged path
+with VLAN devices as ports it is neither at any door.
+
+Follows the earlier mails about the tag belonging to the egress device.  Two
+questions were left open there: the 802.1ad egress path, and the bridged (L2)
+path for the same four bytes.  Both are now measured on 7.3.4; 30 arms per boot,
+two boots.
+
+1. The TPID only selects which capability bit is consulted.  `vlan_hw_offload_-
+   capable()` maps 0x8100 to NETIF_F_HW_VLAN_CTAG_TX and 0x88a8 to
+   NETIF_F_HW_VLAN_STAG_TX (include/linux/if_vlan.h), and a veth advertises
+   both.  Clearing the bit with ETHTOOL_SFEATURES moves the *same* tag out of
+   the skb and into the frame:
+
+     x1.102 = vlan 102, proto 802.1ad, reorder cleared     -> wire 80 B, tag a word
+     same device, NETIF_F_HW_VLAN_STAG_TX cleared          -> wire 84 B, bytes
+                                                              88a8 0066 86dd
+     x1.103 = vlan 103, proto 802.1Q,  NETIF_F_HW_VLAN_CTAG_TX cleared
+                                                           -> wire 84 B as well
+
+   Witnesses: the PACKET_OUTGOING copy on the sending device (80 vs 84 bytes),
+   `NFULA_TCI` in the receiving device's `NFULA_VLAN` (absent in the byte case),
+   and the egress door of the real device, whose `NFULA_L2HDR` is 14 bytes with a
+   `vlan_tci` word and 18 bytes without one.
+
+2. One store, two destinations.  With the device's REORDER flag cleared,
+   `vlan_dev_hard_header()` has already put the tag in the bytes when the
+   netdev egress hook of the VLAN device runs, so `@ll,14,2 = 0x2066` is
+   accepted.  Then:
+
+     capability on    vlan_dev_hard_start_xmit() pops the in-band tag into
+                      skb->vlan_tci *reading the stored bytes*: the next door
+                      sees 88a8:2066 and the wire carries no tag at all;
+     capability off   the store stays in the frame: the wire is 84 bytes ending
+                      88a8 2066 86dd.
+
+   The receiving device demultiplexes the same vid in both cases.  What a rule
+   changes is not the fate but whether its byte ever leaves the machine as a
+   byte.
+
+3. With the REORDER flag *default* there is nothing to write at that door: the
+   tag is not built until `vlan_dev_hard_start_xmit()`, which runs after the
+   egress hook.  `@ll,14,2` there is refused by `nft_ll_write_ok()` (bound =
+   skb_mac_len = 14) and the packet is forwarded untouched; `@ll,12,2` is
+   accepted and lands in the frame's ethertype.  A read at the same door cannot
+   tell the two worlds apart -- `nft_payload_copy_vlan()` rebuilds the 18-byte
+   virtual header from skb->vlan_proto / skb_vlan_tag_get() / skb->protocol --
+   so read symmetry hides write asymmetry.
+
+4. On a bridge whose port is a VLAN device, the tag exists at no door at all.
+   `vlan_do_receive()` skips the byte reinsertion when the device is a bridge
+   port (`!netif_is_bridge_port(vlan_dev)`, net/8021q/vlan_core.c) and clears
+   the word unconditionally, so `@ll,12,2` at the bridge prerouting door is the
+   frame's own ethertype and a rule asking for `8100` misses.  The ingress
+   device's REORDER flag -- the flag that moved `@ll` by four bytes on a layer-3
+   device -- is not consulted: two ports with opposite flags give the same
+   answer.
+
+   On the way out nobody calls `vlan_dev_hard_header()` either (bridged frames
+   skip neighbour resolution), so the port's `vlan_dev_hard_start_xmit()` writes
+   its *own* vid as a word after the last door: a frame that arrived with vid 101
+   leaves with vid 102, a wire of 80 bytes with no tag in it, and the far end
+   demultiplexes 102.  Reproducer, in full:
+
+     ip link add br0 type bridge
+     ip link add link x1 name x1.101 type vlan id 101 protocol 802.1Q
+     ip link set x1.101 type vlan reorder-hdr off
+     ip link add link y1 name y1.102 type vlan id 102
+     ip link set x1.101 master br0; ip link set y1.102 master br0
+     nft add table bridge t
+     nft 'add chain bridge t pre { type filter hook prerouting priority 0; }'
+     nft add rule bridge t pre counter accept      # counts 1
+     nft add rule bridge t pre '@ll,12,2' '0x8100' counter accept
+                                                   # counts 0: not a tag
+     nft add rule bridge t pre '@ll,14,2 set 0x0067' counter accept
+                                                   # refused, packet unaffected
+
+   And the same offset at the egress port's own door is refused for a different
+   reason yet again: there the frame is 14 bytes of header and no tag, so the
+   bound is mac_len.
+
+5. A correction to my earlier mail: `Ip6InReceives +2 / Ip6InDiscards +1` on a
+   VLAN device with IPv6 disabled is not a second packet.  `ip6_rcv_core()`
+   counts IPSTATS_MIB_IN before it checks `idev->cnf.disable_ipv6` and then
+   counts IPSTATS_MIB_INDISCARDS for the same skb
+   (net/ipv6/ip6_input.c:206,211).
+
+Measured with 9411 independent checks over two boots (every door counter, every
+snmp6 delta, every NFLOG message with its header length, VLAN nest, payload and
+hop limit at the index that payload implies, both taps, every read/store outcome
+and the byte it had to see or replace).  Six of my 28 predictions did not survive
+(P12, P19, P22, P26, P27 and a clause of P16) and are recorded as refuted in the finding.
+
+The consequence worth stating plainly: on the bridged path the frame's ethertype
+and the tag's word live at the same `@ll` offset on different doors, and which
+one a rule touches depends on a flag of a device the rule does not name.
+
+
+===== SUMMARY.md =====
+# F56 — the tag is a byte or a word according to a capability, and on the bridged path it is neither
+
+Kernel: `7.3.4-T563`, `1efbc957…2033` (the F41..F55 image, no new build).
+Instrument: `differ578`, two modes, **30 arms in each of two boots**.
+Logs: `logs/f56_rep1.log`, `logs/f56_rep2.log`; tables below are the output of
+`tools/f578_summary.py` (derived from the log, not typed).
+
+## What was asked
+
+577 named two holes:
+
+1. the bridged (L2) path for the same four tag bytes — F52 saw the tag there
+   only as metadata, F53 only on a layer-3 device behind a cleared
+   `VLAN_FLAG_REORDER_HDR`, and 577 only the routed path;
+2. 802.1ad on the egress path — a device whose `vlan_proto` is 88a8, where
+   `validate_xmit_vlan()`'s rule about which tags are pushed into bytes is a
+   different branch.
+
+Both turn out to be the same question: **where does the tag live at the moment
+a rule touches it, and who reads it afterwards**. The answer is not a property
+of the protocol: it is a capability bit (`NETIF_F_HW_VLAN_{C,ST}AG_TX`) and, on
+the bridge, a function that is not called at all.
+
+## Mode `ad` — the routed frame, four egress devices
+
+`x1.101` (vid 101, 8100, REORDER cleared) receives a tagged frame;
+`x1.102` (102, **88a8**, cleared), `x1.103` (103, 8100, cleared) and `x1.104`
+(104, 88a8, **default**) are three possible egress devices, one per
+destination; `x0.102/.103/.104` demultiplex at the far end. Seven doors:
+`g6` ip6 prerouting, `f6` ip6 forward, `e2/e3/e4` netdev egress of the VLAN
+device, `p1` netdev egress of the real device `x1`, `r0` netdev ingress of `x0`.
+The two capability bits of `x1` are set and cleared per arm with
+`ETHTOOL_SFEATURES` and read back with `ETHTOOL_GFEATURES` (CTAG_TX = bit 7,
+STAG_TX = bit 45; both are in a veth's `hw_features`).
+
+## T1 — mode `ad`: what the rule did, and where the tag was
+
+| arm | frame | bits | action | ch | tap0 B | tap0 tci:tpid | egress-door L2 | p1 L2 | p1 nest | far end | u6n |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ctl2` | A | 0 |  | -1 | 80 | 0066:88a8 | 18 | 14 | 88a8:0066 | x0.102 1:66:0 | 0 |
+| `rd_e2` | A | 0 | rd@e2:12:2:88a8 | 1 | 80 | 0066:88a8 | 18 | 14 | 88a8:0066 | x0.102 1:66:0 | 0 |
+| `rd_p1` | A | 0 | rd@p1:12:2:88a8 | 1 | 80 | 0066:88a8 | 18 | 14 | 88a8:0066 | x0.102 1:66:0 | 0 |
+| `w14_e2` | A | 0 | set@e2:14:2:- | 1 | 80 | 2066:88a8 | 18 | 14 | 88a8:2066 | x0.102 1:66:0 | 0 |
+| `ctl2s` | A | 1 |  | -1 | 84 | -:0000 | 18 | 18 | none | x0.102 1:66:0 | 0 |
+| `w14_e2s` | A | 1 | set@e2:14:2:- | 1 | 84 | -:0000 | 18 | 18 | none | x0.102 1:66:0 | 0 |
+| `ctl3` | B | 0 |  | -1 | 80 | 0067:8100 | - | 14 | 8100:0067 | x0.103 1:66:0 | 0 |
+| `w14_e3` | B | 0 | set@e3:14:2:- | 1 | 80 | 6067:8100 | - | 14 | 8100:6067 | x0.103 1:66:0 | 0 |
+| `ctl3c` | B | 2 |  | -1 | 84 | -:0000 | - | 18 | none | x0.103 1:66:0 | 0 |
+| `w14_e3c` | B | 2 | set@e3:14:2:- | 1 | 84 | -:0000 | - | 18 | none | x0.103 1:66:0 | 0 |
+| `ctl4` | E | 0 |  | -1 | 80 | 0068:88a8 | - | 14 | 88a8:0068 | x0.104 1:66:0 | 0 |
+| `w14_e4` | E | 0 | set@e4:14:2:- | 0 | 80 | 0068:88a8 | - | 14 | 88a8:0068 | x0.104 1:66:0 | 0 |
+| `w12_e4` | E | 0 | set@e4:12:2:- | 1 | 80 | 0068:88a8 | - | 14 | 88a8:0068 | x0.104 1:66:0 | 0 |
+| `w_tci_p1` | A | 0 | set@p1:14:2:- | 1 | 80 | 0067:88a8 | 18 | 14 | 88a8:0066 | - | 0 |
+| `w_proto_p1` | A | 0 | set@p1:12:2:- | 1 | 84 | -:0000 | 18 | 14 | 88a8:0066 | - | 0 |
+| `rd_r0` | A | 0 | rd@r0:12:2:88a8 | 1 | 80 | 0066:88a8 | 18 | 14 | 88a8:0066 | x0.102 1:66:0 | 0 |
+
+### The TPID does not decide byte-vs-word; the bit does
+
+`vlan_hw_offload_capable()` maps 8100 to `NETIF_F_HW_VLAN_CTAG_TX` and 88a8 to
+`NETIF_F_HW_VLAN_STAG_TX` — and a veth advertises **both**. So with a veth peer
+the tag is a word no matter which protocol it is, and clearing the bit moves the
+*same* tag into the bytes:
+
+## T2 — mode `ad`: the tag at the two doors and on the wire
+
+| arm | device proto | reorder | tag in bytes at the egress door | tag at p1 | wire | far-end demux |
+|---|---|---|---|---|---|---|
+| `ctl2` | 88a8 | cleared | L2 18 B: 469db7465bb76a79a9aaa31b88a8006686dd | 88a8:0066 | 80 B | x0.102 |
+| `rd_e2` | 88a8 | cleared | L2 18 B: 469db7465bb76a79a9aaa31b88a8006686dd | 88a8:0066 | 80 B | x0.102 |
+| `rd_p1` | 88a8 | cleared | L2 18 B: 469db7465bb76a79a9aaa31b88a8006686dd | 88a8:0066 | 80 B | x0.102 |
+| `w14_e2` | 88a8 | cleared | L2 18 B: 469db7465bb76a79a9aaa31b88a8006686dd | 88a8:2066 | 80 B | x0.102 |
+| `ctl2s` | 88a8 | cleared | L2 18 B: 469db7465bb76a79a9aaa31b88a8006686dd | no word | 84 B | x0.102 |
+| `w14_e2s` | 88a8 | cleared | L2 18 B: 469db7465bb76a79a9aaa31b88a8006686dd | no word | 84 B | x0.102 |
+| `ctl3` | 8100 | cleared | L2 18 B: 469db7465bb76a79a9aaa31b8100006786dd | 8100:0067 | 80 B | x0.103 |
+| `w14_e3` | 8100 | cleared | L2 18 B: 469db7465bb76a79a9aaa31b8100006786dd | 8100:6067 | 80 B | x0.103 |
+| `ctl3c` | 8100 | cleared | L2 18 B: 469db7465bb76a79a9aaa31b8100006786dd | no word | 84 B | x0.103 |
+| `w14_e3c` | 8100 | cleared | L2 18 B: 469db7465bb76a79a9aaa31b8100006786dd | no word | 84 B | x0.103 |
+| `ctl4` | 88a8 | default | L2 14 B: 469db7465bb76a79a9aaa31b86dd | 88a8:0068 | 80 B | x0.104 |
+| `w14_e4` | 88a8 | default | L2 14 B: 469db7465bb76a79a9aaa31b86dd | 88a8:0068 | 80 B | x0.104 |
+| `w12_e4` | 88a8 | default | L2 14 B: 469db7465bb76a79a9aaa31b86dd | 88a8:0068 | 80 B | x0.104 |
+| `w_tci_p1` | 88a8 | cleared | L2 18 B: 469db7465bb76a79a9aaa31b88a8006686dd | 88a8:0066 | 80 B | - |
+| `w_proto_p1` | 88a8 | cleared | L2 18 B: 469db7465bb76a79a9aaa31b88a8006686dd | 88a8:0066 | 84 B | - |
+| `rd_r0` | 88a8 | cleared | L2 18 B: 469db7465bb76a79a9aaa31b88a8006686dd | 88a8:0066 | 80 B | x0.102 |
+
+Four arms, one store (`@ll,14,2 = 0x2066`), one device, and two places for the
+result: with the capability on, `vlan_dev_hard_start_xmit()` pops the in-band
+tag into `skb->vlan_tci` **reading the bytes the store wrote** — the word at the
+next door is `88a8:2066` and the wire is 80 bytes with no tag in them; with the
+bit cleared the same store stays in the bytes and the wire is 84 bytes ending
+`88a8 2066 86dd`. The far end demultiplexes `x0.102` in **both** cases: what
+changed is not the fate, but whether a rule's byte ever left the machine as a
+byte.
+
+### At the egress door of a REORDER-default device there is nothing to write
+
+`vlan_dev_hard_header()` writes the tag only when `VLAN_FLAG_REORDER_HDR` is
+cleared; with the flag default the tag is not built until
+`vlan_dev_hard_start_xmit()`, which runs **after** the egress hook. The frame at
+`e4` therefore has no tag in its bytes and none in a word, so:
+
+* `@ll,14,2 = 0x2066` at `e4` is **refused** (`ch0 = 0`, the packet is
+  forwarded untouched) — the write bound is `mac_len = 14`, and 14+2 > 14;
+* `@ll,12,2 = 0x0806` at the same door is accepted and lands in the frame's
+  ethertype — the far end still demultiplexes `x0.104` by the word, and its
+  stack then reads 0806.
+
+### Read symmetry, write asymmetry
+
+`rd_p1` reads `@ll,12,2 = 88a8` and `@ll,14,2 = 0066` at a door where the tag is
+only a word, and `rd_e2` reads the same two values from the bytes:
+`nft_payload_copy_vlan()` rebuilds the 18-byte virtual header from
+`skb->vlan_proto`, `skb_vlan_tag_get()` and `skb->protocol`, and subtracts 4 for
+offsets ≥ 18, so a read cannot tell the two worlds apart. Only a store, and the
+wire, can. The same store into the word at `p1` (`w_tci_p1`, vid → 103) changes
+what the far end demultiplexes — nothing finds `88a8/103`, the frame becomes
+`PACKET_OTHERHOST`, `x0.102` receives 0 and `x0`'s `rx_otherhost` grows by 1;
+and `w_proto_p1` (0806 into the proto word) shows that an un-offloadable TPID is
+pushed inside by `validate_xmit_vlan()`: an 84-byte wire whose first tag is
+`0806 0066`, and a far end that demultiplexes nothing at all.
+
+## Mode `br` — the bridged frame, VLAN devices as bridge ports
+
+`br0` with three ports: `x1.101` (vid 101, REORDER **cleared**), `z1.101`
+(vid 101, REORDER **default**) and `y1.102` (vid 102) as the way out;
+`y0.102` demultiplexes at the far end. Ten doors: `bv` bridge prerouting, `bf`
+bridge forward (once per copy), `bl` bridge local-in, `gv` ip6 prerouting on
+`br0`, `n1`/`nz` netdev ingress of the two real devices, `q1` netdev ingress of
+`x1.101`, `e2` netdev egress of `y1.102`, `p1` netdev egress of `y1`, `ry`
+netdev ingress of `y0`.
+
+## T3 — mode `br`: the door census and the fate
+
+| arm | frame | doors | ch | wire | ry nest | y0.102 | u6n |
+|---|---|---|---|---|---|---|---|
+| `ctl_x` | C | bv=1 bf=2 bl=1 gv=1 n1=1 nz=0 q1=1 e2=1 p1=1 ry=1 | -1 | 80 B | 8100:0066 | 1:66:0 | 1 |
+| `rd_bv` | C | bv=1 bf=2 bl=1 gv=1 n1=1 nz=0 q1=1 e2=1 p1=1 ry=1 | 1 | 80 B | 8100:0066 | 1:66:0 | 1 |
+| `rd_bvt` | C | bv=1 bf=2 bl=1 gv=1 n1=1 nz=0 q1=1 e2=1 p1=1 ry=1 | 0 | 80 B | 8100:0066 | 1:66:0 | 1 |
+| `rd_n1` | C | bv=1 bf=2 bl=1 gv=1 n1=1 nz=0 q1=1 e2=1 p1=1 ry=1 | 0 | 80 B | 8100:0066 | 1:66:0 | 1 |
+| `rd_bv_z` | D | bv=1 bf=2 bl=1 gv=1 n1=0 nz=1 q1=0 e2=1 p1=1 ry=1 | 1 | 80 B | 8100:0066 | 1:66:0 | 1 |
+| `rd_nz` | D | bv=1 bf=2 bl=1 gv=1 n1=0 nz=1 q1=0 e2=1 p1=1 ry=1 | 0 | 80 B | 8100:0066 | 1:66:0 | 1 |
+| `rd_q1` | C | bv=1 bf=2 bl=1 gv=1 n1=1 nz=0 q1=1 e2=1 p1=1 ry=1 | 1 | 80 B | 8100:0066 | 1:66:0 | 1 |
+| `rd_e2` | C | bv=1 bf=2 bl=1 gv=1 n1=1 nz=0 q1=1 e2=1 p1=1 ry=1 | 1 | 80 B | 8100:0066 | 1:66:0 | 1 |
+| `rd_bl` | C | bv=1 bf=2 bl=1 gv=1 n1=1 nz=0 q1=1 e2=1 p1=1 ry=1 | 1 | 80 B | 8100:0066 | 1:66:0 | 1 |
+| `rd_ry` | C | bv=1 bf=2 bl=1 gv=1 n1=1 nz=0 q1=1 e2=1 p1=1 ry=1 | 1 | 80 B | 8100:0066 | 1:66:0 | 1 |
+| `w12_bv` | C | bv=1 bf=2 bl=1 gv=1 n1=1 nz=0 q1=1 e2=1 p1=1 ry=1 | 1 | 80 B | 8100:0066 | 1:66:0 | 1 |
+| `w12_e2` | C | bv=1 bf=2 bl=1 gv=1 n1=1 nz=0 q1=1 e2=1 p1=1 ry=1 | 1 | 80 B | 8100:0066 | 1:66:0 | 1 |
+| `w14_e2` | C | bv=1 bf=2 bl=1 gv=1 n1=1 nz=0 q1=1 e2=1 p1=1 ry=1 | 0 | 80 B | 8100:0066 | 1:66:0 | 1 |
+| `w16_ry` | C | bv=1 bf=2 bl=1 gv=1 n1=1 nz=0 q1=1 e2=1 p1=1 ry=1 | 1 | 80 B | 8100:0066 | 1:66:0 | 1 |
+
+### The tag exists nowhere on the way in
+
+`vlan_do_receive()` skips the byte reinsertion when the device is a bridge port
+(`vlan_core.c:41-43`: `!netif_is_bridge_port(vlan_dev)`) and then clears the
+word unconditionally. So at `bv` the frame is untagged **in both worlds**: the
+read `@ll,12,2` returns the frame's own ethertype `86dd` (`rd_bv` = 1) and the
+negative control `8100` misses (`rd_bvt` = 0), while the same frame's message at
+`n1` still carries `NFULA_VLAN = 8100:0065` — the word was there one door
+earlier.
+
+The flag that moved `@ll` by four bytes in F53 is not consulted at all here:
+`rd_bv_z` sends the same frame through `z1.101`, whose REORDER flag is the
+default, and reads the same `86dd`; `rd_nz`/`rd_n1` agree. On a bridge port the
+flag is dead code.
+
+### …and it is created after the last door
+
+| door | what the frame is there | witness |
+|---|---|---|
+| `e2` (egress of `y1.102`) | no tag in the bytes and no word | `rd_e2` reads `@ll,12,2 = 86dd` and `@ll,18,2 = 001a`; `w14_e2` at this door is **refused** (bound = `mac_len` = 14) |
+| `p1` (egress of `y1`) | the word `8100:0066` exists | `@ll` sees it via the rebuild, `NFULA_VLAN = 8100:0066` |
+| wire | 80 bytes, no tag in them | tap0 |
+| `ry` (ingress of `y0`) | the word `8100:0066` | message nest; `rd_ry` reads `8100`/`0066` |
+
+The port's `vlan_dev_hard_start_xmit()` writes `vlan->vlan_id | mask` — vid
+**102**, although the frame arrived with vid **101**. The L2 path's tag is the
+egress device's on both ends, exactly as F54 found for the routed path, but here
+nobody builds the header on the way out: on the bridge the tag is a word at the
+last door and a word on the wire, and no byte of the frame ever holds it.
+
+## T4 — mode `br`: the four stores, and what each one hit
+
+| arm | door | offset | what the offset is there | counter | wire bytes 12..17 | far end |
+|---|---|---|---|---|---|---|
+| `w12_bv` | bv | 12 | the frame's ethertype (the tag does not exist) | 1 | 080660000000 | y0.102 1, other 0 |
+| `w12_e2` | e2 | 12 | the frame's ethertype (no tag at this door) | 1 | 080660000000 | y0.102 1, other 0 |
+| `w14_e2` | e2 | 14 | past mac_len = 14: refused | 0 | 86dd60000000 | y0.102 1, other 0 |
+| `w16_ry` | ry | 16 | the frame's 12..13 (vlan_hlen = 4) | 1 | 86dd60000000 | y0.102 1, other 0 |
+
+<!-- derivations differ between the boots: 0 -->
+
+Two stores at the same egress door hit two different objects: offset 12 is the
+frame's ethertype (accepted, the wire leaves with `0806` in the bytes and the
+far end still demultiplexes by the word), offset 14 is refused. At the *receiving*
+door `ry` the same offset 16 lands on the frame's 12..13 (`vlan_hlen = 4`) and is
+accepted, because `nft_ll_write_ok()` exempts netdev ingress from the bound.
+
+## One correction to the record
+
+F54 and F55 both reported `Ip6InReceives +2 / Ip6InDiscards +1` on this topology
+and called it "the same double count". The mechanism is now named: the receiving
+VLAN device has IPv6 disabled, and `ip6_rcv_core()` counts
+`__IP6_UPD_PO_STATS(IPSTATS_MIB_IN)` **before** it looks at
+`idev->cnf.disable_ipv6` — and then counts `IPSTATS_MIB_INDISCARDS` for the same
+packet (`net/ipv6/ip6_input.c:206,211`). The second receive-counter is not a
+second packet.
+
+## Predictions: 21 of 28, and five clauses did not survive
+
+`research/predictions_578.md`, written before the first smoke.
+
+* Held: P1–P7, P9–P11, P13–P15, P17, P18, P20, P21, P23, P24, P25, P28.
+* **P8 and P10 were wrong in their value, not their mechanism**: I stored
+  `0x2066` into a vid-103 device, which is vid 102 — the frame became
+  `PACKET_OTHERHOST` instead of keeping its vid and changing only the PCP. The
+  arm was re-armed with `0x6067` (PCP 3, vid 103) before the full run.
+* **P12 refuted**: I expected the store into the word at the egress door of the
+  REORDER-default device to be *overwritten* by
+  `vlan_tci = vlan->vlan_id | mask`. Measured: the store is refused, because at
+  that door there is no tag at all; the bound is `mac_len`.
+* **P19 refuted**: at the netdev ingress door `@ll,12,2` returns `8100`, not the
+  frame's `86dd` — a present word makes the read virtual even there. The
+  distinction that matters is not ingress-vs-egress but word-present-vs-absent.
+* **P22 refuted**: I expected the bridged egress door to read the tag through the
+  rebuild (`8100`/`6000`). Measured `86dd`/`001a`: there is no word at `e2`.
+* **P26 refuted**: I expected offset 12 at `e2` to be the proto word. Measured:
+  it is the frame's ethertype, accepted, and the far end still demultiplexes.
+* **P27 refuted**: offset 14 at `e2` is refused, not a vid change.
+* **P16 partly refuted**: `bf` counts **2**, not 1 — the bridge floods to two
+  other ports (`z1.101` and `y1.102`), and the copy that left `z1.101` came back
+  as `x0`'s `rx_otherhost +1` in the frame-D arms.
+
+## Errors of the turn, all mine
+
+1. Both modes ran in one boot but each door was given the same table name, so the
+   second chain of a table (`f6` in `f78a`, where `pre0` already existed with
+   another hook) was refused with `-EOPNOTSUPP` — one table per door now.
+2. `ENV` in mode `br` prints `f555_ifindex("x1.101")` twice (under `n1`) and never
+   prints `z1`'s or `y1`'s index; the verifier has to skip one indev check and
+   says so. Cosmetic, left in place.
+3. A blind `A_E2 → B_E2` rename in the arm table pointed three mode-`ad` arms at
+   out-of-range door indices; the first smoke printed `a0=(null)` and `rc0=-2`.
+4. The poll loop read all seventeen counters per iteration through netlink, which
+   cost **2.8 minutes per arm**; the first full run was killed after 7 arms and
+   the loop rewritten to read one. The per-arm `f573_settle()` (3 s) was replaced
+   by a 120 ms sleep.
+5. `pkill -f "f56_run.sh full"` matched my own shell and killed it — the sixth
+   time in this project (F47 #6, F54 #4, F55 #6, F57 #6). The first full run's
+   qemu survived the kill of its driver and kept writing into the log I had just
+   deleted; it was stopped by **pid**, not by pattern, and the run restarted.
+6. The verifier's model was wrong eleven times before it went green; the five that
+   matter are recorded above as refuted predictions, and two more were pure
+   arithmetic: I forgot that `ip6_forward()` decrements the hop limit before the
+   frame is written (every tap comparison failed on that byte), and I rebuilt the
+   wire from the frame as the instrument *sends* it instead of as the router
+   *rewrites* it (destination and source swap).
+7. `f578_snapshot` resets its struct on every call, so the local-delivery count
+   (`u6n`) was lost between polls and every mode-`br` arm printed `u6n=0` while
+   `Udp6InDatagrams` grew by one. The count is now accumulated outside the
+   snapshot.
+8. The `AF_PACKET` auxdata of the tap is computed at **dequeue** time
+   (`packet_recvmsg`), not at the door, and on this kernel it reported
+   `tp_vlan_tci = 0066` together with a `tp_status` that lacks
+   `TP_STATUS_VLAN_VALID` — a combination the `packet_recvmsg` source I read says
+   cannot happen. I did not use the auxdata for any claim in this finding; only
+   its length and its first bytes are witnesses.
+
+## What is not measured, plainly
+
+* No real NIC was used: `NETIF_F_HW_VLAN_{C,ST}AG_TX` was cleared by hand on a
+  veth, so "a device that cannot offload" is simulated, not observed on hardware.
+* The tap shows the frame only after `skb_vlan_untag()` when the wire carried a
+  TPID, so the "tag in bytes on the wire" is witnessed by the *sending* device's
+  `PACKET_OUTGOING` copy, not by the receiver.
+* Three or more tags; QinQ on the bridged path; `inet`/`ip6`-family chains on a
+  bridge port; `br_netfilter`; IPv4 frames; GSO/`CHECKSUM_PARTIAL` on real
+  hardware — none of these were touched.
+* `nft_payload` on a *bridge* door with a device that has `mac_len != 0` and a
+  word present at once (the combination that would make `@ll,16` write the frame
+  at 12 on a bridge) was not measured; only the ingress door provides it here.
+* **Not a vulnerability**: every rule in this finding was installed by root in
+  the initial user namespace. What was measured are consequences: the tag's
+  whereabouts at a door decide whether a store can reach the wire at all, and on
+  the bridged path the frame's own ethertype and the tag's word share the same
+  `@ll` offset on different doors.
+
+## Files
+
+* `findings/F56-tag-or-word/{SUMMARY.md, summary.json, VERIFY_REPORT.md,
+  LETTER_SECTION_F56.txt}`
+* `vm/{differ578_add.c, build_f56_differ.sh, make_initramfs578.sh,
+  build/differ578}`
+* `tools/{f56_run.sh, verify578.py, verify578_selftest.sh, f578_mutate.py,
+  f578_summary.py, audit_f56_doc.py}`
+* `research/predictions_578.md`; logs `logs/f56_{rep1,rep2}.log`
+
+
+===== summary.json =====
+{
+  "turn": 578,
+  "finding": "F56",
+  "title": "the tag is a byte or a word according to an offload capability, not the TPID, and on a bridged path with VLAN ports it exists at no door at all",
+  "answer_short": "with a REORDER-cleared egress VLAN device the tag sits in the frame's bytes at the device's egress door; whether it then leaves as bytes or is popped into skb->vlan_tci is decided by NETIF_F_HW_VLAN_{C,ST}AG_TX (clearing the bit moves the same tag from the word to the wire), while with the flag default there is no tag at that door at all and the store is refused by the mac_len bound; on a bridge whose port is a VLAN device vlan_do_receive() drops the tag (bridge-port clause) so every bridge door sees an untagged frame and the ingress device's flag is not consulted, and the egress port writes its own vid as a word after the last door",
+  "kernel": "7.3.4-T563",
+  "kernel_sha256": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+  "boots": 2,
+  "arms": {
+    "ad": 16,
+    "br": 14
+  },
+  "frames_per_arm": 1,
+  "doors": [
+    "g6 ip6 prerouting",
+    "f6 ip6 forward",
+    "e2 netdev egress x1.102 (vid 102, 88a8)",
+    "e3 netdev egress x1.103 (vid 103, 8100)",
+    "e4 netdev egress x1.104 (vid 104, 88a8, REORDER default)",
+    "p1 netdev egress x1 (the real device)",
+    "r0 netdev ingress x0",
+    "bv bridge prerouting on br0",
+    "bf bridge forward (once per copy)",
+    "bl bridge local-in",
+    "gv ip6 prerouting on br0",
+    "n1 netdev ingress x1",
+    "nz netdev ingress z1",
+    "q1 netdev ingress x1.101",
+    "e2 netdev egress y1.102 (bridge port)",
+    "p1 netdev egress y1",
+    "ry netdev ingress y0"
+  ],
+  "facts": {
+    "capability_bits": "CTAG_TX = bit 7, STAG_TX = bit 45 of netdev_features_t; both are in a veth's hw_features, cleared per arm by ETHTOOL_SFEATURES and read back by ETHTOOL_GFEATURES",
+    "88a8_capability_on": "wire 80 bytes; the tag is a word (NFULA_VLAN 88a8:0066 at the real device's egress door), no VLAN bytes in the frame",
+    "88a8_capability_off": "wire 84 bytes ending 88a8 0066 86dd; no NFULA_VLAN at that door",
+    "8100_capability_off": "wire 84 bytes ending 8100 0067 86dd -- the TPID picks the bit, the bit decides",
+    "store_tci_at_88a8_egress_door": "accepted; the pop into skb->vlan_tci reads the stored bytes: next door 88a8:2066, wire 80 bytes, far end still demuxes x0.102",
+    "store_tci_with_capability_off": "the store stays in the frame: wire 84 bytes ending 88a8 2066 86dd",
+    "store_tci_at_reorder_default_door": "refused (counter 0, packet forwarded): there is no tag at that door and the bound is skb_mac_len = 14",
+    "store_proto_at_reorder_default_door": "accepted at @ll,12: it writes the frame's ethertype, the far end still demuxes by the word",
+    "read_symmetry": "@ll,12/14 read the same values at a bytes-tag door and at a word-tag door (nft_payload_copy_vlan rebuilds the 18-byte header and subtracts 4 for offsets >= 18); only a store and the wire can tell them apart",
+    "store_word_at_real_device_door": "vid -> 103, no 88a8/103 device: PACKET_OTHERHOST, x0.102 receives 0, x0 rx_otherhost +1",
+    "store_proto_word_0806": "not offloadable, so validate_xmit_vlan pushes it inside: wire 84 bytes 0806 0066 86dd, the far end demuxes nothing",
+    "br_ingress": "at the bridge door @ll,12 is the frame's own ethertype (86dd) and the negative control 8100 misses; the message at the netdev ingress door one step earlier still carries NFULA_VLAN 8100:0065",
+    "br_flag_not_consulted": "two ingress ports with opposite REORDER flags give the same answer at the bridge door and at their own ingress doors",
+    "br_egress": "at the egress door of the bridge port there is no tag (read 86dd / 001a, store at 14 refused); at the real device's egress door the word 8100:0066 exists; the wire is 80 bytes with no tag; the far end demuxes vid 102 although the frame arrived with vid 101",
+    "br_stores": "@ll,12 at the bridge door = the frame's ethertype for both copies; @ll,12 at the egress door = the same for one copy; @ll,14 at the egress door refused; @ll,16 at the receiving ingress door = the frame's 12..13 (vlan_hlen = 4)",
+    "br_door_census": "bv 1, bf 2 (one clone per other port), bl 1, gv 1, n1/nz 1, q1 1 (input port only), e2 1, p1 1, ry 1; the local copy is delivered (Udp6InDatagrams +1, sport 43200, 18 bytes)",
+    "ip6in_double_count": "Ip6InReceives +2 / Ip6InDiscards +1 on a VLAN device with IPv6 disabled is one packet: __IP6_UPD_PO_STATS(IPSTATS_MIB_IN) runs before the disable_ipv6 check and the same skb then counts IPSTATS_MIB_INDISCARDS (net/ipv6/ip6_input.c:206,211)"
+  },
+  "not_measured": [
+    "no real NIC: NETIF_F_HW_VLAN_{C,ST}AG_TX was cleared by hand on a veth",
+    "the tap sees the frame after skb_vlan_untag when the wire carried a TPID, so the in-band wire is witnessed by the sending device's PACKET_OUTGOING copy",
+    "three or more tags; QinQ on the bridged path",
+    "inet/ip6-family chains on a bridge port; br_netfilter; IPv4 frames",
+    "a bridge door with a word present and mac_len != 0 at once (@ll,16 -> frame 12 on a bridge)",
+    "GSO/CHECKSUM_PARTIAL on real hardware",
+    "the AF_PACKET auxdata of the tap is computed at dequeue time and reported tci without TP_STATUS_VLAN_VALID on one record; it is used for no claim here"
+  ],
+  "predictions": {
+    "held": 21,
+    "refuted": [
+      "P12",
+      "P19",
+      "P22",
+      "P26",
+      "P27"
+    ],
+    "refuted_clauses": [
+      "P8 value (0x2066 on a vid-103 device changes the vid)",
+      "P16 (bf = 2, not 1: two other ports)"
+    ]
+  },
+  "verify": {
+    "checks": 9411,
+    "mismatches": 0,
+    "selftest": "19/19",
+    "doc_audit_cells": 423,
+    "doc_audit_substitutions": "3/3"
+  },
+  "letter": {
+    "file": "LETTER_SECTION_F56.txt",
+    "status": "NOT SENT",
+    "form": "reply in the F28 thread, no [PATCH]"
+  },
+  "artifacts": {
+    "differ": "vm/build/differ578",
+    "initrd": "vm/initrd578/full.cpio.gz",
+    "logs": "logs/f56_rep1.log, logs/f56_rep2.log"
+  }
+}

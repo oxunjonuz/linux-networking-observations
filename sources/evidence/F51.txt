@@ -1,0 +1,404 @@
+===== LETTER_SECTION_F51.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload: a static transport-store check is enforced at runtime,
+ and 14 nft spellings die silently (`tcp flags set` regressed in v7.3)
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+References: <the same Message-Id>
+
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+Theme: a payload store reaches exactly the copies of a frame that the kernel
+makes AFTER it, and for the copies made before it the store is not lost because
+anything forgot it -- `__skb_clone()` sets `cloned = 1` on the source as well,
+so `skb_ensure_writable()` copies the head and the earlier copies keep the bytes
+they were cloned with.  One nft rule at one bridge door changes three copies,
+two copies or none, depending on where the door sits relative to `br_flood()`.
+
+No diff below: this measures the guards and the copy-on-write rule as they
+stand and proposes no change.
+
+Linux 7.3.4, nftables in the initial user namespace, one frame at a time, one
+rule at a time.  Three veth pairs, one bridge `br0` with three ports, IPv6
+enabled on the bridge only; frame A is 80 bytes -- ethernet broadcast | IPv6
+fd02::11 -> fd02::92 | UDP 40000->5000 | 18 x 0x77.  The same skb is presented
+to four doors in one boot: `bridge` prerouting (before `br_flood()`),
+`bridge` forward (once per port copy), `bridge` input (the local copy) and
+`ip6` prerouting (the local copy, inside the IP stack).  Four AF_PACKET taps
+count and record the copies.
+
+The census first, because it decides everything else: one injected frame is
+seen once at the bridge prerouting door, twice at the forward door (two ports),
+once at `LOCAL_IN` and once at the ip6 door.  A store of eight bytes into the
+source MAC at the bridge prerouting door is accepted once and all three copies
+carry it -- the clones are made afterwards and share the head.
+
+The same eight bytes stored into the destination at the forward door are
+evaluated twice and change exactly the two port copies; the local copy, which
+never passes that door, keeps the original.  With the ethertype instead of the
+MAC the same rule leaves two copies saying `0806` and the third still `86dd`,
+still delivered: the protocol was decided at the ingress `eth_type_trans()` and
+`br_pass_frame_up()` does not re-derive it.
+
+The local copy's own door is where the copy-on-write shows.  A store at `ip6`
+prerouting is accepted once, lands on the named bytes, the datagram is
+delivered -- and no port copy carries it.  Not because the store was refused,
+and not because anything re-parsed the frame: `br_flood()` cloned the skb for
+the two ports, `__skb_clone()` set `cloned = 1` on the original too, and
+`nft_payload_set_eval()` stores through `skb_ensure_writable()`, which calls
+`pskb_expand_head()` for a cloned skb.  The local path gets a private copy; the
+two ports keep the old head.  Closing the instrument's own tap on the bridge
+changes nothing, so the flood's clone alone is enough.
+
+Two smaller things fall out of the same instrument.  A store into the source
+teaches the bridge that MAC on the ingress port, so a later rule that aims the
+destination at those same bytes turns the frame into a known unicast back to its
+ingress port and it is delivered nowhere: one accepted store can disarm the
+next one.  And a store of the hop limit at `LOCAL_IN` is visible to a tap on the
+bridge device but not to the ports, because that hook runs before
+`netif_receive_skb()` -- the only local door whose store a tap can see.
+
+Nothing here is a vulnerability: the rule is installed by root in the initial
+user namespace.  What is described is the shape of the guard: "accepted" and
+"reached every copy" are different claims, and which copies a store reaches is
+decided by the order of the clones, not by the rule.
+
+
+===== SUMMARY.md =====
+# F51 -- a store reaches exactly the copies made after it, and pays a head copy for the ones made before
+
+Turn 573. Kernel: 7.3.4-T563 (`1efbc957…2033`), the image F41..F50 used; no new
+build. Instrument: `vm/differ573` (generated from `differ572`, mode `flood`),
+**22 arms in each of two boots**; every derived fact of the two boots agrees.
+
+The debt was named at the end of F50: *a frame flooded to several ports -- does
+a store at a bridge door reach every copy or only the last, and who shares the
+head after `__skb_clone()`?*  Plus the layer-3 door of a VLAN-filtering bridge.
+
+## 1. One bridge, three ports, one frame, four doors
+
+Three veth pairs `x0/x1`, `y0/y1`, `z0/z1`; bridge `br0` with the ports `x1`,
+`y1`, `z1`; IPv6 enabled on `br0` only (`fd02::92/128`, a UDP6 socket on 5000).
+Frame A is 80 bytes -- ethernet broadcast | IPv6 `fd02::11 → fd02::92` | UDP
+40000→5000 | 18 × `0x77` -- injected on `x0`; frame B is the same with `br0`'s
+MAC as the ethernet destination, so the bridge does not flood it at all.  The
+same skb is presented to four doors in one boot:
+
+| door | hook | what it sees |
+|---|---|---|
+| `brp` | `NF_BR_PRE_ROUTING` | the frame before `br_flood()` splits it |
+| `brf` | `NF_BR_FORWARD` | once per port copy |
+| `brl` | `NF_BR_LOCAL_IN` | the local copy only |
+| `in6` | `NF_INET_PRE_ROUTING` | the local copy, inside the IP stack |
+
+Every arm carries a `counter+log+accept` at prio 0 in all four doors (the
+census) and at most one `counter+store|read+log+accept` at prio 10 in one of
+them.  Four AF_PACKET taps are opened per arm by a mask: `x1` (the ingress
+port), `y0`, `z0` (the ports) and `br0` (the local copy).
+
+## 2. The census: how many copies each door sees
+
+| arm | frame | brp | brf | brl | in6 |
+|---|---|---|---|---|---|
+| ctlA | A | 1 | 2 | 1 | 1 |
+| ctlX | A | 1 | 2 | 1 | 1 |
+| uniC | B | 1 | 0 | 1 | 1 |
+| preS | A | 1 | 2 | 1 | 1 |
+| preD | A | 1 | 0 | 0 | 0 |
+| preD7 | A | 1 | 2 | 0 | 0 |
+| fwdS | A | 1 | 2 | 1 | 1 |
+| in6D | A | 1 | 2 | 1 | 1 |
+| vlanC | C | 1 | 2 | 1 | 0 |
+
+Frame A is decided as broadcast, `local_rcv = true`; `br_flood()` then hands a
+clone to `y1` and to `z1` and returns the **original** skb to
+`br_pass_frame_up()`, so the forward door runs **twice** (once per port copy),
+the local-in door **once** and the ip6 door **once**.  Frame B finds `br0`'s own
+MAC in the FDB as a local entry, so nothing is flooded and the forward door is
+not reached at all.
+
+## 3. Before the split: one store, every copy
+
+| door | arm | copies | stored | y0 dst/src/hl | z0 dst/src/hl | br0 dst/src/hl | u6n |
+|---|---|---|---|---|---|---|---|
+| brp | preS | 1/2/1 | 909192939495 | ffffffffffff/909192939495/40 | ffffffffffff/909192939495/40 | ffffffffffff/909192939495/40 | 1 |
+| brp | preS_x1 | 1/2/1 | 909192939495 | ffffffffffff/909192939495/40 | ffffffffffff/909192939495/40 | ffffffffffff/909192939495/40 | 1 |
+| brp | preD7 | 1/2/0 | 909192939497 | 909192939497/b235c17ab938/40 | 909192939497/b235c17ab938/40 | - | 0 |
+| brf | fwdS | 2/2/1 | 909192939495 | ffffffffffff/909192939495/40 | ffffffffffff/909192939495/40 | ffffffffffff/b235c17ab938/40 | 1 |
+| in6 | in6D | 1/2/1 | 909192939495 | ffffffffffff/b235c17ab938/40 | ffffffffffff/b235c17ab938/40 | ffffffffffff/b235c17ab938/40 | 1 |
+| in6 | in6D_noT | 1/2/1 | 909192939495 | ffffffffffff/b235c17ab938/40 | ffffffffffff/b235c17ab938/40 | - | 1 |
+| brl | brlH | 1/2/1 | 90 | ffffffffffff/b235c17ab938/40 | ffffffffffff/b235c17ab938/40 | ffffffffffff/b235c17ab938/90 | 1 |
+
+`@ll,6,6 = 90:91:92:93:94:95` (the source MAC) at the bridge prerouting door is
+accepted once and every copy carries it -- both ports and the local copy.  The
+store happens before `br_flood()`, the clones are made afterwards, and a clone
+shares the head, so one write is enough.
+
+`preS_x1` is the same arm with the tap on the ingress port open: the ingress tap
+is a clone made *before* the store, and it shows the frame **before** the store
+-- while the two ports and the local copy still carry it.  This is the
+direction control: a clone before the store does not stop the copies made after
+it.
+
+`preD7` stores the same eight bytes into the **destination** (a value the bridge
+never learned): the frame becomes an unknown unicast, is flooded to both ports,
+and **no local copy exists** -- the local-in and ip6 doors count 0 and the
+datagram is not delivered.  Both ports drop it as `PACKET_OTHERHOST`
+(`rx_otherhost_dropped` +1 each) and neither `Ip6InReceives` nor
+`Ip6InDiscards` moves, because that check is the first thing in
+`ip6_rcv_core()`.
+
+## 3b. Who is speaking: every log message carries its door
+
+| arm | messages (prefix:indev:outdev) |
+|---|---|
+| ctlA | p0:5:-1  p1:5:9  p1:5:7  p2:5:-1  p3:11:-1 |
+| preS | p0:5:-1  s:5:-1  p1:5:9  p1:5:7  p2:5:-1  p3:11:-1 |
+| fwdS | p0:5:-1  p1:5:9  s:5:9  p1:5:7  s:5:7  p2:5:-1  p3:11:-1 |
+| brlH | p0:5:-1  p1:5:9  p1:5:7  p2:5:-1  s:5:-1  p3:11:-1 |
+| in6D | p0:5:-1  p1:5:9  p1:5:7  p2:5:-1  p3:11:-1  s:11:-1 |
+| preD | p0:5:-1  s:5:-1 |
+
+`indev` is the device the frame arrived on (the ingress port `x1` at all three
+bridge doors; the bridge device itself once the frame is in its IP stack, which
+is what `LOCAL_IN` and `ip6` prerouting see), `outdev` is set only at the
+forward door, where each copy leaves towards its own port, and the payload of
+every message is `skb->data` at that moment -- so the `p0` and `s` messages of
+one arm are the before/after of a single skb at one door, and the `s` messages
+at the forward door are per copy.
+
+## 4. After the split: the per-copy door changes exactly the copies
+
+`@ll,6,6` at the forward door is evaluated **twice** (once per copy), and both
+port copies carry the store while the local copy -- which never passes that door
+-- keeps the original source.  `@ll,12,2 = 08 06` there is the sharpest form:
+both ports leave with ethertype `0806` and the local copy is still `86dd` and
+still delivered, so the same rule kills two of three copies and leaves the third
+alone.
+
+## 5. The local copy's door cannot reach the ports, and the reason is one line
+
+| arm | door | Ip6InReceives | discards | Ip6InDelivers | Udp6InDatagrams |
+|---|---|---|---|---|---|
+| ctlA | - | +3 | +2 | +1 | +1 |
+| in6D | in6 | +3 | +2 | +1 | +1 |
+| in6D_noT | in6 | +3 | +2 | +1 | +1 |
+| uniD | in6 | +1 | +0 | +1 | +1 |
+| uniD_noT | in6 | +1 | +0 | +1 | +1 |
+| brlH | brl | +3 | +2 | +1 | +1 |
+
+frame A: 80 bytes, br0 mac 021144bf4fc1, x0 mac b235c17ab938, y1 ifindex 7, z1 9
+
+`@ll,0,6 = 90:91:92:93:94:95` at the **ip6 prerouting** door of the bridge is
+accepted once, the datagram is delivered to the socket -- and **no tap carries
+the store**: not the two ports, not the br0 tap.  The measure is the same with
+the br0 tap closed (`in6D_noT`), so it is not the instrument's own clone that
+causes it.
+
+The mechanism is one line in `net/core/skbuff.c` (`__skb_clone()`, line 1637):
+
+```c
+	atomic_inc(&(skb_shinfo(skb)->dataref));
+	skb->cloned = 1;
+```
+
+The clone marks **the source too**.  By the time the frame reaches `br0`'s IP
+stack, `br_flood()` has already cloned it for the two ports, so
+`skb_cloned(skb)` is true for the skb that carries the store;
+`nft_payload_set_eval()` stores through `skb_ensure_writable()`, which is
+
+```c
+	if (!skb_cloned(skb) || skb_clone_writable(skb, write_len))
+		return 0;
+	return pskb_expand_head(skb, 0, 0, GFP_ATOMIC);
+```
+
+so the store pays `pskb_expand_head()` -- a private copy of the head -- and the
+port copies keep the bytes they were cloned with.  This is also the correction
+to F50, which attributed the same asymmetry to `ip6_rcv_core()`: the unshare is
+`__skb_clone()` marking the source plus `skb_ensure_writable()` copying, and
+`ip6_rcv_core()` is not involved.
+
+`brlH` shows the same door family from the other side:
+`@nh,7,1 = 0x90` (the hop limit) at `NF_BR_LOCAL_IN` runs **before**
+`netif_receive_skb()`, so the br0 tap does carry it (`hl = 90`) while the two
+ports keep `40` -- one copy again, but visible to the tap because that hook
+precedes the tap's delivery.
+
+## 6. The same eight bytes, two outcomes: the bridge remembers what a store teaches it
+
+| arm | dst store | brf | brl | taps y0/z0/br0 | Ip6InReceives | discards | otherhost y0/z0 | u6n |
+|---|---|---|---|---|---|---|---|---|
+| preD | 909192939495 | 0 | 0 | 0/0/0 | +0 | +0 | 0/0 | 0 |
+| preD7 | 909192939497 | 2 | 0 | 1/1/0 | +0 | +0 | 1/1 | 0 |
+
+`preD` stores `90:91:92:93:94:95` into the destination of a frame, immediately
+after `preS` stored the same bytes into the **source**.  The bridge learned that
+MAC on `x1`, so the destination store turns the frame into a *known* unicast
+back to the ingress port: `should_deliver()` refuses every port, no local copy
+is made (the destination is not the bridge's), and the frame is delivered
+nowhere -- `brf` 0, `brl` 0, `in6` 0, all taps empty, and the only two log
+messages of the arm come from the bridge prerouting door.  One store can disarm
+the next one.
+
+## 7. Predictions: 20 of 23, and three clauses that did not survive
+
+Sections 2..6 were predicted in `research/predictions_573.md` before the
+instrument ran.  **Confirmed:** P1, P2, P3, P4, P5 (its first two clauses), P6
+(as the pair in §6), P8, P9, P10, P11, P12, P13, P14, P15, P16, P17, P18, P23
+(determinism), P24 (no `vlan_filtering` attribute).
+
+**Refuted, and reported as refuted:**
+
+* **P7** -- I predicted that a store of `0806` into the ethertype at the bridge
+  prerouting door would make the local copy stop being IPv6.  Measured: the
+  local copy is still delivered (`u6n = 1`, `Ip6InReceives` +1) while all three
+  copies carry `0806` on the wire.  The protocol was decided at the ingress
+  `eth_type_trans()` on `x1` and `br_pass_frame_up()` does not re-derive it, so
+  the bytes and the verdict disagree on the same skb.
+* **The last clause of P5** -- I predicted that the `ch` log message at the
+  bridge door would differ from the `pre0` message of the same arm (a
+  before/after of one skb).  Measured: they carry the *same* 42 bytes, because
+  the payload attribute starts at `skb->data` (the IPv6 header) and a store into
+  the MAC header is not in it.  The before/after witness of a MAC store is the
+  tap, not the log.
+* **P20** -- the tagged frame's read: I predicted `@ll,12,2` at the bridge
+  prerouting door would be the inner ethertype `86dd` after `skb_vlan_untag()`.
+  Measured: the read does not fire (`ch = 0`), and the taps show `86dd` at bytes
+  12..13 of an 80-byte frame.  That contradiction is §8.
+
+**Not tested as predicted:** P19, P21 and P22 describe the tagged frame's copies
+and the `preE`-style behaviour on it; after the contradiction above I reduced the
+VLAN section to two arms (`vlanC`, `vlanR`) and dropped the rest rather than
+build claims on numbers I cannot model.
+
+## 8. The VLAN-filtering bridge: not buildable here, and a tagged frame I did not explain
+
+`CONFIG_BRIDGE_VLAN_FILTERING is not set` (`.config:1431`), so
+`br_handle_vlan()` is the stub at `br_private.h:1713` (`return skb;`) and there
+is no `vlan_filtering` attribute: `F573 SYS|...|vf=-1|vfpath=0` -- the sysfs
+file does not exist.  The debt named at the end of F50 cannot be built on this
+kernel.
+
+A tagged frame (802.1Q vid 100 in front of the same IPv6 datagram) was still run
+through the instrument twice (`vlanC`, `vlanR`) and the numbers did not agree
+with the bytes in a way I could explain, so **I am not building a claim on
+them**.  Recorded: the local copy never reaches the ip6 door
+(`in6` 0, `u6n` 0, no `p3` message) although `brl` counts it, and `@ll,12,2` at
+the bridge prerouting door is **not** the inner ethertype (the read of `86dd`
+does not fire, `ch = 0`) while the taps show an 80-byte frame whose bytes 12..13
+are `86dd`.  The next turn starts from that contradiction.
+
+## 9. Errors of this turn, all mine
+
+1. **Two `f51_run.sh full` started at once** -- the first `nohup` was reported
+   as failed by my own `ls`, started anyway, and both appended to
+   `logs/f51_rep1.log`: 44 arms in one file.  Same error as F570's #6; the fix
+   was `pkill` by PID and one `setsid` run, and the log's arm count is now
+   checked by the verifier.
+2. **`f573_snap(&r0)` never called** -- the baseline struct stayed zeroed, so
+   every "delta" in the instrument printed the counter's absolute value since
+   boot (33, 36, 39…).  It looked like an IPv6 chatter storm from the address
+   setup and cost one full run; the tell was that the numbers equalled the
+   absolute counters and grew by exactly the model's +3 per broadcast arm.
+3. **The FDB learns what a source store writes** -- `preD` first measured "the
+   frame is dropped" because `preS` had taught the bridge that MAC.  Rather than
+   flush the FDB (my `RTM_DELNEIGH` with `NTF_SELF` came back `-EINVAL`), the
+   instrument now uses two needles: `…95` for source stores and `…97` (never
+   learned) for destination stores, and the poisoned case became §6.
+4. **Frame C had no inner ethertype** -- `f573_frame_tag()` wrote the TPID and
+   the TCI and then started the IPv6 header at 18 without writing `86dd` at
+   16..17, so the first tagged smoke measured an ethertype of `0000`.  Fixed
+   before the full run.
+5. **The verifier crashed three times before it could go green** (a dict where a
+   string was expected in the tap parser; the tap index vs the device name; the
+   `s` message of a read arm that fires only when the read matches).
+6. **A cosmetic flaw left in the instrument**: the no-injection arm prints
+   `fk=A` (the default frame name) instead of `fk=-`.  The verifier accepts both
+   and says so; nothing measured depends on it.
+7. `st` (the settle loop) reports 3 in every arm in the full run: with the
+   baseline bug fixed there is no chatter to settle, and 3 rounds of quiet is
+   what the loop always finds.
+
+## 10. What was verified, and how
+
+| | |
+|---|---|
+| `tools/verify573.py` | **3186 checks, 0 mismatches** over both boots -- provenance (kernel sha from each boot's header, initrd from both headers, `differ` extracted from the initramfs and compared with the built one), 10 source anchors, the environment, the frame's own bytes, and **every arm**: the four-door census, the `ch` counter, the socket, 12 SNMP6 counters, `rx_otherhost_dropped` per port, the NFLOG count and every message's prefix/indev/outdev/payload, and all four taps (count, length, bytes) |
+| `tools/verify573_selftest.sh` | **22/22** -- baseline green; 20 single-field mutations of `logs/f51_rep1.log` each turn the verifier red with no traceback; a missing log exits 1 instead of crashing |
+| determinism | 110 per-arm records, with the two kernel-chosen MACs normalised, identical in both boots |
+| regression | verify572 5629, verify571 5974, verify570 753, verify569 3810, verify568 10088, verify567/566/563 OK, verify565 884, verify564 895, verify562 all sections 0 |
+| collection | see README's counter -- `tools/verify_collection.py` runs every verifier in the tree |
+
+## 11. Not measured, plainly
+
+* a frame flooded to **more than two** ports (three ports is what this
+  instrument has; the claim is "every copy", measured on two);
+* `brf` with `local_rcv` false and a *unicast* flood (frame B is delivered
+  locally, `preD7` is the unknown-unicast flood -- both were run, but not the
+  combination with the tap on the ingress port);
+* the order of equal priorities at one hook;
+* `skb->cloned` is not observable from nftables: what is measured is its
+  *consequence* (the port copies do not carry the store), not the flag;
+* GSO/`CHECKSUM_PARTIAL`, IPv4, and one sender/one bridge at a time;
+* the tagged frame's contradiction (§8).
+
+**Not a vulnerability**: the rule is installed by root in the initial user
+namespace.  What is described is the shape of the guard: a store that is
+accepted, lands on the named bytes, and reaches only the copies that the kernel
+makes after it.
+
+
+===== summary.json =====
+{
+  "finding": "F51-flood-copies",
+  "turn": 573,
+  "kernel": "7.3.4-T563",
+  "kernel_sha256": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+  "instrument": "vm/differ573 (mode flood), generated from differ572 + differ573_add.c",
+  "boots": 2,
+  "arms_per_boot": 22,
+  "checks": 3186,
+  "mismatches": 0,
+  "selftest": "22/22",
+  "topology": {
+    "veth_pairs": [["x0", "x1"], ["y0", "y1"], ["z0", "z1"]],
+    "bridge": "br0",
+    "ports": ["x1", "y1", "z1"],
+    "ipv6": "br0 only, fd02::92/128, UDP6 socket on 5000",
+    "taps": ["x1", "y0", "z0", "br0"]
+  },
+  "doors": ["brp=NF_BR_PRE_ROUTING", "brf=NF_BR_FORWARD", "brl=NF_BR_LOCAL_IN", "in6=NF_INET_PRE_ROUTING"],
+  "door_census_frame_A": {"brp": 1, "brf": 2, "brl": 1, "in6": 1},
+  "door_census_frame_B": {"brp": 1, "brf": 0, "brl": 1, "in6": 1},
+  "claims": [
+    "A store before br_flood() (bridge prerouting) is accepted once and every copy made afterwards carries it: both ports and the local copy (arm preS).",
+    "A store at the forward door is evaluated once per port copy and changes exactly those copies; the local copy, which never passes that door, keeps the original (arm fwdS/fwdD/fwdE).",
+    "A store at the local copy's door (ip6 prerouting) is accepted once, the datagram is delivered, and no port copy carries it -- with and without the instrument's own tap on br0 (arms in6D, in6D_noT).",
+    "The mechanism is __skb_clone() marking the SOURCE cloned (net/core/skbuff.c:1637) plus skb_ensure_writable() calling pskb_expand_head(), not ip6_rcv_core() as F50 said.",
+    "A store into the source teaches the bridge that MAC on the ingress port; the next frame aimed at those bytes with the destination is a known unicast back to the ingress port and is delivered nowhere (arms preS -> preD: brf 0, brl 0, in6 0, all taps empty).",
+    "A store of 0806 into the ethertype at the bridge prerouting door changes the bytes on all three copies and does not stop the local copy from being delivered as IPv6 (arm preE; refutes prediction P7).",
+    "A store of the hop limit at NF_BR_LOCAL_IN is visible to the br0 tap (90) and not to the ports (40), because that hook runs before netif_receive_skb() (arm brlH).",
+    "CONFIG_BRIDGE_VLAN_FILTERING is not set, br_handle_vlan() is the stub at br_private.h:1713, and /sys/class/net/br0/bridge/vlan_filtering does not exist: the VLAN-filtering debt cannot be built on this kernel.",
+    "A tagged frame (802.1Q vid 100) is recorded but not explained: the local copy never reaches the ip6 door while brl counts it, and @ll,12,2 at the bridge door is not the inner ethertype although the taps show 86dd at bytes 12..13."
+  ],
+  "refuted_predictions": ["P7 (the ethertype store does not stop the local copy from being IPv6)", "the last clause of P5 (the ch log message of a MAC store is identical to the pre0 message)", "P20 (the tagged frame: @ll,12,2 at the bridge door is not the inner ethertype although the taps show 86dd at 12..13)"],
+  "not_measured": [
+    "a flood to more than two ports",
+    "the order of equal hook priorities",
+    "skb->cloned itself (only its consequence)",
+    "GSO/CHECKSUM_PARTIAL, IPv4",
+    "the tagged frame's contradiction"
+  ],
+  "files": {
+    "summary": "findings/F51-flood-copies/SUMMARY.md",
+    "verify_report": "findings/F51-flood-copies/VERIFY_REPORT.md",
+    "letter": "findings/F51-flood-copies/LETTER_SECTION_F51.txt",
+    "instrument": ["vm/differ573_add.c", "vm/build_f51_differ.sh", "vm/make_initramfs573.sh"],
+    "tools": ["tools/f51_run.sh", "tools/verify573.py", "tools/verify573_selftest.sh", "tools/f573_mutate.py", "tools/f573_summary.py", "tools/audit_f51_doc.py"],
+    "predictions": "research/predictions_573.md",
+    "logs": ["logs/f51_rep1.log", "logs/f51_rep2.log"]
+  },
+  "letter_status": "NOT SENT"
+}

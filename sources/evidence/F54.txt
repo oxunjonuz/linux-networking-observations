@@ -1,0 +1,367 @@
+===== LETTER_SECTION_F54.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload: a static transport-store check is enforced at runtime,
+ and 14 nft spellings die silently (`tcp flags set` regressed in v7.3)
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+References: <the same Message-Id>
+
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+Theme: the 802.1Q tag is a property of the device a frame leaves through, not
+of the frame a rule writes into.  On a VLAN sub-interface with
+VLAN_FLAG_REORDER_HDR cleared the tag is physical frame bytes at both layer-3
+doors, so `@ll,14,2` writes a byte and the rule's counter says the store was
+taken; `vlan_dev_hard_header()` then builds a fresh header from `vlan->vlan_id`
+(plus an egress QoS map of `skb->priority`) between the FORWARD hook and the
+egress hook of that device, and the far end demuxes the device's vid.  The
+priority bits do not travel either.  Deleting the four tag bytes outright does
+not change what leaves.  At the netdev ingress hook the same offset is
+`skb->vlan_tci` instead, and there the same store does decide the frame's fate
+-- it re-targets the VLAN and, with no device for that vid, the frame is
+dropped as PACKET_OTHERHOST before any IP counter sees it.
+
+The second half is the smallest reproduction I could find of the
+`invalid VLAN protocol` WARN that earlier mail mentioned: one veth pair, one
+VLAN device, one netdev-ingress table with one chain and one rule storing
+0x0806 at `@ll,12,2`, one tagged frame.  The warning is not WARN_ONCE: N
+frames print N lines, and every one of them is a frame the kernel then drops.
+Two conditions are needed and both are worth stating, because the first
+version of my reproduction had neither: the frame must carry a tag
+(`skb_vlan_tag_present()` gates the store into `skb->vlan_proto`), and the
+receiving device must have a `vlan_info` -- `vlan_find_dev()` only reaches
+`vlan_proto_idx()`, the function that warns, when the device has at least one
+VLAN above it.  A bare veth pair cannot warn at all.
+
+Measurement only; no patch is implied.  Kernel 7.3.4-T563, one frame per arm,
+two boots, every number from the packet's own bytes and from the receiving
+device's counters.
+
+Numbers, for the record:
+
+  * the same frame, six doors: the tag is metadata at netdev ingress (vid 101),
+    frame bytes at ip6 prerouting and forward, and metadata again from the
+    egress door of the egress VLAN device onward -- with vid 102, that device's
+    own.  An egress door has no NFULA_HWHEADER in this kernel; the tag is in
+    NFULA_L2HDR (18 bytes at the VLAN device, 14 after
+    vlan_dev_hard_start_xmit() pops it into metadata).
+  * a store of vid 103 at prerouting is accepted and is still readable at the
+    forward hook; the egress door of the egress VLAN device reads the device's
+    0066 instead, and so does the last door before the wire.
+  * the far end runs two VLAN devices of its own; x0.102's rx_packets is 1 in
+    every arm that reaches the wire, x0.101's is 0.  The wire frame is 80
+    bytes, untagged in the bytes.
+  * zeroing the four bytes at 12..15 at prerouting removes the tag from the
+    frame, and the frame still leaves with 8100 0066.
+  * storing 0x0806 at `@ll,12,2` on the ingress door, with one VLAN device on
+    the box: one WARN line per tagged frame, `net/8021q/vlan.h:48 at
+    vlan_do_receive`, and the frame is dropped as PACKET_OTHERHOST.
+
+
+===== SUMMARY.md =====
+# F54 — the tag has a wire: the egress device composes it from its own configuration, and no store into it survives
+
+Kernel `7.3.4-T563` (`1efbc957…2033`), no new build.  Instrument `differ576`,
+two modes in one boot, **two boots** (`logs/f54_rep{1,2}.log`), every derived
+fact identical in both after normalising the MACs the kernel picks at random.
+
+The two debts of turn 575 were: (1) a store into the 802.1Q tag that has a
+**wire**, and (2) a minimal reproduction of the `invalid VLAN protocol` WARN
+that F53 met by accident.  Both are closed; the second one by a smaller setup
+than this turn started with, because the first smoke showed the WARN needs a
+device that carries a VLAN group.
+
+## 1. The topology, and why it is shaped this way
+
+    x0 ------------ x1          (one veth pair; the far end / the near end)
+    x0.101  8100 vid 101        x1.101  8100 vid 101, REORDER_HDR cleared,
+    x0.102  8100 vid 102                 IPv6 on, forwarding on, no address
+
+                                x1.102  8100 vid 102, REORDER_HDR cleared,
+                                         IPv6 on, fd02::93/64, neighbour
+                                         fd02::92 -> MAC(x0)
+
+One frame, 84 bytes: `dst=x1`, `src=x0`, `8100 0065` (vid 101), IPv6
+`fd02::11 → fd02::92`, UDP 43000→5000, 18 × `0x77`.
+
+It arrives on x1 tagged vid 101, so `vlan_do_receive()` hands it to x1.101;
+`fd02::92` is not local, so IPv6 forwards it; the on-link /64 lives on
+**x1.102**, so the packet leaves through a different VLAN device than it came
+in on.  That last detail is not decoration: `ip6_forward()` sends an ICMPv6
+redirect when the input and output devices are equal, and that redirect
+resolves the packet's source, which emits a neighbour solicitation — a second
+frame at every door (measured in the first two smokes: `e0=2, r0=2` per
+packet; §8).
+
+Six doors, in the order the frame meets them:
+
+| door | family · hook · device |
+|---|---|
+| `n1` | netdev ingress · x1 |
+| `g6` | ip6 prerouting · (all devices; the device is `NFULA_IFINDEX_INDEV`) |
+| `f6` | ip6 forward |
+| `e0` | netdev egress · x1.102 |
+| `e1` | netdev egress · x1 |
+| `r0` | netdev ingress · x0 (the far end, in the same netns) |
+
+## 2. The tag at each door
+
+Every arm installs a census rule (`counter + log + accept`) at priority 0 in
+all six doors, so every message below is one frame in one arm.  `ctl` (no
+action rule at all):
+
+| door | NFULA_VLAN | `@ll` view | hardware · L2 header | payload |
+|---|---|---|---|---|
+| `n1` | **8100 : 0065** | untagged eth (`…86dd`) | 14 · 14 | 66 (IPv6, hop 40) |
+| `g6` | none | **tag in the bytes** (`…8100`) | 14 · — | 66 (IPv6, hop 40) |
+| `f6` | none | tag in the bytes | 14 · — | 66 (IPv6, hop **3f**) |
+| `e0` | none | built header, **8100 : 0066** | — · 18 | 84 (from the eth header) |
+| `e1` | **8100 : 0066** | untagged eth | — · 14 | 80 |
+| `r0` | **8100 : 0066** | untagged eth | 14 · 14 | 66 (IPv6, hop 3f) |
+
+Three states of the same tag on one frame: metadata at the ingress door
+(F53's finding), physical bytes at both layer-3 doors (F53's other finding,
+here because x1.101 has the flag cleared), and metadata again from `e0`
+onwards — with a **different vid**: 0066, the egress device's.
+
+The header at `e0` is 18 bytes and says so by itself:
+`dst=MAC(x0), src=MAC(x1), 8100, 0066, 86dd` — and it is the *L2* attribute
+of the message, because an egress door has no `NFULA_HWHEADER` in this kernel
+(`hlen = 0` at both `e0` and `e1`; the hardware header exists only where the
+frame is *received*).
+
+## 3. What survives the stack, and where it dies
+
+`0067` is vid 103: no device has it, so a frame that leaves with 103 would be
+visible as such at the far end (and would die there).  Nothing does.
+
+| arm | action 1 | action 2 (a read that asks for) | `ch0` | `ch1` |
+|---|---|---|---|---|
+| `rd_g6_65` | read `@ll,14,2` == 0065 at `g6` | — | **1** | — |
+| `w67_g6_rd_f6` | store 0067 at `g6` | 0067 at `f6` | **1** | **1** |
+| `w67_f6_rd_e0_66` | store 0067 at `f6` | 0066 at `e0` | **1** | **1** |
+| `w67_f6_rd_e1_66` | store 0067 at `f6` | 0066 at `e1` | **1** | **1** |
+| `same66_f6_rd_e0` | store 0066 at `f6` | 0066 at `e0` | **1** | **1** |
+| `pc1_f6_rd_e0_66` | store 2065 at `f6` | 0066 at `e0` | **1** | **1** |
+| `e1_rd_tpid` | read `@ll,12,2` == 8100 at `e1` | — | **1** | — |
+
+Two facts in one table:
+
+* the store at the prerouting door is accepted **and still readable at the
+  forward door** — the frame carries 0067 through the IP stack (`f6` is two
+  hooks downstream of `g6`);
+* the same store, made at the forward door, is **not** what the egress door
+  of the egress VLAN device reads: `e0` reads 0066, the device's own vid, and
+  the last door before the wire (`e1`) reads 0066 as well.  The priority bits
+  fare no better: `2065` stored at `f6` leaves `e0` reading `0066`.
+
+The function that does it is `vlan_dev_hard_header()`: with
+`VLAN_FLAG_REORDER_HDR` cleared it does `skb_push(VLAN_HLEN)` and writes
+`vlan->vlan_id` (plus `vlan_dev_get_egress_qos_mask(skb->priority)`) into the
+four new bytes — after `FORWARD`, before the egress hook of the VLAN device,
+which is exactly the gap the two doors bracket.  Then
+`vlan_dev_hard_start_xmit()` pops that in-band tag into `skb->vlan_proto/tci`
+(the `else if` branch, because `veth->h_vlan_proto == vlan->vlan_proto`), and
+that is the metadata `e1` and the far end see.
+
+## 4. The wire: the far end's own demux
+
+The witness is not a hexdump of mine: x0 carries two VLAN devices, and their
+`rx_packets` say which vid left the box.
+
+| arm | x0.101 (vid 101) | x0.102 (vid 102) | bytes on x0.102 | x0 rx bytes | x1 otherhost | tap on x0 |
+|---|---|---|---|---|---|---|
+| `n0` | 0 | 0 | 0 | 0 | 0 | 0 · — |
+| `ctl` | 0 | **1** | 66 | 80 | 0 | 1 · 80 |
+| `rd_g6_65` | 0 | **1** | 66 | 80 | 0 | 1 · 80 |
+| `w67_g6_rd_f6` | 0 | **1** | 66 | 80 | 0 | 1 · 80 |
+| `w67_f6_rd_e0_66` | 0 | **1** | 66 | 80 | 0 | 1 · 80 |
+| `w67_f6_rd_e1_66` | 0 | **1** | 66 | 80 | 0 | 1 · 80 |
+| `same66_f6_rd_e0` | 0 | **1** | 66 | 80 | 0 | 1 · 80 |
+| `pc1_f6_rd_e0_66` | 0 | **1** | 66 | 80 | 0 | 1 · 80 |
+| `e1_rd_tpid` | 0 | **1** | 66 | 80 | 0 | 1 · 80 |
+| `del12_g6` | 0 | **1** | 66 | 80 | 0 | 1 · 80 |
+| `n67` | 0 | 0 | 0 | 0 | **1** | 0 · — |
+| `n_pc1` | 0 | **1** | 66 | 80 | 0 | 1 · 80 |
+
+The frame arrives with vid 101, every store tries to write 103, and the wire
+says **102** — the egress device's own vid — in every arm that reaches it.
+The wire frame is 80 bytes with no tag in the bytes: the tag lives in
+`skb->vlan_proto/tci` all the way to the veth, and the tap (which now ignores
+`PACKET_OUTGOING`, so it no longer shows my own injection) shows the untagged
+80-byte frame whose VLAN the receiving device demuxes as 102.
+
+## 5. Deleting the tag from the frame changes nothing
+
+`del12_g6` zeroes the four bytes at 12..15 at the prerouting door.  The store
+is accepted, the frame still carries `8100 0065` at `g6`'s census message,
+`0000` in the store's own message at `g6` and at `f6` — the tag is gone from
+the frame — and at `e0` the header is 18 bytes again, `8100 0066 86dd`.  The
+far end demuxes vid 102.  A frame stripped of its tag still leaves with one,
+because the tag is a property of the egress device, not of the frame.
+
+## 6. The ingress door is the other world
+
+| arm | store at `n1` | fate | `g6` | x1 otherhost | wire |
+|---|---|---|---|---|---|
+| `n67` | TCI = 0067 (vid 103) | **dies at x1** | 0 | **1** | nothing |
+| `n_pc1` | TCI = 2065 (PCP 1, vid 101) | forwarded | 1 | 0 | vid 102 |
+
+At `n1` the tag is metadata and `@ll,14,2` is `skb->vlan_tci`
+(`nft_payload_set_vlan()`), so a store there retargets the frame's VLAN — and
+a vid with no device is `PACKET_OTHERHOST`, which never reaches the IP stack.
+Same offset, same length, same instruction, four bytes away in the pipeline:
+at the layer-3 doors it is a frame byte that gets rebuilt, at the ingress door
+it is the routing decision of the frame.
+
+## 7. The WARN, minimal
+
+The first smoke of this turn ran five arms with **no VLAN device anywhere** and
+stored `0806` into `@ll,12,2` at the ingress door: **zero splats**.  The
+reason is in `vlan_find_dev()`: it only calls `vlan_proto_idx()` — and only
+that function warns — when the receiving device has a `vlan_info`.  With one
+VLAN device on the receiving side the same rule warns every time:
+
+| arm | rule | frames | `ch` | splats | x1.101 rx | x1 otherhost |
+|---|---|---|---|---|---|---|
+| `w_ctl` | none | 1 tagged | 0 | **0** | **1** | 0 |
+| `w_tag` | store 0806 at 12,2 | 1 tagged | 1 | **1** | 0 | **1** |
+| `w_tag_x3` | store 0806 at 12,2 | 3 tagged | 3 | **3** | 0 | **3** |
+| `w_untag` | store 0806 at 12,2 | 1 untagged | 1 | **0** | 0 | 0 |
+| `w_same` | store 8100 at 12,2 | 1 tagged | 1 | **0** | **1** | 0 |
+
+Four WARN lines in the boot, one per packet that the store hits — the message
+is not `WARN_ONCE`.  The exact text, as the kernel printed it:
+
+    [   27.037597] invalid VLAN protocol: 0x0806
+    [   27.037597] WARNING: net/8021q/vlan.h:48 at vlan_do_receive+0x282/0x9a0, CPU#0: repro/152
+
+and the frame does not survive it: it is dropped as `PACKET_OTHERHOST`
+instead of being delivered to x1.101 (`w_ctl` delivers, `w_tag` does not).
+The untagged frame and the value the frame already carries both print
+nothing: the store path is taken only when `skb_vlan_tag_present()`.
+
+## 8. Errors of the way, all mine
+
+1. **Forwarding in and out of the same device** makes `ip6_forward()` send an
+   ICMPv6 redirect; the redirect resolves the *source*, which emits a
+   neighbour solicitation, so every door saw **two** frames per packet
+   (`e0=2, e1=2, r0=2`, `x0.101` +2).  I first tried `send_redirects=0`, which
+   this kernel does not consult on that path; the fix was to put the on-link
+   /64 on a **second** VLAN device, so `iif != oif` and the redirect branch is
+   not taken.  Two smokes were spent on this.
+2. **An explicit `/128` route was refused** (`RTM_NEWROUTE` → `-EACCES`) and
+   the neighbour on an address-less device `-EINVAL`; both are gone from the
+   instrument, replaced by the address living on the egress device.
+3. **The tap counted my own transmission**: an `AF_PACKET` socket receives a
+   `PACKET_OUTGOING` copy of what the box sends (`dev_queue_xmit_nit`), so the
+   first matching frame in `t0` was the frame I injected, not the one that
+   arrived.  The drain now skips `PACKET_OUTGOING`, and the wire witness in
+   the tap became the arriving 80-byte frame.
+4. **`pkill -f "f54_run.sh full"` matched my own shell** and killed it —
+   the fifth time in this project (F47 №6, F570 №6, F52 №1, F53 №6).  It cost
+   one run of the full pair; `rep1` survived, `rep2` was re-run alone.
+5. Three field-index mistakes in the verifier before it was green: the hop
+   limit of an IPv6 payload is at hex characters 14..15 (not 12..15 of the
+   bytes I thought), the tap stores 18 bytes not 14, and at an egress door
+   the tag lives in `NFULA_L2HDR`, not `NFULA_HWHEADER`.
+6. The first `warn` mode had no VLAN device at all, so it measured nothing
+   (§7) — the instrument was wrong about what it was testing, not the kernel.
+
+## 9. Predictions: 16 of 17
+
+P1–P12 and P14–P17 held.  **P13 held in its first clause and failed in its
+second**: the rule does print the message once and the frame does die, but the
+minimal setup needs one VLAN device — a bare veth pair cannot warn at all,
+because `vlan_find_dev()` never reaches `vlan_proto_idx()` without a
+`vlan_info`.  That refutation is §7.
+
+## 10. What is not measured, plainly
+
+Store into the tag on a frame that is **bridged** (L2) rather than routed —
+F52 measured the metadata side of that, and here I only measured the routed
+side; a store into `skb->priority` plus an **egress QoS map**, which is the
+one channel by which a rule could still reach the PCP (no map is installed in
+this instrument, and `vlan_dev_get_egress_qos_mask()` returns 0 without one);
+802.1ad/QinQ on the egress path; VLAN on top of a device whose
+`hard_header_len` is not 14; GSO/`CHECKSUM_PARTIAL` on real hardware;
+conntrack on this path; two VLAN devices of the same vid on different real
+devices.
+
+**Not a vulnerability**: every rule here is installed by root in the initial
+user namespace.  What the measurement says is narrower and stranger: the tag a
+frame leaves with is a function of the device it leaves through, and the only
+part of it a hook can touch — the PCP, through `skb->priority` and a QoS map —
+is not the part anyone would look at.
+
+## 11. Files
+
+    findings/F54-tag-on-the-wire/{SUMMARY.md, summary.json, VERIFY_REPORT.md,
+                                  LETTER_SECTION_F54.txt}
+    vm/{differ576_add.c, differ576.c, build_f54_differ.sh, make_initramfs576.sh,
+        build/differ576, initrd576/full.cpio.gz}
+    tools/{f54_run.sh, verify576.py, verify576_selftest.sh}
+    research/predictions_576.md
+    logs/{f54_rep1.log, f54_rep2.log, f54_initrd_hashes.txt}
+
+
+===== summary.json =====
+{
+  "turn": 576,
+  "finding": "F54",
+  "title": "the 802.1Q tag on the wire is composed by the egress device; no store into it survives",
+  "kernel": "7.3.4-T563",
+  "kernel_sha256": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+  "boots": 2,
+  "arms": {
+    "warn": 5,
+    "xf": 12
+  },
+  "frames_per_arm": 1,
+  "doors": [
+    "n1 netdev ingress x1",
+    "g6 ip6 prerouting",
+    "f6 ip6 forward",
+    "e0 netdev egress x1.102",
+    "e1 netdev egress x1",
+    "r0 netdev ingress x0"
+  ],
+  "facts": {
+    "tag_at_ingress_door": "metadata 8100:0065 (payload starts at IPv6)",
+    "tag_at_prerouting_and_forward": "frame bytes (hardware header ends 8100, mac_len 18)",
+    "tag_at_egress_door_of_vlan_device": "built by vlan_dev_hard_header: 8100:0066 (device vid), in NFULA_L2HDR",
+    "tag_at_last_door": "metadata 8100:0066",
+    "store_of_vid_103_at_prerouting": "accepted, readable at forward, absent at egress",
+    "store_of_pcp_at_forward": "accepted, egress door reads the device's 0066",
+    "store_that_deletes_the_tag_bytes": "frame leaves with 8100 0066 anyway",
+    "wire_vid_control": 102,
+    "x0_101_rx_packets": 0,
+    "x0_102_rx_packets": 1,
+    "wire_frame_bytes": 80,
+    "ingress_store_of_vid_103": "PACKET_OTHERHOST at x1, nothing forwarded",
+    "ingress_store_of_pcp": "forwarded, wire vid still 102",
+    "warn_splats_control": 0,
+    "warn_splats_one_frame": 1,
+    "warn_splats_three_frames": 3,
+    "warn_splats_untagged_frame": 0,
+    "warn_splats_same_value": 0,
+    "warn_needs_vlan_device": true
+  },
+  "verify": {
+    "checks": 768,
+    "mismatches": 0,
+    "selftest": "19/19",
+    "doc_audit_cells": 154,
+    "doc_audit_substitutions": "3/3"
+  },
+  "letter": {
+    "file": "LETTER_SECTION_F54.txt",
+    "status": "NOT SENT",
+    "form": "reply in the F28 thread, no [PATCH]"
+  },
+  "artifacts": {
+    "differ": "vm/build/differ576",
+    "initrd": "vm/initrd576/full.cpio.gz"
+  }
+}

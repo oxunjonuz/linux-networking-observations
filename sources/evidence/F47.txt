@@ -1,0 +1,1267 @@
+===== LETTER_SECTION_F47.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload: a static transport-store check is enforced at runtime,
+ and 14 nft spellings die silently (`tcp flags set` regressed in v7.3)
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+References: <the same Message-Id>
+
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+Theme: what a network-base store costs in IPv6 -- there is no header checksum,
+so the toll moves to the hop limit, and two offsets have no case at all.
+
+No diff below: this measures the guard as it stands and proposes no change.
+
+Linux 7.3.4, nftables in the initial user namespace, one packet at a time, one
+rule at a time.  Six doors (local_out, postrouting, forward, prerouting, input
+and the netdev egress hook of a veth), two classes (a datagram from a local
+IPv6 socket, and a frame injected on the wire and forwarded), two base chains
+per door (counter+log+accept, and the payload statement).  The receiver is an
+IPv6 socket in its own netns plus that namespace's Ip6/Udp6 counters.
+112 arms x 2 boots, identical on every derived fact.
+
+1. The IPv6 network-base list has no case for offset 4 and none for 6.
+
+  @nh,0,4  60 91 92 93  accepted (the written version nibble is 6)
+  @nh,0,4  90 91 92 93  refused  -- case 0 compares the *immediate's* version
+  @nh,2,2               accepted (flow label)
+  @nh,4,2  payload_len  refused  -- no case for offset 4
+  @nh,6,1  next header  refused  -- no case for offset 6
+  @nh,8,16 saddr        accepted (the list allows len <= 32 here)
+  @nh,24,16 daddr       accepted
+
+The refusals are identical at all five layer-3 hooks and at the netdev egress
+hook: unlike the ingress side, nothing here depends on the family the hook was
+registered with.  A refused store is not a drop -- the packet continues and is
+delivered byte-identical to the control.
+
+2. With no header checksum the price of a header store mostly disappears.
+
+One byte into @nh,7,1 (the hop limit), four values, seven door/class pairs:
+
+  hop limit written   64 (as the frame carries it)  delivered everywhere
+                      0x90                         delivered everywhere
+                      0x00 / 0x01                  delivered at six pairs,
+                                                   NO FRAME at prerouting
+
+On IPv4 the same store killed the packet at four doors, because the header
+checksum is computed before LOCAL_OUT and verified before PREROUTING.  IPv6 has
+no such checksum, so the only thing that can charge for the store is the
+forwarding path itself: `ip6_forward()` tests `hop_limit <= 1` *before* it
+enters the FORWARD hook.  A store at PREROUTING is therefore seen by that test
+and the packet dies in `ip6_forward()`; a store at the FORWARD hook happens
+after the test and the frame is forwarded with a hop limit of zero.
+
+The hop limit is decremented in the same gap, and the wire shows it: written at
+prerouting, 0x40 leaves as 0x3f and 0x90 as 0x8f; written at forward,
+postrouting or the egress hook, the value written is the value on the wire.
+The read side sees the same seam -- reading @nh,7,1 and comparing with 0x40
+matches at the doors the packet has not been forwarded through yet and matches
+nowhere after it, because the byte there is 0x3f.
+
+3. The transport toll is now the UDP pseudo-header, and it belongs to the skb.
+
+One cell, @nh,8,16 = fd00::99, and its control (writing the address the frame
+already carries):
+
+  locally generated datagram   both delivered -- the skb leaves the hook with
+                               CHECKSUM_PARTIAL and veth carries the flag to
+                               the peer, which therefore never verifies it
+  frame from the wire          the store costs the datagram: Udp6InErrors at
+                               the receiver, no delivery; the control with the
+                               same 16 bytes is delivered
+
+Measured from the bytes, the wire field of a locally generated datagram is not
+a valid checksum at all (fa2f where the pseudo-header gives 8220), and that is
+true of the control arm as well -- it is a property of the sender, not of the
+store.
+
+4. A destination written before the route lookup stops being your datagram.
+
+@nh,24,16 = fd00::99 at seven door/class pairs: the store is accepted
+everywhere, and then
+
+  local_out, postrouting   the packet is routed to the written address before
+                           the route lookup, no neighbour exists, and the door
+                           counts EIGHT packets for one datagram (the
+                           solicitation retries and the ICMP errors of that
+                           queue); nothing reaches the receiver
+  prerouting               nothing arrives either
+  netdev egress            the L2 header and the neighbour are already
+                           resolved, so the frame goes out carrying the
+                           written destination and the receiver counts
+                           Ip6InAddrErrors
+
+The counter of the door is not a property of the datagram: same rule, same
+accepted store, 1 to 8 depending on the door.
+
+Not tested here: IPv6 inside PPPoE, a VLAN-tagged IPv6 frame at an egress hook,
+@th in this mode, extension headers at an egress hook, GSO/CHECKSUM_PARTIAL on
+real hardware, ICMPv6 and SCTP as the transport.  Every rule here is installed
+by root in the initial user namespace.
+
+Reproduction: one static C program (netlink by hand), busybox initramfs, two
+boots; every number above is derived from the log by an independent Python
+model of the guard and of the door, and the tables are generated from the log
+rather than typed.
+
+
+===== SUMMARY.md =====
+# F47 — IPv6 at the egress doors: the toll moves from the header checksum to the hop limit, and it sits between two doors
+
+Turn 569. Kernel 7.3.4-T563 (`1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033`),
+the image F41..F46 used; no new build. nftables 1.1.7, family `inet` chains installed by
+root in the initial user namespace. Instrument `differ569` (mode `v6`), 112 arms × 2 boots,
+and mode `iso` (the isolation of the F46 anomaly, section 9).
+
+Six doors, two classes:
+
+    door            family inet hook        class measured
+    out             local_out               a datagram generated by a local IPv6 socket
+    post            postrouting             local datagram / frame forwarded
+    fwd             forward                 frame forwarded
+    pre             prerouting              frame forwarded
+    egr             netdev egress of x0     local datagram / frame forwarded
+
+`loc` = a real `AF_INET6` socket bound to `fd00::1:40000` sending 18 bytes to
+`fd00::2:5000`; the receiver is an `AF_INET6` socket on `fd00::2:5000` inside its own
+netns, plus the kernel's `Ip6*`/`Udp6*` counters and an `AF_PACKET` tap on `x1`.
+`fwd` = a fully built IPv6/UDP frame injected on `o1`, forwarded by the parent netns to
+`fd00::2`. Both classes carry the same 18 bytes of `0x77`.
+
+Two base chains per door (priority 0/10): the first is `counter`+`log`+`accept` and says
+whether the hook ran, the second carries one `payload set` and says whether the guard
+accepted it (`lives` = that chain's counter). Every logged message is kept, not only the
+last, so the packets a door counts can be classified one by one.
+
+## 1. The guard is the same at all six doors, and it has no case for two offsets
+
+| cell (store) | out/loc | post/loc | egr/loc | post/fwd | fwd/fwd | egr/fwd | pre/fwd |
+|---|---|---|---|---|---|---|---|
+| hop90 | yes | yes | yes | yes | yes | yes | yes |
+| hop00 | yes | yes | yes | yes | yes | yes | yes |
+| hop01 | yes | yes | yes | yes | yes | yes | yes |
+| hop64 | yes | yes | yes | yes | yes | yes | yes |
+| flow2 | yes | yes | yes | yes | yes | yes | yes |
+| tc4 | yes | yes | yes | yes | yes | yes | yes |
+| ver9 | no | no | no | no | no | no | no |
+| saddr | yes | yes | yes | yes | yes | yes | yes |
+| saddr_same | yes | yes | yes | yes | yes | yes | yes |
+| daddr | yes | yes | yes | yes | yes | yes | yes |
+| plen2 | no | no | no | no | no | no | no |
+| nh1 | no | no | no | no | no | no | no |
+
+Twelve cells, seven door/class pairs, both boots identical. `yes` = the store was accepted
+(`lives > 0`), `no` = refused (`lives = 0`, and the counter of the door still 1: the refusal
+is not a drop). Three cells are refused everywhere:
+
+* `ver9` — `@nh,0,4 = 90 91 92 93`. `nft_nh_write_ok_ip6()` `case 0` compares the written
+  **version nibble with 6**, so a store that would change the version is refused, and the
+  same cell with `60 91 92 93` (`tc4`) is accepted;
+* `plen2` — `@nh,4,2` (payload length) and `nh1` — `@nh,6,1` (next header): the IPv6 list
+  has **no case for offset 4 and none for 6**, so these two fields are not writable at all
+  at the network base. On IPv4 the same offsets are writable (F46 measured both).
+
+The refusals are the same at five layer-3 hooks and at the netdev egress hook, which is the
+opposite of F44's ingress result: nothing here depends on the family the hook was
+registered with.
+
+## 2. The coordinate is exact, and the read side agrees with it
+
+`rd_src` and `rd_dst` (read the 16-byte source / destination and compare it with the
+immediate) match at all seven pairs, and `rd_hop00` matches nowhere — the read counts:
+
+| cell (read / refused) | out/loc | post/loc | egr/loc | post/fwd | fwd/fwd | egr/fwd | pre/fwd |
+|---|---|---|---|---|---|---|---|
+| ver9 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| plen2 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| nh1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| rd_hop64 | 1 | 1 | 1 | 0 | 0 | 0 | 1 |
+| rd_hop00 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| rd_src | 1 | 1 | 1 | 1 | 1 | 1 | 1 |
+| rd_dst | 1 | 1 | 1 | 1 | 1 | 1 | 1 |
+
+At the five layer-3 hooks the logged payload starts at the IPv6 header (`data = network
+header`, `pkt->nhoff = 0`), so `@nh,off` is `data + off`; at the egress hook the logged
+payload starts at the MAC header, so the store lands at `data + 14 + off`, and the tap shows
+it in the right place. The two IPv6-specific traps of the read side (F40's `nhoff`, F45's
+walk) do not appear here: `thoff` is not involved, and `nhoff` is zero on every door
+measured.
+
+## 3. The price: there is no header checksum, so six of seven doors are free
+
+The same four one-byte stores into `@nh,7,1` (the hop limit), 7 pairs × 4 values:
+
+| door | cell | lives | hop on the wire | u6in_d | i6deliv |
+|---|---|---|---|---|---|
+| out/loc | hop64 | 1 | 40 | 1 | 22 |
+| out/loc | hop90 | 1 | 90 | 1 | 3 |
+| out/loc | hop00 | 1 | 00 | 1 | 10 |
+| out/loc | hop01 | 1 | 01 | 1 | 16 |
+| post/loc | hop64 | 1 | 40 | 1 | 23 |
+| post/loc | hop90 | 1 | 90 | 1 | 4 |
+| post/loc | hop00 | 1 | 00 | 1 | 11 |
+| post/loc | hop01 | 1 | 01 | 1 | 17 |
+| egr/loc | hop64 | 1 | 40 | 1 | 24 |
+| egr/loc | hop90 | 1 | 90 | 1 | 5 |
+| egr/loc | hop00 | 1 | 00 | 1 | 12 |
+| egr/loc | hop01 | 1 | 01 | 1 | 18 |
+| post/fwd | hop64 | 1 | 40 | 1 | 25 |
+| post/fwd | hop90 | 1 | 90 | 1 | 6 |
+| post/fwd | hop00 | 1 | 00 | 1 | 13 |
+| post/fwd | hop01 | 1 | 01 | 1 | 19 |
+| fwd/fwd | hop64 | 1 | 40 | 1 | 26 |
+| fwd/fwd | hop90 | 1 | 90 | 1 | 7 |
+| fwd/fwd | hop00 | 1 | 00 | 1 | 14 |
+| fwd/fwd | hop01 | 1 | 01 | 1 | 20 |
+| egr/fwd | hop64 | 1 | 40 | 1 | 27 |
+| egr/fwd | hop90 | 1 | 90 | 1 | 8 |
+| egr/fwd | hop00 | 1 | 00 | 1 | 15 |
+| egr/fwd | hop01 | 1 | 01 | 1 | 21 |
+| pre/fwd | hop64 | 1 | 3f | 1 | 28 |
+| pre/fwd | hop90 | 1 | 8f | 1 | 9 |
+| pre/fwd | hop00 | 1 | - | 0 | 15 |
+| pre/fwd | hop01 | 1 | - | 0 | 21 |
+
+On IPv4 the same store killed the packet at four doors, because the header checksum is
+computed before LOCAL_OUT and verified before PREROUTING (F46 §2). IPv6 has no header
+checksum, so:
+
+* `hop64` (writing the value the frame already carries) is delivered everywhere — the store
+  itself costs nothing;
+* `hop90` is delivered everywhere, including the four doors where the IPv4 packet died;
+* `hop00` and `hop01` — a hop limit of 0 or 1, which `ip6_forward()` refuses — are delivered
+  at six of the seven pairs and produce **no frame at all** at `prerouting`. That is the
+  whole toll of this family: `ip6_forward()` tests `hop_limit <= 1` *before* it enters the
+  FORWARD hook, so a store at PREROUTING is seen by the test and a store at FORWARD is not.
+  The route from "PREROUTING" to "FORWARD" is where the price is charged, and only there.
+
+The decrement that pays for the forward sits in the same gap, and the wire shows it:
+
+* written at `prerouting`, hop 0x40 leaves as `3f` and 0x90 leaves as `8f`;
+* written at `forward`, `postrouting` or the egress hook, the value written is the value on
+  the wire (the decrement already happened);
+* the read side sees the same seam: `rd_hop64` (read the hop limit, compare with 0x40)
+  matches at the five doors where the packet has not been forwarded yet — `out`, `post`,
+  `egr` of the local class and `pre` of the forwarded one — and matches **nowhere** after
+  it: at `forward`, `postrouting` and the egress hook of a forwarded packet the cell reads
+  0x3f. A read at a door cannot see a value that the door's own packet no longer has.
+
+The whole grid as the receiver saw it — the twelve store cells and the four read
+cells, every door and class. `delivered` = the datagram reached the socket;
+`Udp6InErr` = it reached the transport layer and died of the checksum;
+`AddrErr` = the frame went out and the receiver counted `Ip6InAddrErrors`;
+`no frame` = nothing arrived at all. The first arm of a boot has no baseline for
+the receiver counters and reads `n/a`.
+
+| cell | out/loc | post/loc | egr/loc | post/fwd | fwd/fwd | egr/fwd | pre/fwd |
+|---|---|---|---|---|---|---|---|
+| hop90 | n/a | delivered | delivered | delivered | delivered | delivered | delivered |
+| hop00 | delivered | delivered | delivered | delivered | delivered | delivered | no frame |
+| hop01 | delivered | delivered | delivered | delivered | delivered | delivered | no frame |
+| hop64 | delivered | delivered | delivered | delivered | delivered | delivered | delivered |
+| flow2 | delivered | delivered | delivered | delivered | delivered | delivered | delivered |
+| tc4 | delivered | delivered | delivered | delivered | delivered | delivered | delivered |
+| ver9 | delivered | delivered | delivered | delivered | delivered | delivered | delivered |
+| saddr | delivered | delivered | delivered | Udp6InErr | Udp6InErr | Udp6InErr | Udp6InErr |
+| saddr_same | delivered | delivered | delivered | delivered | delivered | delivered | delivered |
+| daddr | no frame | no frame | AddrErr | no frame | no frame | AddrErr | AddrErr |
+| plen2 | delivered | delivered | delivered | delivered | delivered | delivered | delivered |
+| nh1 | delivered | delivered | delivered | delivered | delivered | delivered | delivered |
+| rd_hop64 | delivered | delivered | delivered | delivered | delivered | delivered | delivered |
+| rd_hop00 | delivered | delivered | delivered | delivered | delivered | delivered | delivered |
+| rd_src | delivered | delivered | delivered | delivered | delivered | delivered | delivered |
+| rd_dst | delivered | delivered | delivered | delivered | delivered | delivered | delivered |
+
+## 4. The transport toll moved into the pseudo-header
+
+One cell, `@nh,8,16` (source address) = `fd00::99`, and its control `saddr_same` (the same
+16 bytes the frame already carries):
+
+| | local datagram (3 doors) | frame from the wire (4 doors) |
+|---|---|---|
+| `saddr` | delivered | **Udp6InErrors** at the receiver, no delivery |
+| `saddr_same` | delivered | delivered |
+
+The IPv6 header has no checksum, but the *UDP* checksum covers a pseudo-header that
+contains the source address. So the toll that IPv4 charged for the header (F46: `InHdrErrors`
+at four doors) is charged here for the transport, and again only where the checksum is
+already final: a locally generated datagram leaves the hook with `CHECKSUM_PARTIAL`, veth
+carries the flag to the peer, and the receiver never verifies it — measured directly from
+the bytes, the UDPv6 checksum on the wire is not a valid one:
+
+| door | field | sum of the datagram | verdict |
+|---|---|---|---|
+| out/loc | fa2f | d775 | invalid |
+| post/loc | fa2f | d775 | invalid |
+| egr/loc | fa2f | d775 | invalid |
+
+That is a property of the sender, not of the store: the *control* datagram, with nothing
+stored, has the same invalid field on the wire and is still delivered.
+
+## 5. A destination written early stops being your datagram
+
+`@nh,24,16` = `fd00::99`, one cell, seven pairs:
+
+| door | cntp | lives | tapn | u6in_d | i6addr | pout_d |
+|---|---|---|---|---|---|---|
+| out/loc | 8 | 8 | 0 | 0 | 0 | 8 |
+| post/loc | 8 | 8 | 0 | 0 | 0 | 8 |
+| egr/loc | 1 | 1 | 1 | 0 | 1 | 1 |
+| post/fwd | 7 | 7 | 0 | 0 | 0 | 6 |
+| fwd/fwd | 1 | 1 | 0 | 0 | 0 | 3 |
+| egr/fwd | 2 | 2 | 1 | 0 | 1 | 5 |
+| pre/fwd | 1 | 1 | 0 | 0 | 2 | 2 |
+
+At `local_out` and at `postrouting` the store lands **before the route lookup**, so the
+packet is routed to `fd00::99`, no neighbour exists, and the datagram is queued for a
+resolution that never comes. The door counts **eight packets for one datagram** — the
+solicitation retries and the ICMP errors of that queue — and nothing reaches the receiver.
+At prerouting the same store also provokes traffic but nothing arrives. At the egress hook
+the L2 header and the neighbour are already resolved, so the frame goes out *carrying the
+written destination* (visible in the tap bytes) and the receiver counts `Ip6InAddrErrors`.
+
+The counter of the door is therefore not a property of the datagram: same rule, same
+accepted store, `cntp` between 1 and 8 depending on the door.
+
+## 6. What was not measured
+
+IPv6 inside PPPoE (`@nh` with `nhoff = 8` at an egress door); a VLAN-tagged IPv6 frame at
+the egress hook; `@th` in this mode (F45 measured it on the ingress doors and F43/F44 on the
+layer-3 ones); extension headers at an egress door (the walk happens before every hook, so
+`@th` would land after them — read, not measured); GSO/`CHECKSUM_PARTIAL` on real hardware
+(veth is what carries it here); ICMPv6 and SCTP as the transport; the `arp` family; more
+than one device in a netdev chain; equal priorities.
+
+Also not measured, and worth saying plainly: the *first* arm of each boot has no baseline
+for the receiver counters, so its delivery column reads `n/a` in the tables above rather
+than a number.
+
+## 7. Errors of the turn, all mine
+
+1. **The instrument's child had to yield before it drained.** Under TCG the frames wait in
+   the backlog until the process that holds the CPU yields; the tap and the UDP socket were
+   read before the softirq ran, so every arm looked undelivered while the counters said the
+   packet had arrived. Found by reading the *disagreement* between `Ip6InReceives` and the
+   tap, fixed with a 40 ms yield before the drain.
+2. **The injected frame was addressed to the wrong device.** `ip6_rcv_core()` drops
+   `PACKET_OTHERHOST` *before* it counts the packet, so a frame addressed to `o1` arriving on
+   `o0` left no trace at all — not even in `Ip6InReceives`. The whole forwarded class was
+   dead and looked like a guard refusal. Fixed by addressing the frame to `o0`.
+3. **Two `/sys` oracles were dead**: `/sys/class/net/*/statistics/*_packets` read 0 in this
+   image, so the columns derived from them were constants. They are printed but not used.
+4. **The read arms compared with the wrong immediate** (`0x90` for a frame that carries
+   `0x40`), so the first grid showed `lives = 0` for every read. The four read cells were
+   rebuilt and are the `refused` table above.
+5. **The receiver counters are cumulative and I first used them as if they were per-arm.**
+   The verdict of an arm is the difference from the previous arm, and the first arm of a
+   boot has no difference; both are handled explicitly now.
+6. `pkill -f "tools/f47_run.sh full"` matched my own shell's command line and killed it —
+   the same mistake as F39, for the same reason, in a command that was writing the text of
+   that very pattern.
+7. The first isolation build enabled IPv6 with `dad_transmits=1` written *before* the
+   enable and got nothing: enabling recreates the device's conf tree. With the sysctls
+   written after the enable, the kernel emits the MLD report and the DAD solicitation, which
+   is what makes section 9 a measurement rather than a hope.
+
+## 8. How this was verified
+
+| | |
+|---|---|
+| `tools/verify569.py` | the whole grid re-derived from the logs: provenance (kernel sha from the log header against the file, initrd against the hash list, the differ **extracted from the initramfs** and compared byte for byte), eight source anchors, the guard's verdict on all 112 arms × 2 boots against a Python model of `nft_nh_write_ok_ip6()`, the receiver's verdict against a model of the door, the bytes on the wire (version, payload length, next header, the stored field, the written destination), determinism between the boots, and the isolation section |
+| `tools/verify569_selftest.sh` | every check must be able to go red: one mutation per check on a copy of the log |
+| `tools/audit_f47_doc.py` | every table of this document is the output of `tools/f569_summary.py`; the audit re-derives them and compares cell by cell |
+
+## 9. The F46 anomaly, closed
+
+F46 recorded one arm where a single datagram was counted twice at the postrouting door and
+wrote honestly that its counters could not separate "two rules in the chain" from "the hook
+ran twice on one skb".
+
+**From the frozen bytes of the F46 logs** (`tools/iso_f46_cntp.py`): on 856 arms
+(428 × 2 boots) `cntp == npre` — the counter always equals the number of packets the chain's
+own log emitted. Exactly one arm saw more than one packet: `rep1 post/loc n0_1`, `cntp = 2`,
+`npre = 2`, and the payload the log kept is a **56-byte ICMPv6 router solicitation** from
+`fe80::0c4f:63ff:fe58:4538` (the EUI-64 of `x0`'s MAC) to `ff02::2`, hop limit 255. The
+receiver saw exactly one IPv4 datagram (`tapn = 1`, `IpInReceives +1`, `IpInDelivers +1`,
+`udpn = 1`), and that arm carried no `F568 RETRY` — the two RETRY lines of that boot are at
+`ll/out l0_2` and `th/out t6_2`, and both arms were re-installed clean.
+
+**Reproduced on purpose** (mode `iso`, one `inet` base chain at postrouting, counter + log +
+accept):
+
+| arm | send4 | cnt | gcnt | nmsg | what |
+|---|---|---|---|---|---|
+| ctl4 | 1 | 2 | 0 | 2 | v4/proto17,v4/proto1 |
+| v6on | 0 | 1 | 0 | 1 | v6/nh0 |
+| v6plus | 1 | 5 | 0 | 5 | v4/proto17,v4/proto1,v6/nh0,v6/nh0,v6/icmp6-135 |
+| guard | 1 | 4 | 2 | 4 | v4/proto17,v4/proto1,v6/nh0,v6/nh0 |
+| v6off | 1 | 2 | 2 | 2 | v4/proto17,v4/proto1 |
+| quiet | 0 | 0 | 0 | 0 | - |
+
+* `ctl4` — IPv6 off, one IPv4 datagram: the chain counts **2**, the datagram and the ICMP
+  port-unreachable it provokes. Both IPv4.
+* `v6on` — IPv6 enabled on `x0` and **not a byte sent by the rule**: the chain counts **1**,
+  and the payload is IPv6 (next header 0: a hop-by-hop header carrying an MLD report).
+  This is the anomaly in one line: an `inet` counter counts packets nobody sent.
+* `v6plus` — the same enable plus one IPv4 datagram in one arm: **5** — one IPv4 datagram,
+  one ICMPv4 error, two IPv6 hop-by-hop packets and one ICMPv6 neighbour solicitation.
+* `guard` — the same traffic with a `meta nfproto ipv4` rule in front of a second counter:
+  the blind counter sees **4**, the family-specific one sees **2**. The same packets, one
+  counter that can tell the families apart.
+* `v6off` — IPv6 off again: **2**, exactly the IPv4-only baseline, and the family-specific
+  counter agrees.
+* `quiet` ×4 — nothing sent, nothing counted.
+
+So `cntp = 2` in F46 was never a double count: an `inet` chain counts every family, the
+second packet was IPv6, and it was emitted by the address configuration of the sending
+device, not by the rule. The debt F46 left open is closed by a counter that can be driven to
+zero and a guard that separates the families, not by re-reading the log.
+
+Not a vulnerability: every rule here is installed by root in the initial user namespace.
+
+
+===== summary.json =====
+{
+ "turn": 569,
+ "finding": "F47",
+ "kernel": "7.3.4-T563",
+ "arms_per_boot": 112,
+ "boots": 2,
+ "tables": {
+  "guard": {
+   "head": [
+    "cell (store)",
+    "out/loc",
+    "post/loc",
+    "egr/loc",
+    "post/fwd",
+    "fwd/fwd",
+    "egr/fwd",
+    "pre/fwd"
+   ],
+   "rows": [
+    [
+     "hop90",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes"
+    ],
+    [
+     "hop00",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes"
+    ],
+    [
+     "hop01",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes"
+    ],
+    [
+     "hop64",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes"
+    ],
+    [
+     "flow2",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes"
+    ],
+    [
+     "tc4",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes"
+    ],
+    [
+     "ver9",
+     "no",
+     "no",
+     "no",
+     "no",
+     "no",
+     "no",
+     "no"
+    ],
+    [
+     "saddr",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes"
+    ],
+    [
+     "saddr_same",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes"
+    ],
+    [
+     "daddr",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes",
+     "yes"
+    ],
+    [
+     "plen2",
+     "no",
+     "no",
+     "no",
+     "no",
+     "no",
+     "no",
+     "no"
+    ],
+    [
+     "nh1",
+     "no",
+     "no",
+     "no",
+     "no",
+     "no",
+     "no",
+     "no"
+    ]
+   ]
+  },
+  "fate": {
+   "head": [
+    "cell",
+    "out/loc",
+    "post/loc",
+    "egr/loc",
+    "post/fwd",
+    "fwd/fwd",
+    "egr/fwd",
+    "pre/fwd"
+   ],
+   "rows": [
+    [
+     "hop90",
+     "n/a",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered"
+    ],
+    [
+     "hop00",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "no frame"
+    ],
+    [
+     "hop01",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "no frame"
+    ],
+    [
+     "hop64",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered"
+    ],
+    [
+     "flow2",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered"
+    ],
+    [
+     "tc4",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered"
+    ],
+    [
+     "ver9",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered"
+    ],
+    [
+     "saddr",
+     "delivered",
+     "delivered",
+     "delivered",
+     "Udp6InErr",
+     "Udp6InErr",
+     "Udp6InErr",
+     "Udp6InErr"
+    ],
+    [
+     "saddr_same",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered"
+    ],
+    [
+     "daddr",
+     "no frame",
+     "no frame",
+     "AddrErr",
+     "no frame",
+     "no frame",
+     "AddrErr",
+     "AddrErr"
+    ],
+    [
+     "plen2",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered"
+    ],
+    [
+     "nh1",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered"
+    ],
+    [
+     "rd_hop64",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered"
+    ],
+    [
+     "rd_hop00",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered"
+    ],
+    [
+     "rd_src",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered"
+    ],
+    [
+     "rd_dst",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered",
+     "delivered"
+    ]
+   ]
+  },
+  "hop": {
+   "head": [
+    "door",
+    "cell",
+    "lives",
+    "hop on the wire",
+    "u6in_d",
+    "i6deliv"
+   ],
+   "rows": [
+    [
+     "out/loc",
+     "hop64",
+     "1",
+     "40",
+     "1",
+     "22"
+    ],
+    [
+     "out/loc",
+     "hop90",
+     "1",
+     "90",
+     "1",
+     "3"
+    ],
+    [
+     "out/loc",
+     "hop00",
+     "1",
+     "00",
+     "1",
+     "10"
+    ],
+    [
+     "out/loc",
+     "hop01",
+     "1",
+     "01",
+     "1",
+     "16"
+    ],
+    [
+     "post/loc",
+     "hop64",
+     "1",
+     "40",
+     "1",
+     "23"
+    ],
+    [
+     "post/loc",
+     "hop90",
+     "1",
+     "90",
+     "1",
+     "4"
+    ],
+    [
+     "post/loc",
+     "hop00",
+     "1",
+     "00",
+     "1",
+     "11"
+    ],
+    [
+     "post/loc",
+     "hop01",
+     "1",
+     "01",
+     "1",
+     "17"
+    ],
+    [
+     "egr/loc",
+     "hop64",
+     "1",
+     "40",
+     "1",
+     "24"
+    ],
+    [
+     "egr/loc",
+     "hop90",
+     "1",
+     "90",
+     "1",
+     "5"
+    ],
+    [
+     "egr/loc",
+     "hop00",
+     "1",
+     "00",
+     "1",
+     "12"
+    ],
+    [
+     "egr/loc",
+     "hop01",
+     "1",
+     "01",
+     "1",
+     "18"
+    ],
+    [
+     "post/fwd",
+     "hop64",
+     "1",
+     "40",
+     "1",
+     "25"
+    ],
+    [
+     "post/fwd",
+     "hop90",
+     "1",
+     "90",
+     "1",
+     "6"
+    ],
+    [
+     "post/fwd",
+     "hop00",
+     "1",
+     "00",
+     "1",
+     "13"
+    ],
+    [
+     "post/fwd",
+     "hop01",
+     "1",
+     "01",
+     "1",
+     "19"
+    ],
+    [
+     "fwd/fwd",
+     "hop64",
+     "1",
+     "40",
+     "1",
+     "26"
+    ],
+    [
+     "fwd/fwd",
+     "hop90",
+     "1",
+     "90",
+     "1",
+     "7"
+    ],
+    [
+     "fwd/fwd",
+     "hop00",
+     "1",
+     "00",
+     "1",
+     "14"
+    ],
+    [
+     "fwd/fwd",
+     "hop01",
+     "1",
+     "01",
+     "1",
+     "20"
+    ],
+    [
+     "egr/fwd",
+     "hop64",
+     "1",
+     "40",
+     "1",
+     "27"
+    ],
+    [
+     "egr/fwd",
+     "hop90",
+     "1",
+     "90",
+     "1",
+     "8"
+    ],
+    [
+     "egr/fwd",
+     "hop00",
+     "1",
+     "00",
+     "1",
+     "15"
+    ],
+    [
+     "egr/fwd",
+     "hop01",
+     "1",
+     "01",
+     "1",
+     "21"
+    ],
+    [
+     "pre/fwd",
+     "hop64",
+     "1",
+     "3f",
+     "1",
+     "28"
+    ],
+    [
+     "pre/fwd",
+     "hop90",
+     "1",
+     "8f",
+     "1",
+     "9"
+    ],
+    [
+     "pre/fwd",
+     "hop00",
+     "1",
+     "-",
+     "0",
+     "15"
+    ],
+    [
+     "pre/fwd",
+     "hop01",
+     "1",
+     "-",
+     "0",
+     "21"
+    ]
+   ]
+  },
+  "refused": {
+   "head": [
+    "cell (read / refused)",
+    "out/loc",
+    "post/loc",
+    "egr/loc",
+    "post/fwd",
+    "fwd/fwd",
+    "egr/fwd",
+    "pre/fwd"
+   ],
+   "rows": [
+    [
+     "ver9",
+     "0",
+     "0",
+     "0",
+     "0",
+     "0",
+     "0",
+     "0"
+    ],
+    [
+     "plen2",
+     "0",
+     "0",
+     "0",
+     "0",
+     "0",
+     "0",
+     "0"
+    ],
+    [
+     "nh1",
+     "0",
+     "0",
+     "0",
+     "0",
+     "0",
+     "0",
+     "0"
+    ],
+    [
+     "rd_hop64",
+     "1",
+     "1",
+     "1",
+     "0",
+     "0",
+     "0",
+     "1"
+    ],
+    [
+     "rd_hop00",
+     "0",
+     "0",
+     "0",
+     "0",
+     "0",
+     "0",
+     "0"
+    ],
+    [
+     "rd_src",
+     "1",
+     "1",
+     "1",
+     "1",
+     "1",
+     "1",
+     "1"
+    ],
+    [
+     "rd_dst",
+     "1",
+     "1",
+     "1",
+     "1",
+     "1",
+     "1",
+     "1"
+    ]
+   ]
+  },
+  "daddr": {
+   "head": [
+    "door",
+    "cntp",
+    "lives",
+    "tapn",
+    "u6in_d",
+    "i6addr",
+    "pout_d"
+   ],
+   "rows": [
+    [
+     "out/loc",
+     "8",
+     "8",
+     "0",
+     "0",
+     "0",
+     "8"
+    ],
+    [
+     "post/loc",
+     "8",
+     "8",
+     "0",
+     "0",
+     "0",
+     "8"
+    ],
+    [
+     "egr/loc",
+     "1",
+     "1",
+     "1",
+     "0",
+     "1",
+     "1"
+    ],
+    [
+     "post/fwd",
+     "7",
+     "7",
+     "0",
+     "0",
+     "0",
+     "6"
+    ],
+    [
+     "fwd/fwd",
+     "1",
+     "1",
+     "0",
+     "0",
+     "0",
+     "3"
+    ],
+    [
+     "egr/fwd",
+     "2",
+     "2",
+     "1",
+     "0",
+     "1",
+     "5"
+    ],
+    [
+     "pre/fwd",
+     "1",
+     "1",
+     "0",
+     "0",
+     "2",
+     "2"
+    ]
+   ]
+  },
+  "csum": {
+   "head": [
+    "door",
+    "field",
+    "sum of the datagram",
+    "verdict"
+   ],
+   "rows": [
+    [
+     "out/loc",
+     "fa2f",
+     "d775",
+     "invalid"
+    ],
+    [
+     "post/loc",
+     "fa2f",
+     "d775",
+     "invalid"
+    ],
+    [
+     "egr/loc",
+     "fa2f",
+     "d775",
+     "invalid"
+    ]
+   ]
+  },
+  "iso": {
+   "head": [
+    "arm",
+    "send4",
+    "cnt",
+    "gcnt",
+    "nmsg",
+    "what"
+   ],
+   "rows": [
+    [
+     "ctl4",
+     "1",
+     "2",
+     "0",
+     "2",
+     "v4/proto17,v4/proto1"
+    ],
+    [
+     "v6on",
+     "0",
+     "1",
+     "0",
+     "1",
+     "v6/nh0"
+    ],
+    [
+     "v6plus",
+     "1",
+     "5",
+     "0",
+     "5",
+     "v4/proto17,v4/proto1,v6/nh0,v6/nh0,v6/icmp6-135"
+    ],
+    [
+     "guard",
+     "1",
+     "4",
+     "2",
+     "4",
+     "v4/proto17,v4/proto1,v6/nh0,v6/nh0"
+    ],
+    [
+     "v6off",
+     "1",
+     "2",
+     "2",
+     "2",
+     "v4/proto17,v4/proto1"
+    ],
+    [
+     "quiet",
+     "0",
+     "0",
+     "0",
+     "0",
+     "-"
+    ]
+   ]
+  }
+ },
+ "isolation": {
+  "file": "findings/F46-egress-doors/ISOLATION_CNTP.md",
+  "tool": "tools/iso_f46_cntp.py",
+  "f46_arms": 856,
+  "f46_cntp_equals_npre": "856/856",
+  "f46_arms_with_more_than_one_packet": 1,
+  "f46_second_packet": "ICMPv6 router solicitation, 56 bytes, fe80::0c4f:63ff:fe58:4538 -> ff02::2",
+  "reproduction": {
+   "ctl4": 2,
+   "v6on": 1,
+   "v6plus": 5,
+   "guard": [
+    4,
+    2
+   ],
+   "v6off": 2,
+   "quiet": 0
+  }
+ },
+ "not_measured": [
+  "IPv6 inside PPPoE (@nh with nhoff = 8 at an egress door)",
+  "a VLAN-tagged IPv6 frame at the egress hook",
+  "@th in the v6 mode",
+  "extension headers at an egress door",
+  "GSO/CHECKSUM_PARTIAL on real hardware",
+  "ICMPv6 and SCTP as the transport",
+  "the arp family in this instrument",
+  "more than one device in a netdev chain"
+ ],
+ "errors": [
+  "the child had to yield before draining: under TCG the frames wait in the backlog",
+  "the injected frame was addressed to o1 and dropped as PACKET_OTHERHOST before any counter",
+  "two /sys statistics oracles read 0 in this image",
+  "the read arms compared with the wrong immediate (0x90 for a frame carrying 0x40)",
+  "cumulative receiver counters used as per-arm deltas",
+  "pkill matched my own shell",
+  "the first isolation build wrote the sysctls before the enable and emitted nothing"
+ ],
+ "title": "IPv6 has no header checksum, so a hop-limit store at @nh is free at six of seven egress door/class pairs; the one seam that charges is ip6_forward()'s hop_limit <= 1 test, which sits between PREROUTING and FORWARD",
+ "answer_short": "measured on 112 arms x 2 boots: @nh,7,1 = 0x90 delivered at all seven pairs, 0x00/0x01 deadly at prerouting and free at the FORWARD hook; the IPv6 white list has no case for offset 4 or 6; saddr costs the datagram only on a frame from the wire (Udp6InErrors); daddr written before the route lookup makes one door count eight packets for one datagram"
+}

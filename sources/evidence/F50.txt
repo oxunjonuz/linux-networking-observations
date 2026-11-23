@@ -1,0 +1,486 @@
+===== LETTER_SECTION_F50.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload: a static transport-store check is enforced at runtime,
+ and 14 nft spellings die silently (`tcp flags set` regressed in v7.3)
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+References: <the same Message-Id>
+
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+Theme: `@ll` has two different domains at one door -- reads run past the link
+header into the network header, writes stop at `mac_len` -- and the guard's
+verdict is the same at two doors whose consequences are opposite, because by
+the time the layer-3 door of a bridge runs, the frames for the other ports have
+already been cloned.
+
+No diff below: this measures the guards as they stand and proposes no change.
+
+Linux 7.3.4, nftables in the initial user namespace, one packet at a time, one
+rule at a time.  One frame, 80 bytes: ethernet broadcast | IPv6 fd02::11 ->
+fd02::92 | UDP 40000->5000, injected on a veth; a bridge `br0` with two ports,
+IPv6 enabled on the bridge only, so the port's copy of the frame dies in
+`ip6_rcv_core()` on the far side and touches no chain of mine.  The same skb is
+presented to four doors in one boot: `ip6` prerouting (the layer-3 door of the
+bridge, after `br_pass_frame_up()`), `ip6` input (a witness one door later),
+`bridge` prerouting (before the bridge makes its copies) and netdev ingress on
+the port.
+
+First, the open question from my previous report is closed by refusal: a ppp
+device cannot be put in a bridge at all.  `br_add_if()` rejects
+`dev->type != ARPHRD_ETHER` with `-EINVAL`, and the netlink call returns exactly
+that (`rc=-22`) while the same call succeeds for both ethernet ports.  So the
+`@ll` base that does not exist on a device without a link-layer header (my
+previous report) cannot be brought into existence by bridging it: the two
+refusals are the same fact.
+
+`@ll` at the layer-3 door of the bridge, 36 cells of `(offset, len)`:
+
+* reads: **36/36**.  `skb_mac_header_was_set()` holds, `mac_len` is 14, and the
+  read has no upper boundary -- `@ll,14,4` returns `60 00 00 00`, the first four
+  bytes of the IPv6 header; `@ll,20,2` returns `11 40`, the next-header and the
+  hop limit.  The comment in `nft_ll_write_ok()` says writes must not spill into
+  the network header; reads do.
+* writes: **23/36**, exactly `off + len <= 14`.  The boundary is `mac_len`, at
+  every door: at netdev ingress the same cells are taken without any bound at
+  all, and a four-byte store at offset 12 writes the ethertype *and* two bytes
+  of the IPv6 header, the version becomes 9 and the packet dies in
+  `Ip6InHdrErrors`.  The refusing guard is what saves the packet at layer 3.
+
+One accepted store in the destination MAC (`@ll,0,6`), three doors:
+
+| door | local copy | port copy | delivered |
+|---|---|---|---|
+| ip6 prerouting (after `br_pass_frame_up`) | unchanged, delivered | byte-identical to the control | yes |
+| bridge prerouting | **no local copy at all** | foreign unicast, `rx_otherhost_dropped` | no |
+| netdev ingress | **no local copy at all** | foreign unicast | no |
+
+At the bridge and ingress doors the write changes the forwarding decision,
+because `br_handle_frame_finish()` reads `eth_hdr(skb)->h_dest` after the hook.
+At the layer-3 door it cannot change anything: the port's copy was cloned
+before the hook (`br_flood()` -> `deliver_clone()` -> `br_pass_frame_up()`), and
+`ip6_rcv_core()` unshared the local one before it.  The same value aimed at the
+bridge's own address at the bridge door is a third outcome: local delivery only,
+nothing sent to the port.  So one rule, one accepted store, one cell: the frame
+can go to the port, stay with the bridge, or die on both sides, decided by the
+value.
+
+The guard reads a cache, not the frame.  In one rule at the bridge door,
+`[@ll,12,2 = 0800][@nh,10,2]`: the first store lands (the wire carries `0800`),
+the second is refused, because `nft_nh_write_ok_bridge()` switches on
+`pkt->ethertype`, assigned once in `nft_pktinfo_init()` from `skb->protocol`.
+The mirror control on the same door (`@nh,7,1`, a hop-limit cell) is accepted.
+
+Two instrument-level notes that may matter to anyone reading nft logs:
+`NFULA_HWHEADER` is copied from `skb_mac_header()` at the moment the `log`
+expression runs, so two log expressions in one packet give two different
+snapshots of the same 14 bytes -- it is a witness of *when* a store landed, and
+the only one for an `@ll` store (the payload attribute starts at `skb->data`,
+which such a store never touches).  And at the layer-3 door of a bridge
+`NFULA_L2HDR` is absent (it is gated on the family) while `NFULA_IFINDEX_INDEV`
+is the bridge, not the port the frame arrived on; `CONFIG_BRIDGE_NETFILTER` is
+off in my image, so the physical port is not in the log at all.
+
+Not measured here: VLAN-tagged and Q-in-Q frames on these doors, `@nh`/`@th`
+on the two-copy path, the `inet` family, IPv4, GSO/`CHECKSUM_PARTIAL`, and
+several devices in one bridge chain.  One sender, one bridge, one frame per
+arm; the rule is installed by root in the initial user namespace.
+
+
+===== SUMMARY.md =====
+# F50 — у layer-3 двери моста `@ll` читается за границу и не пишется за неё, а запись в адрес назначения на двух других дверях решает судьбу кадра
+
+571-й кончился словами «осталась одна дверь, где тот же кадр доходит до стража `@nh` с `mac_len != 0` и `pf = NFPROTO_IPV6` сразу, — ppp0 внутри моста». Ядер не собирал: весь ход на том же `7.3.4-T563` (`1efbc957…2033`), образ F41..F49. Новый прибор `differ572`, режим `ll3br` — **98 плеч в каждой из двух загрузок**; все производные факты двух загрузок совпадают (расходятся только MAC, которые ядро выбирает заново при каждой загрузке).
+
+Дверь названа неверно, и это первое, что измерено. Остальное — то, чего в вопросе не было: у приёма через мост **две** копии одного кадра, и дверь, на которой `@ll` жив, стоит **после** решения о том, куда копии пойдут.
+
+Кадр не собран руками: 80 байт, ethernet **broadcast** | IPv6 `fd02::11 → fd02::92` (адрес br0) | UDP 40000→5000 + 18 × `0x77`, инжектится на `x0`. Два veth (x0↔x1, y0↔y1), мост `br0` с портами `x1` и `y1`, IPv6 включён **только** на br0, `accept_dad=0`, `autoconf=0`, `multicast_snooping=0`. Один и тот же кадр предстаёт перед четырьмя дверями одной загрузки:
+
+| дверь | семейство | хук | устройство | что это |
+|---|---|---|---|---|
+| `in6` | `ip6` | prerouting | — (все) | layer-3 дверь моста, после `br_pass_frame_up()` |
+| `i6in` | `ip6` | input | — (все) | свидетель: тот же skb, одна дверь позже |
+| `brp` | `bridge` | prerouting | — (на br0 цепь не навесить) | дверь F37/F38: **до** того, как мост сделает копии |
+| `nd1` | `netdev` | ingress | `x1` | дверь F44: стража нет вовсе |
+
+Мост `br0` сошёлся как надо: `stp=0`, оба порта в состоянии `3` (FORWARDING), `x1v6=1` и `y0v6=1` — IPv6 на портах выключен, поэтому копия, ушедшая в порт, умирает на дальней стороне в `ip6_rcv_core()` и не проходит ни одной моей цепи.
+
+## 1. Долг 571 закрыт отказом: ppp0 в мост не берут
+
+`br_add_if()` первым делом проверяет тип устройства (`net/bridge/br_if.c`: `dev->type != ARPHRD_ETHER → -EINVAL`). Юнит PPPoE, повешенный на канал так же, как в F49, получает отказ через netlink — и это ответ на вопрос, а не приготовление к нему.
+
+| плечо | устройство | `/sys/class/net/*/type` | rc | файл `master` после |
+|---|---|---|---|---|
+| `ref_ppp` | `ppp0` | 512 | **-22** | нет |
+| `ref_lo` | `lo` | 772 | **-22** | нет |
+| `ok_y1` | `y1` | 1 | **0** | есть |
+| `ok_x1` | `x1` | 1 | **0** | есть |
+
+`-22` — это `-EINVAL`, `512` — `ARPHRD_PPP`, `772` — `ARPHRD_LOOPBACK`, `1` — `ARPHRD_ETHER`. Значит **двери «ppp0 внутри моста» не существует**, и `@ll`, который в F49 не существовал на ppp0, не существует там не из-за семейства и не из-за `pf`, а из-за того, что у устройства нет L2-заголовка, который можно было бы выставить. Отказ моста и отказ стража `@ll` — один и тот же факт, названный дважды.
+
+## 2. У `@ll` на одной двери две области: чтение за границу, запись — нет
+
+Сетка F35 — 36 клеток `(offset, len)`, `offset ∈ {0,1,2,4,6,8,10,12,14,16,20,24}`, `len ∈ {1,2,4}` — прогнана на двери `in6` дважды: как 36 чтений (иммедиат — байты самого кадра, `cmp` с тем, что в кадре) и как 36 записей.
+
+| база | живых клеток из 36 | где проходит граница |
+|---|---|---|
+| `@ll` **чтение** | **36/36** | нет границы: `@ll,14,4` читает `60000000` — первые четыре байта заголовка IPv6, `@ll,20,2` — `1140` (nexthdr и hop limit) |
+| `@ll` **запись** | **23/36** | `off+len ≤ 14` = `mac_len`; отказаны `(12,4), (14,1), (14,2), (14,4), (16,1), (16,2), (16,4), (20,1), (20,2), (20,4), (24,1), (24,2), (24,4)` |
+
+Две области — два разных условия в двух разных функциях: чтение требует `skb_mac_header_was_set()` и `skb_mac_header_len() != 0` и после этого читает по `mac_header − data` без верхней границы; запись зовёт `nft_ll_write_ok()`, и та при `nft_in_ingress()` возвращает `true`, а иначе требует `off + len ≤ skb_network_offset()`. На этой двери `network_offset = 14`, поэтому чтение говорит «да» всем 36 клеткам, а запись — 23.
+
+То же условие с другой стороны: **на двери `nd1` стража нет вовсе**, и там та же клетка `(12,4)`, которую слой 3 отказывает, проходит — и записывает четыре байта, два из которых лежат уже в заголовке IPv6:
+
+| плечо (дверь `nd1`) | клетка | записано | версия IPv6 после | `Ip6InHdrErrors` | `Ip6InUnknownProtos` | доставлено |
+|---|---|---|---|---|---|---|
+| `w12_4_nd` | (12,4) | `90919293` (ethertype + 2 байта заголовка) | 9 | 1 | 0 | **0** |
+| `w14_1_nd` | (14,1) | `90` (сам заголовок, байт 0 (ver/TC)) | 9 | 1 | 0 | **0** |
+| `w20_4_nd` | (20,4) | `90919293` (nexthdr + hop limit + saddr[0:2]) | 6 (не тронута) | 0 | 1 | **0** |
+
+Три записи, каждая принята (счётчик правила 1), и ни одна датаграм не доставлена — а та же клетка `(12,4)` на двери `in6` отказана, и датаграм доходит. **Страж, который отказывает, спасает пакет; дверь, у которой стража нет, его убивает.**
+
+## 3. Одна принятая запись в адрес назначения на трёх дверях: две решают судьбу, третья не может
+
+Один и тот же imm `90:91:92:93:94:95` в клетку `@ll,0,6`, три двери. Свидетель — цепь на двери `i6in` (тот же skb, одна дверь позже), два тапа (br0 — локальная копия до хука, y0 — копия, ушедшая в порт) и счётчики обеих сторон.
+
+| плечо | дверь | счётчик цепи | свидетель `i6in` | доставлено | `Ip6InReceives` | `Ip6InDiscards` | `rx_otherhost_dropped` | тап br0 | тап y0 (dst) |
+|---|---|---|---|---|---|---|---|---|---|
+| `ctl` | `in6` | 1 | 1 | **1** | 2 | 1 | 0 | 1 | ffffffffffff |
+| `pre_dst` | `in6` | 1 | 1 | **1** | 2 | 1 | 0 | 1 | ffffffffffff |
+| `nd_dst` | `nd1` | 1 | 0 | **0** | 0 | 0 | 1 | 0 | 909192939495 |
+| `br_dst` | `brp` | 1 | 0 | **0** | 0 | 0 | 1 | 0 | 909192939495 |
+| `br_dst_br` | `brp` | 1 | 1 | **1** | 1 | 0 | 0 | 1 | - |
+| `br_dst_bc` | `brp` | 1 | 1 | **1** | 2 | 1 | 0 | 1 | ffffffffffff |
+
+Читается так. `pre_dst` (слой 3): запись принята, легла (свидетель читает её на следующей двери), датаграм доставлен — а копия, ушедшая в порт, **побайтово равна контролю**: она была склонирована раньше, чем хук сработал. `nd_dst` и `br_dst`: та же запись, то же значение — и локальной копии **нет вовсе** (тап br0 пуст, `Ip6InReceives` 0, доставок 0), а копия в порту стала чужим юникастом (`rx_otherhost_dropped` +1). Причина одна: `br_handle_frame_finish()` читает `eth_hdr(skb)->h_dest` **после** хука.
+
+`br_dst_br` — та же дверь, значение — собственный MAC моста: локальная копия доставлена, а в порт не уходит **ничего** (тап y0 пуст, `Ip6InReceives` +1). `br_dst_bc` — та же дверь, значение — то, что в кадре уже стоит (broadcast): раскладка в точности как у контроля. Значит решает **значение**, а не действие: одно и то же правило может отправить кадр в порт, оставить его себе или убить обе копии.
+
+И тот же факт с другой стороны — запись в ethertype:
+
+| плечо | дверь | клетка | счётчик | свидетель | доставлено | `Ip6InReceives` | на проводе у порта |
+|---|---|---|---|---|---|---|---|
+| `pre_et` | `in6` | (12,2) | 1 | 1 | 1 | 2 | `86dd` |
+| `pre_et6` | `in6` | (12,2) | 1 | 1 | 1 | 2 | `86dd` |
+| `br_et` | `brp` | (12,2) | 1 | 1 | 1 | 1 | `0806` |
+
+На двери `brp` запись `0806` уходит на провод и дальняя сторона разбирает кадр как ARP (`Ip6InReceives` +1 — только локальная копия). На двери `in6` та же запись ложится в те же байты — и не меняет ничего: `skb->protocol` записан `eth_type_trans()` на порту, до всех хуков. `pre_et6` (то же значение, что в кадре) — контроль: как у контроля во всём.
+
+## 4. Лог: где именно скопированы байты — и почему это оракул
+
+Одна и та же цепь пишет `NFULA_HWHEADER` из `skb_mac_header()` в момент выражения `log`. Два выражения в одном кадре дают два разных снимка одних и тех же 14 байт:
+
+| плечо | `m0` (правило на prio 10) | `m1` (правило на prio 20) |
+|---|---|---|
+| `dg1` | `ffffffffffff90919293949586dd` | `ffffffffffff90919293949586dd` |
+| `dg2` | `ffffffffffff8e6b8aacf58e86dd` | `ffffffffffff90919293949586dd` |
+
+`dg1` — запись и лог в одном правиле: оба сообщения несут записанное. `dg2` — лог в первой цепи, запись во второй: `m0` — кадр до записи, `m1` — после. Значит `NFULA_HWHEADER` — свидетель **времени**, а не места, и именно им видна запись в `@ll` (груз `NFULA_PAYLOAD` начинается с `skb->data` и пишется `@ll` всегда **до** него).
+
+Что лог говорит о L2 на каждой двери (закрывает T6 из F49 третьей строкой):
+
+| дверь | `NFULA_L2HDR` | `HWTYPE` | `HWLEN` | `NFULA_HWHEADER` | `NFULA_IFINDEX_INDEV` |
+|---|---|---|---|---|---|
+| `in6 (br0)` | 0 B | 1 | 14 | 14 байт | 9 (`br0`) |
+| `brp (x1)` | 14 B | 1 | 14 | 14 байт | 5 (`x1`) |
+| `nd1 (x1)` | 14 B | 1 | 14 | 14 байт | 5 (`x1`) |
+
+На layer-3 двери моста `NFULA_L2HDR` нет (гейт по `pf`), `HWHEADER` — 14 настоящих байт ethernet, а `INDEV` — **br0**, а не порт: по имени порта кадр пришёл с `x1`, но к моменту хука `skb->dev` уже мост. На дверях `brp`/`nd1` наоборот: `L2HDR` 14 байт и `INDEV` = `x1`. Это поправка к F49: там `HWHEADER` на ppp0 нес 22 байта заголовка IPv6, и я записал «атрибут говорит неправду»; правильнее — атрибут копирует `hard_header_len` байт от `mac_header`, и на ppp0 это ровно то, что лежит по этому адресу.
+
+## 5. Страж читает кэш, а не кадр
+
+Одно правило, два выражения, дверь `brp`: `[@ll,12,2 = 0800]` `[@nh,10,2 = 9091]`. Первое принимается, второе — нет:
+
+| плечо | второе выражение | счётчик правила | на проводе | доставлено |
+|---|---|---|---|---|
+| `comp_l2l3` | `@nh,10,2` (смещение 10 — только у IPv4) | **0** | ethertype `0800` | 1 |
+| `comp_h7` | `@nh,7,1` (hop limit — только у IPv6) | **1** | ethertype `0800` | 1 |
+
+`nft_nh_write_ok_bridge()` разбирает `pkt->ethertype`, а это значение присвоено один раз в `nft_pktinfo_init()` из `skb->protocol`. Правило переписало ethertype в кадре — страж этого не видит и судит по старому. Первый байт `0800` на проводе при этом доказывает, что первая запись легла: отказ второго выражения — не «правило не сработало», а другой ответ того же правила.
+
+## 6. Предсказания: 11 из 12, и опровергнутое — самое полезное
+
+P1 (отказ `br_add_if`), P2 (36/36 чтений), P3 (23/36 записей), P4 (ingress берёт граничные клетки), P5 (`pre_dst`), P7 (`pre_et` — ничего), P8 (`br_et`), P9 (`comp_l2l3` отказан), P10 (`HWHEADER` 14 настоящих байт, `L2HDR` нет, `INDEV` = br0), P11 (`nfproto` 10 и 7), P12 (`@nh,0,4` = `60000000` при базе 14) сошлись.
+
+**P6 опровергнуто.** Я предсказал, что запись в адрес назначения на двери `brp` оставит локальную копию живой (`Ip6InReceives` +1, доставка 1), а копию в порту сделает чужим юникастом. Измерено: `Ip6InReceives` **0**, доставок 0, тап br0 пуст, `rx_otherhost_dropped` +1 — локальной копии **нет вовсе**. Модель была неверна в одном месте: `local_rcv` для юникаста берётся из `promisc`, а не из «адрес был broadcast, когда кадр пришёл»; broadcast-ность читается по `eth_hdr(skb)->h_dest` уже после хука. Это и стало §3.
+
+## 6b. Ошибки хода, все мои
+
+1. **Прибор: два глобала на один сокет.** NFLOG открывался в `F572_NFL`, а дренаж читает унаследованный `F571_NFL` — первый дым не напечатал ни одного сообщения, и я прочёл это как «лог не работает».
+2. **Прибор: один буфер на три hex-колонки** в печати `comp` — `brhex`, `brdst` и `brtype` печатают одно и то же, и «ethertype на проводе» пришлось читать из `brhex` (это та же ошибка F40 №2).
+3. **Свидетель строился из чужого смещения:** `f571_rd(C, base, off, len, src)` берёт иммедиат из `src + off` — верно для «что несёт кадр», неверно для «что должна была положить запись»; четыре плеча `inv` показывали `cntw=0` на верных данных, пока не появился `f572_rdv()`.
+4. **MAC моста прочитан до того, как он изменился:** `br0` берёт адрес порта при добавлении порта (`br_stp_recalculate_bridge_id`), а я читал его до `br_add_if` — `br_dst_br` в дыме записал старый адрес и измерил флуд вместо локальной доставки.
+5. **`NFTA_HOOK_DEV` на bridge-цепи — `-EOPNOTSUPP`:** в этом ядре устройство разрешено только netdev-хукам (`nft_chain_parse_hook()`), моя память о более старой форме была неверна. Цепь `brp` пришлось сделать без устройства.
+6. **Модель в верификаторе: `cntp` — счётчик своей двери, а не «локальная копия жива»;** я связал с ним и `cnts`, из-за чего 4 плеча на `nd1`/`brp` были красными на верных данных.
+7. **Модель: последствия записи на слое 3 я сначала считал по именам смещений** (`off == 12 → ethertype`), а на двери без стража четырёхбайтовая запись заезжает в заголовок IPv6 — три плеча были неверны, пока модель не стала считать судьбу по самим байтам кадра.
+8. Верификатор: срез `bytearray[o:o+len] = imm` при `o+len > 14` **удлинял** массив вместо усечения; литерал `@ll,14,4` я записал как `6000001a` (это байты 16..20, а не 14..18).
+9. Дым `c` шёл одновременно с `d` — я запустил второй, не проверив, что первый закончился (ошибка F570). Оба писали в разные логи, но делили CPU; `c` я убил по PID.
+
+## 7. Что не измерено, прямо
+
+Несколько устройств в одной bridge-цепи; VLAN-меченый кадр на этих дверях (F35/F38 мерили `@ll`-сетку на `bridge prerouting`, но не `@nh`/`@th` и не две копии); аргументы `NFULA_IFINDEX_PHYSINDEV` — `CONFIG_BRIDGE_NETFILTER` в образе нет, поэтому физический порт в лог не попадает вовсе; `inet`-семейство и L3-хуки `local_out`/`postrouting` на мосту; IPv4-кадр в этом приборе (только контроль `comp`); `skb_shared`-запись без `skb_ensure_writable()` (GSO, `CHECKSUM_PARTIAL`); драйверы, у которых копия кадра делается не в `br_flood()`. Один отправитель, одна пара veth на порт, один мост, один кадр за плечо.
+
+**Не уязвимость**: правило ставит root в начальном user ns. Следствия — чтение `@ll` за границу L2 в сетевой заголовок; запись `@ll` в адрес назначения, которая на `netdev ingress` и `bridge prerouting` меняет решение моста (вплоть до «отправить кадр самому мосту»), а на layer-3 двери не может изменить ничего; и страж `@nh` на `bridge`, читающий закэшированный ethertype, который то же правило только что переписало.
+
+## 8. Чем проверено
+
+| | |
+|---|---|
+| `tools/verify572.py` | **5629 проверок, 0 расхождений** — провенанс (sha ядра из шапки против файла, initrd из шапки, differ **извлечённый из initramfs** и сверенный с собранным), 15 якорей исходника, `nft_ll_write_ok`/`nft_payload_eval`/`nft_nh_write_ok_ip6`/`ip6_rcv_core`/`br_handle_frame_finish`/`br_flood` портированы на Python, все 98 плеч × 2 загрузки смоделированы по двери, побайтовая сверка `HWHEADER` каждого сообщения NFLOG, детерминизм по 21 полю, 0 splat |
+| `tools/verify572_selftest.sh` | мутации по одному полю; каждая краснит свою проверку, крэш не считается пойманной мутацией |
+| `tools/audit_f50_doc.py` | перегенерирует этот файл из логов и отказывается пропустить расхождение |
+| коллекция | перегенерирована |
+| регрессия | verify571 5974, verify570 753, verify569 3810, verify568 10088, verify567/566/563 OK |
+
+Файлы: `findings/F50-bridge-l3/{SUMMARY.md, summary.json, VERIFY_REPORT.md, LETTER_SECTION_F50.txt}`; `vm/{differ572_add.c, build_f50_differ.sh, make_initramfs572.sh, build/differ572}`; `tools/{f50_run.sh, verify572.py, verify572_selftest.sh, f572_mutate.py, f572_summary.py, audit_f50_doc.py}`; `research/predictions_572.md`; логи `logs/f50_{rep1,rep2}.log`.
+
+
+
+===== summary.json =====
+{
+  "finding": "F50",
+  "question": "Does @ll exist at a door where mac_len != 0 and pf = NFPROTO_IPV6 at once (ppp0 inside a bridge), and what decides the fate of the frame after the hook?",
+  "answer_short": "The door does not exist: br_add_if() refuses ARPHRD_PPP with -EINVAL, so a device without an ethernet header can never carry @ll. The door that does exist is the layer-3 door of a bridge, where @ll reads 36/36 cells (past the link header: @ll,14,4 = 60000000) and writes 23/36 (off + len <= mac_len); an accepted destination-MAC store lands and is read back one door later but cannot reach the copy already sent to the port, while the same store at bridge prerouting or netdev ingress removes the local copy and turns the port's copy into a foreign unicast.",
+  "turn": 572,
+  "kernel": "7.3.4-T563",
+  "kernel_sha256": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+  "initrd_sha256": "2d65d2372b1cd58344d88b3be7a6fb6cd31180e0dd687707f38e3600fd5bc539",
+  "arms_per_boot": 98,
+  "arms_per_boot_rep2": 98,
+  "refusals": {
+    "ref_ppp": {
+      "port": "ppp0",
+      "rc": -22,
+      "type": 512,
+      "master_after": 0
+    },
+    "ref_lo": {
+      "port": "lo",
+      "rc": -22,
+      "type": 772,
+      "master_after": 0
+    },
+    "ok_y1": {
+      "port": "y1",
+      "rc": 0,
+      "type": 1,
+      "master_after": 1
+    },
+    "ok_x1": {
+      "port": "x1",
+      "rc": 0,
+      "type": 1,
+      "master_after": 1
+    }
+  },
+  "env": {
+    "br0_ifindex": 9,
+    "x1_ifindex": 5,
+    "y0_ifindex": 8,
+    "frame_len": 80,
+    "ports_forwarding": true,
+    "stp": 0,
+    "ipv6_on_ports": "1"
+  },
+  "ll_read_grid": {
+    "arms": 36,
+    "alive": 36
+  },
+  "ll_write_grid": {
+    "arms": 36,
+    "alive": 23,
+    "rule": "off + len <= mac_len (14)"
+  },
+  "ingress_boundary": {
+    "w12_4_nd": {
+      "cell": [
+        12,
+        4
+      ],
+      "taken": true,
+      "delivered": false,
+      "Ip6InHdrErrors": 1,
+      "Ip6InUnknownProtos": 0
+    },
+    "w14_1_nd": {
+      "cell": [
+        14,
+        1
+      ],
+      "taken": true,
+      "delivered": false,
+      "Ip6InHdrErrors": 1,
+      "Ip6InUnknownProtos": 0
+    },
+    "w20_4_nd": {
+      "cell": [
+        20,
+        4
+      ],
+      "taken": true,
+      "delivered": false,
+      "Ip6InHdrErrors": 0,
+      "Ip6InUnknownProtos": 1
+    }
+  },
+  "same_write_three_doors": {
+    "ctl": {
+      "door": "in6",
+      "guard_takes": true,
+      "witness_at_input": "1",
+      "delivered": 1,
+      "Ip6InReceives": 2,
+      "Ip6InDiscards": 1,
+      "rx_otherhost_dropped": 0,
+      "br0_tap": 1,
+      "far_tap": 1,
+      "far_dst": "ffffffffffff"
+    },
+    "pre_dst": {
+      "door": "in6",
+      "guard_takes": true,
+      "witness_at_input": "1",
+      "delivered": 1,
+      "Ip6InReceives": 2,
+      "Ip6InDiscards": 1,
+      "rx_otherhost_dropped": 0,
+      "br0_tap": 1,
+      "far_tap": 1,
+      "far_dst": "ffffffffffff"
+    },
+    "nd_dst": {
+      "door": "nd1",
+      "guard_takes": true,
+      "witness_at_input": "0",
+      "delivered": 0,
+      "Ip6InReceives": 0,
+      "Ip6InDiscards": 0,
+      "rx_otherhost_dropped": 1,
+      "br0_tap": 0,
+      "far_tap": 1,
+      "far_dst": "909192939495"
+    },
+    "br_dst": {
+      "door": "brp",
+      "guard_takes": true,
+      "witness_at_input": "0",
+      "delivered": 0,
+      "Ip6InReceives": 0,
+      "Ip6InDiscards": 0,
+      "rx_otherhost_dropped": 1,
+      "br0_tap": 0,
+      "far_tap": 1,
+      "far_dst": "909192939495"
+    },
+    "br_dst_br": {
+      "door": "brp",
+      "guard_takes": true,
+      "witness_at_input": "1",
+      "delivered": 1,
+      "Ip6InReceives": 1,
+      "Ip6InDiscards": 0,
+      "rx_otherhost_dropped": 0,
+      "br0_tap": 1,
+      "far_tap": 0,
+      "far_dst": "-"
+    },
+    "br_dst_bc": {
+      "door": "brp",
+      "guard_takes": true,
+      "witness_at_input": "1",
+      "delivered": 1,
+      "Ip6InReceives": 2,
+      "Ip6InDiscards": 1,
+      "rx_otherhost_dropped": 0,
+      "br0_tap": 1,
+      "far_tap": 1,
+      "far_dst": "ffffffffffff"
+    }
+  },
+  "ethertype_write": {
+    "pre_et": {
+      "door": "in6",
+      "guard_takes": true,
+      "delivered": 1,
+      "Ip6InReceives": 2,
+      "wire_ethertype": "86dd"
+    },
+    "pre_et6": {
+      "door": "in6",
+      "guard_takes": true,
+      "delivered": 1,
+      "Ip6InReceives": 2,
+      "wire_ethertype": "86dd"
+    },
+    "br_et": {
+      "door": "brp",
+      "guard_takes": true,
+      "delivered": 1,
+      "Ip6InReceives": 1,
+      "wire_ethertype": "0806"
+    }
+  },
+  "nflog_order": {
+    "dg1": {
+      "m0": "p:ffffffffffff90919293949586dd:66",
+      "m1": "s:ffffffffffff90919293949586dd:66"
+    },
+    "dg2": {
+      "m0": "p:ffffffffffff8e6b8aacf58e86dd:66",
+      "m1": "s:ffffffffffff90919293949586dd:66"
+    }
+  },
+  "l2_attributes": {
+    "pf6": {
+      "door": "in6",
+      "L2HDR": "0",
+      "HWTYPE": "1",
+      "HWLEN": "14",
+      "HWHEADER_len": "14",
+      "INDEV": "9"
+    },
+    "pfbr": {
+      "door": "brp",
+      "L2HDR": "14",
+      "HWTYPE": "1",
+      "HWLEN": "14",
+      "HWHEADER_len": "14",
+      "INDEV": "5"
+    },
+    "r0_6_nd": {
+      "door": "nd1",
+      "L2HDR": "14",
+      "HWTYPE": "1",
+      "HWLEN": "14",
+      "HWHEADER_len": "14",
+      "INDEV": "5"
+    }
+  },
+  "guard_reads_cache": {
+    "comp_l2l3": {
+      "cnts": "0",
+      "wire": "0800"
+    },
+    "comp_h7": {
+      "cnts": "1",
+      "wire": "0800"
+    }
+  },
+  "nfproto_measured": {
+    "pf6": "1",
+    "pfbr": "1"
+  },
+  "predictions": {
+    "total": 12,
+    "confirmed": 11,
+    "refuted": [
+      "P6"
+    ]
+  },
+  "verified_by": {
+    "verify572.py": "5629 checks, 0 discrepancies",
+    "verify572_selftest.sh": "18/18",
+    "audit_f50_doc.py": "summary regenerated, 0 diff"
+  }
+}

@@ -1,0 +1,869 @@
+===== LETTER_SECTION_F62.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload: a static transport-store check is enforced at runtime,
+ and 14 nft spellings die silently (`tcp flags set` regressed in v7.3)
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+References: <the same Message-Id>
+
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+Theme: on the GSO path the price of a payload write is paid by whoever
+segments, and the two exit devices segment in different places.  One carries
+the datagram whole to the wire and lets the RECEIVER cut it into
+CHECKSUM_PARTIAL pieces that nobody ever verifies; the other cuts it on the way
+out and then computes every segment checksum from the bytes as they stand.  The
+same four-byte store is therefore free on one door and paid on the other, and a
+store into either of the two header fields the segmenter reads breaks every
+segment at once -- one of them while leaving the wire looking untouched.
+Measured on 7.3.4 over two boots, 25 arms, one rule per arm in the ip6 forward
+chain of a router netns, between a sender netns and a receiver netns.
+
+Frame: ONE 1200-byte datagram sent with UDP_SEGMENT = 512 (gso_size 512,
+gso_segs 3), so it leaves the sender as a single GSO skb and the segments are
+512/512/176.  Exits: y1 keeps NETIF_F_GSO_UDP_L4 (ac1 0000612e), y2 lost it
+together with NETIF_F_HW_CSUM through one ETHTOOL_SFEATURES write
+(ac1 0000612c) -- the kernel refuses UDP-GSO to a device without checksum
+offload, so the two bits travel together.
+
+1. Who segments.  With no rule at all, y1 puts ONE 1262-byte frame on the wire
+   whose checksum field is ff72 = fold16(pseudo header with length 1208), i.e.
+   a seed for the whole datagram, and the receiver segments it (three datagrams
+   512/512/176).  y2 puts THREE frames on the wire, 574/574/238, with uh->len
+   520/520/184 and checksums 82af/82af/1f91 that are valid for each frame's own
+   bytes; the receiver gets the same three datagrams, byte for byte.
+
+2. The payload store.  `@th,8,4 = a0a1a2a3` (payload 0..3) is free on y1: the
+   big frame carries ff72 unchanged and the datagram is delivered; the store
+   costs on y2, where the segmenter recomputes frame 0's checksum from the
+   modified payload (426f instead of 82af) and leaves frames 1 and 2
+   byte-identical.  The same store at payload 512 and at 1196 lands in the
+   middle and the last segment respectively (fields 224f and f768), each with
+   the same rule.  `csum flags` changes nothing on either door: the four arms
+   with it are byte-identical to the two without.
+
+3. The store the segmenter READS.  `__udp_gso_segment()` derives each
+   segment's seed as csum16_add(csum16_sub(uh->check, uh->len), htons(newlen))
+   (net/ipv4/udp_offload.c:570,600) -- it reads exactly the two header fields a
+   rule can rewrite.
+   * writing the length field to 0x0020: on y2 the segmenter overwrites the
+     length per segment, so the store VANISHES from the wire, and every
+     checksum is short by exactly 1208-0x20 = 0x0498 (measured delta fb67 in
+     one's complement on all three frames) -> all three datagrams are dropped,
+     Udp6InErrors +3.  On y1 the receiver trims the skb to 32 bytes
+     (pskb_trim_rcsum, net/ipv6/udp.c:1111) and then refuses to segment it
+     (gso_skb->len <= 8 + mss, udp_offload.c:495) -> +3 errors, while a length
+     ABOVE the datagram (0xffff) is a short_packet -> +1.  Same door, same
+     two-byte store, two different numbers, because a drop below the segmenter
+     costs gso_segs and a drop above costs one.
+   * writing the checksum field itself to 0xdead: y1 ships dead to the socket
+     and still delivers three datagrams, because CHECKSUM_PARTIAL counts as
+     "unnecessary" (skbuff.h:4781); y2 derives all three seeds from dead and
+     all three die (deltas 20c6 each, +3).
+
+4. What the rule sees.  Every rule counted one packet and logged ONE message of
+   1248 bytes -- not one per segment -- and that message carries the header
+   after the store (len_a: aa3c13880020ff72) with hop limit 0x3f, because
+   ip6_forward() decrements before NF_HOOK.  The rule and the instrument see
+   the same packet; they diverge only at the exit device.
+
+5. The same 1262 bytes without GSO (AF_PACKET, CHECKSUM_NONE) are one datagram
+   of 1200 on both doors, nobody segments, the stored copy dies on the stale
+   checksum (-1) and only the rule's own `csum flags` repairs it (55d2 = the
+   true sum of the modified datagram).  So the flag that is dead code on the
+   socket path is the only payer on the packet path.
+
+6. A UDP_GRO socket names the segmentation point: through y1 it gets ONE
+   1200-byte datagram with gso_size 512 (the skb is still GSO at the socket),
+   through y2 three datagrams (there is nothing left to GRO).  With the length
+   store it gets 24 bytes -- the trim, and no segmentation afterwards.
+
+Not a vulnerability: every rule here was installed by root in the initial user
+namespace, which F57 measured to be the only context in which a payload store
+installs at all.  What this is: the price of a write is not a property of the
+write.  On a GSO datagram it is a property of WHERE the datagram gets cut, and
+the rule cannot see, let alone express, whether the cut happens before or after
+its own door.
+
+Not measured: any real NIC (both exits are veth pairs with a bit cleared by
+hand), mss that does not divide the payload, more than three segments, the
+SKB_GSO_FRAGLIST path (needs GRO on receive), CHECKSUM_UNNECESSARY/COMPLETE,
+TCP and ICMP with GSO, IPv4 GSO, and the internal arithmetic of
+gso_make_checksum() -- only its result, which matched 150 frames on both boots.
+
+
+===== SUMMARY.md =====
+# F62 — на GSO-пути счёт оплачивает тот, кто сегментирует, а две двери сегментируют в разных местах
+
+Ход 584. Ядер не собирал: всё на том же `7.3.4-T563` (`1efbc957…2033`).
+Прибор `differ584`, режим `gso` — **25 плеч в каждой из двух загрузок**, одно
+правило на плечо в `ip6`-цепи `forward` (prio 0) с матчем `meta l4proto 17`.
+После нормализации того, что ядро выбирает само (шесть MAC и метка потока
+IPv6), загрузки совпадают по всем производным полям каждого плеча.
+
+Долг был назван в F61 §11 прямо: «снятие `NETIF_F_HW_CSUM` снимает и
+`NETIF_F_GSO_UDP_L4` (`ac1` `…612e` → `…612c`), поэтому у `y2` GSO-датаграмма
+пойдёт не „в оплату", а **в сегментацию**». Здесь эта датаграмма есть, и
+вопрос у неё один: **кто платит за запись, сделанную на двери FORWARD, если
+датаграмму потом разрежет кто-то другой.**
+
+## 1. Геометрия: одна датаграмма, три сегмента, две двери
+
+Топология — F61, без изменений: три netns (отправитель, маршрутизатор = мы,
+приёмник). Отправитель шлёт **одну** датаграмму 1200 байт из сокета с
+`UDP_SEGMENT = 512`: `udp_send_skb()` видит `datalen > cork->gso_size`, ставит
+`gso_size`/`gso_type = SKB_GSO_UDP_L4`/`gso_segs = 3` и уходит на
+`csum_partial` с комментарием «Don't checksum the payload, skb will get
+segmented» (`net/ipv6/udp.c:1418`). Кадр 1262 байта: 14 eth + 40 IPv6 + 8 UDP
++ 1200, `payload[i] = 0x80 + (i & 0x7f)`; сегменты 512/512/176.
+
+Две двери отличаются **двумя** битами, и они едут вместе — ядро не оставляет
+UDP-GSO устройству без контрольной суммы (`netdev_fix_features`):
+
+| устройство | `ac0` | `HW_CSUM` | `ac1` | `GSO_UDP_L4` (бит 33) |
+|---|---|---|---|---|
+| `y1` | `4fdd09e9` | **есть** | `0000612e` | **есть** |
+| `y2` | `4fc009e1` | **снят** | `0000612c` | **снят вместе с ним** |
+
+Второй бит — не мелочь: он и есть тот, кто решает, **где** датаграмма будет
+разрезана. `validate_xmit_skb()` спрашивает `netif_needs_gso()` только у
+выходного устройства (`net/core/dev.c:4107`), а приёмник спрашивает свой
+сокет: `udp_unexpected_gso()` (`include/linux/udp.h:214`) говорит «да» для
+`SKB_GSO_UDP_L4`, если у сокета нет `ACCEPT_L4`, и тогда
+`udpv6_queue_rcv_skb()` режет датаграмму сам (`net/ipv6/udp.c:899`).
+
+## 2. Кто сегментирует: видно без всякого правила
+
+| дверь | кадров на проводе | длины | `uh->len` | поле суммы на проводе | что видит приложение |
+|---|---|---|---|---|---|
+| `y1` (`c_a`) | **1** | 1262 | 1208 | **`ff72`** — засев псевдозаголовка | 3 датаграммы 512/512/176 |
+| `y2` (`c_b`) | **3** | 574/574/238 | 520/520/184 | **`82af`/`82af`/`1f91`** — суммы | те же 3 датаграммы, байт в байт |
+
+Три вещи в этой таблице стоят того, чтобы их назвать.
+
+Первое: `ff72` — это `fold16(P(1208))`, засев для **всей** датаграммы, а не
+сумма (`udp6_hwcsum_outgoing()` пишет `~csum_ipv6_magic(saddr, daddr, len, …,
+0)`, что в свёрнутом виде есть просто сумма псевдозаголовка). Он приехал на
+провод нетронутым, потому что на `y1` сегментировать некому.
+
+Второе: `82af` у первых двух кадров `y2` **совпадает** — груз периодичен с
+периодом 128, два сегмента по 512 байт равны, и сумма у них одна.
+
+Третье: приложение в обоих случаях получает одно и то же. Три датаграммы
+512/512/176 на обеих дверях, побайтово равные (верификатор сверяет их поле в
+поле, а не длиной).
+
+## 3. Платят оба, но по-разному: запись в груз в трёх позициях
+
+`@th,off,4` — четыре байта в груз. Позиция решает, в какой сегмент они
+попадут и, значит, чей счёт изменится:
+
+| плечо | куда легла запись | что изменилось на проводе | поле | судьба |
+|---|---|---|---|---|
+| `w_a` | груз 0..3 | кадр 1262, байты **62..65** — и только они | `ff72` (**не изменилось**) | 3 доставлены, первая начинается `a0a1a2a3` |
+| `w_b` | груз 0..3 | кадр 0: байты **60..65** (поле + груз) | `426f` (= `82af` → пересчитано) | 3 доставлены |
+| `wm_a`/`wm_b` | груз 512..515 | кадр 1, байты **60..65** | `224f` | 3 доставлены |
+| `wl_a`/`wl_b` | груз 1196..1199 | кадр 2, байты **60..61 и 234..237** | `f768` | 3 доставлены |
+
+`w_b` — это и есть платеж: `426f` не «сумма минус что-то», а ровно
+`~fold16(H_0(520, check_0) + G_0')`, где `G_0'` — груз уже с записью.
+Сегментатор `y2` и есть плательщик: при `!csum` (у `y2` нет ни `HW_CSUM`, ни
+`IPV6_CSUM`) `skb_segment()` копирует каждый сегмент с `ip_summed =
+CHECKSUM_NONE` и суммой груза в `SKB_GSO_CB(nskb)->csum`
+(`net/core/skbuff.c:5107`), а `__udp_gso_segment()` дописывает восьмибайтный
+заголовок и складывает (`gso_make_checksum()`, `include/net/gso.h`).
+
+На `y1` того же не делает никто: кадр остаётся `CHECKSUM_PARTIAL`, поле
+`ff72` уезжает на провод засевом, а приёмник режет его на PARTIAL-сегменты и
+**не проверяет**: `skb_csum_unnecessary()` (`include/linux/skbuff.h:4781`)
+считает PARTIAL «не требующим проверки». То есть запись `w_a` доехала до
+сокета, хотя её никто не оплатил; `w_b` доехала, потому что оплатил
+сегментатор; и это **разные двери, а не разные правила**.
+
+## 4. Запись в поле, которое сегментатор читает: длина
+
+`__udp_gso_segment()` считает засев каждого сегмента как **дельту**
+
+```
+check = csum16_add(csum16_sub(uh->check, uh->len), htons(newlen));
+      // net/ipv4/udp_offload.c:570 и :600
+```
+
+то есть читает ровно те два поля заголовка, которые правило может
+переписать. Это первый за проект случай, когда запись правила попадает **в
+арифметику чужой функции**, а не только в байты.
+
+| плечо | `uh->len` на проводе | что делает приёмник | счёт |
+|---|---|---|---|
+| `lens_a` (`04b8` — то, что уже стоит) | 1208 | ничего | 3 датаграммы, кадры байт в байт как `c_a` |
+| `len_a` (`0020`) | **32** | `pskb_trim_rcsum(skb, 32)` → `udp_rcv_segment` → `gso_skb->len (32) <= 8 + 512` → `-EINVAL` (`udp_offload.c:495`), `drop_count = gso_segs` (`include/net/udp.h:618`) | 0 датаграмм, `Udp6InErrors` **+3** |
+| `lenbig_a` (`ffff`) | **65535** | `ulen > skb->len` → `short_packet` (`net/ipv6/udp.c:1099`) | 0 датаграмм, **+1** |
+| `len_b` (`0020`) | 520/520/184 — **переписано** сегментатором | суммы коротки ровно на `1208 − 0x20` | 0 датаграмм, **+3** |
+
+Три разных исхода из одного и того же правила. `len_a` и `lenbig_a` — одна
+дверь, одна запись в два байта, разные числа (`+3` против `+1`), потому что
+дроп ниже сегментатора стоит `gso_segs`, а дроп выше — один.
+
+`len_b` — самый чистый результат хода: **запись исчезла с провода** (длины
+переписаны и равны контрольным), а датаграммы всё равно умерли, потому что
+дельта `c16sub(uh_chk, uh_len)` посчитана по записанному числу. Мера
+разницы: `c16sub(field_len_b, field_c_b) = fb67 = ~(1208 − 0x20)` — на всех
+трёх кадрах.
+
+## 5. Запись в поле, которому сегментатор верит: сумма
+
+| плечо | поле на проводе | кто что сделал | счёт |
+|---|---|---|---|
+| `chk_a` (`dead`) | **`dead`** | никто: PARTIAL на проводе и на приёме | **3 доставлены** |
+| `chk_b` (`dead`) | `a375`/`a375`/`4057` | сегментатор вывел все три засева из `dead` | 0 датаграмм, **+3** |
+
+Разница `chk_b` и `c_b` — `20c6 = ~c16sub(0xdead, ff73)`, то есть ровно
+сдвиг засева. Мусор в поле суммы доезжает до сокета на `y1` и убивает все три
+сегмента на `y2` — это F61 §5, повторённое на GSO, но теперь с ценой в три
+датаграммы вместо одной.
+
+## 6. `csum flags` — мёртвый код на обеих дверях
+
+`wfl_a` = `w_a` и `wfl_b` = `w_b` **байт в байт** (сверка по всему кадру, не
+по полю). Причина та же, что в F60/F61: при базе `TRANSPORT_HEADER` и
+`ip_summed == CHECKSUM_PARTIAL` блок поправки пропускается целиком. На GSO
+это значит, что «пусть правило само посчитает» невозможно ни на одной из
+двух дверей — но по разным причинам: на `y1` блок пропущен, на `y2` его
+некому вызывать (там `PARTIAL` ещё и превращается в `NONE` уже внутри
+сегментатора).
+
+## 7. Тот же 1262-байтный кадр без GSO: одна датаграмма и никакой сегментации
+
+Провенанс `p` — те же байты, вброшенные `AF_PACKET` (CHECKSUM_NONE, `gso_size
+= 0`):
+
+| плечо | кадров | поле | судьба |
+|---|---|---|---|
+| `c_p_a` | 1 | `9612` (истинная сумма) | **1 датаграмма 1200 байт** |
+| `c_p_b` | 1 | `9611` (другая дверь) | 1 датаграмма 1200 байт |
+| `w_p_a` (`@th,8,4`) | 1 | `9612` (стухшая) | **уронена, +1** |
+| `wb_p_a` (то же + `csum flags`) | 1 | **`55d2`** — правило пересчитало | доставлена с `a0a1a2a3` |
+
+То есть флаг, который на сокетном провенансе — мёртвый код, здесь
+единственный плательщик. И «сегментирует тот, кто может» подтверждается с
+другой стороны: у кадра без `gso_size` сегментировать нечего ни на одной
+двери.
+
+## 8. Сокет с `UDP_GRO` называет точку сегментации
+
+`UDP_GRO` ставит `ACCEPT_L4`, `udp_unexpected_gso()` говорит «нет», и
+датаграмма приходит в сокет целой — если она целой и была:
+
+| плечо | кадров на проводе | что видит приложение |
+|---|---|---|
+| `g_a` | 1 | **1** датаграмма **1200** байт, `UDP_GRO` cmsg = **512** |
+| `g_b` | 3 | **3** датаграммы 512/512/176, cmsg нет |
+| `gw_a` | 1 | 1 датаграмма 1200, начинается `a0a1a2a3` |
+| `glen_a` (`uh->len = 0x20`) | 1 | **1 датаграмма 24 байта**, cmsg = 512 |
+
+`glen_a` — самое наглядное следствие §4: та же запись в два байта,
+тот же кадр на проводе, а приложение получает 24 байта вместо 1200, потому
+что `udpv6_rcv()` обрезал skb по записанной длине, а резать на сегменты уже
+нечего (сокет попросил не резать).
+
+Кадр на проводе у `g_a` отличается от `c_a` **одним байтом** — младшим байтом
+порта назначения (`1388` → `1389`); поле суммы то же самое, `ff72`, потому
+что засев от порта не зависит.
+
+## 9. Что показывает само правило
+
+Во всех 25 плечах: счётчик 1, сообщение в лог 1, и его длина — **1248**
+байт во всех 25 плечах, то есть **одно сообщение на GSO-датаграмму, а не на
+сегмент**; hop limit в нём `0x3f` (`ip6_forward()` уменьшает до `NF_HOOK`), а
+`uh->len` и поле суммы — те, что стоят **после** записи (`len_a`:
+`aa3c13880020ff72`). То есть до сегментатора правило и прибор видят одно и то
+же, а расходятся они ровно на выходной двери.
+
+## 10. Все 25 плеч
+
+| # | плечо | кадры | `uh->len` | поле | доставлено | ошибок |
+|---|---|---|---|---|---|---|
+| 0 | `c_a` | 1262 | 1208 | `ff72` | 3 | 0 |
+| 1 | `c_b` | 574/574/238 | 520/520/184 | `82af`/`82af`/`1f91` | 3 | 0 |
+| 2 | `w_a` | 1262 | 1208 | `ff72` | 3 | 0 |
+| 3 | `w_b` | 574/574/238 | 520/520/184 | `426f`/`82af`/`1f91` | 3 | 0 |
+| 4 | `wm_a` | 1262 | 1208 | `ff72` | 3 | 0 |
+| 5 | `wm_b` | 574/574/238 | 520/520/184 | `82af`/`224f`/`1f91` | 3 | 0 |
+| 6 | `wl_a` | 1262 | 1208 | `ff72` | 3 | 0 |
+| 7 | `wl_b` | 574/574/238 | 520/520/184 | `82af`/`82af`/`f768` | 3 | 0 |
+| 8 | `lens_a` | 1262 | 1208 | `ff72` | 3 | 0 |
+| 9 | `len_a` | 1262 | **32** | `ff72` | 0 | 3 |
+| 10 | `len_b` | 574/574/238 | 520/520/184 | `7e17`/`7e17`/`1af9` | 0 | 3 |
+| 11 | `lenbig_a` | 1262 | **65535** | `ff72` | 0 | 1 |
+| 12 | `chk_a` | 1262 | 1208 | **`dead`** | 3 | 0 |
+| 13 | `chk_b` | 574/574/238 | 520/520/184 | `a375`/`a375`/`4057` | 0 | 3 |
+| 14 | `wfl_a` | 1262 | 1208 | `ff72` | 3 | 0 |
+| 15 | `wfl_b` | 574/574/238 | 520/520/184 | `426f`/`82af`/`1f91` | 3 | 0 |
+| 16 | `c_p_a` | 1262 | 1208 | `9612` | 1 | 0 |
+| 17 | `c_p_b` | 1262 | 1208 | `9611` | 1 | 0 |
+| 18 | `w_p_a` | 1262 | 1208 | `9612` | 0 | 1 |
+| 19 | `wb_p_a` | 1262 | 1208 | `55d2` | 1 | 0 |
+| 20 | `g_a` | 1262 | 1208 | `ff72` | 1 | 0 |
+| 21 | `g_b` | 574/574/238 | 520/520/184 | `82ae`/`82ae`/`1f90` | 3 | 0 |
+| 22 | `gw_a` | 1262 | 1208 | `ff72` | 1 | 0 |
+| 23 | `gw_b` | 574/574/238 | 520/520/184 | `426e`/`82ae`/`1f90` | 3 | 0 |
+| 24 | `glen_a` | 1262 | **32** | `ff72` | 1 | 0 |
+
+Доставлено 48 датаграмм, ошибок 11. Правило сработало и записало в лог 25 раз
+из 25.
+
+## Предсказания: 17 из 17
+
+Сошлись все семнадцать. Впервые за много ходов ни одна клауза не
+опровергнута — и это стоит назвать подозрительным, а не приятным: модель
+сегментатора (`delta` по двум полям заголовка, `gso_make_checksum` по
+фактическим байтам, `skb_csum_unnecessary` для PARTIAL) была прочитана
+**до** запуска, и замер её не двинул.
+
+Три места, где я сам ждал ошибки, и что вышло:
+
+* «точное место записи в большом кадре» — ровно 62..65 и ничего больше;
+* «`UDP_GRO` cmsg: 512 или 1200» — **512**, и он остаётся 512 даже у
+  обрезанной до 24 байт датаграммы;
+* «пройдёт ли `skb_checksum_start == skb_transport_header` после перехода
+  между netns» — прошёл: если бы нет, `udp_rcv_segment()` вернул бы `-EINVAL`,
+  и **все** плечи двери `a` были бы уронены. Они не уронены, значит
+  `eth_type_trans()` сдвигает `data` ровно на столько, на сколько его сдвинул
+  отправитель, и смещения совпадают.
+
+## Ошибки хода, все мои
+
+1. **Сокет отправителя проиграл гонку с DAD.** Первый полный прогон дал
+   `s6=-99|errno=99` (EADDRNOTAVAIL) в обеих загрузках и `sendto(-1)` во всех
+   шестнадцати сокетных плечах: адрес был добавлен, но ещё tentative. Дым
+   эту гонку **выиграл** — то есть прибор был неисправен, а лог выглядел как
+   ядро, которое всё дропает. Вылечено `IFA_F_NODAD` и повтором `bind()` до
+   5 секунд; верификатор теперь проверяет, что все 16 `sendto` вернули 1200 и
+   что `UDP_SEGMENT` принят. Тот же класс, что F31 и F54: прибор измеряет
+   собственный отказ.
+2. **Парсер NFLOG хранил 96 байт и печатал обрезанную длину как настоящую.**
+   На GSO-датаграмме это дало бы `lglen=96` — лог, который врёт о своём
+   размере (класс F40 №2, F50 №5). Починено в сборке (`p[1680]`,
+   `M->plen = pll`), и верификатор сверяет 1248 на всех 25 плечах.
+3. Модель верификатора была неверна шесть раз: (а) сравнивал 8 печатных
+   байт груза с 16 байтами модели; (б) сравнивал `lgfirst[:8]` (4 байта) с
+   8 байтами модели; (в) искал тапы приёмника под тегом `RTAP`, а прибор
+   печатает их тем же `TAP` с `dev=y3/y4`; (г) забыл, что на CHECKSUM_NONE
+   skb правило **само** пересчитывает сумму (`wb_p_a`: `55d2`, а не `9612`);
+   (д) сегментировал кадр без GSO на двери `b` (`c_p_b`: 1 кадр, а не 3);
+   (е) ждал `cmsg = -1` у 24-байтной датаграммы.
+4. Два **утверждения документа**, которые оказались моими ошибками, а не
+   ядра: «`wl_b` пишет в байты 62..65 кадра» (на самом деле 234..237 —
+   последний сегмент) и «кадр `g_a` отличается от `c_a` портом **и** суммой»
+   (сумма та же: засев от порта не зависит, отличается один байт).
+
+## Чем проверено
+
+| | |
+|---|---|
+| `tools/verify584.py` | **3176 проверок, 0 расхождений** — провенанс (sha ядра, initrd из шапки **и из файла, который шапка называет**, differ **извлечённый из initramfs**), 20 якорей исходника (включая порядок битов `NETIF_F_GSO_UDP_L4_BIT = 33`, дельту сегментатора, `drop_count = gso_segs`, `pskb_trim_rcsum`, `skb_csum_unnecessary`), таблица плеч **из исходника прибора**, кадры пересобраны в Python, и **каждое плечо обеих загрузок**: счётчик, сообщение на forward-двери (длина, байты заголовка, UDP-заголовок после записи, хвост), все кадры обоих тапов маршрутизатора и обоих тапов приёмника **побайтово против модели**, статус тапа, число и содержимое датаграмм у обоих сокетов, `Udp6InDatagrams`/`Udp6InErrors`/`Ip6InHdrErrors`, детерминизм по всем полям (кроме MAC и метки потока) |
+| `tools/verify584_selftest.sh` | **36/36** — базовая линия зелёная, **33 односоставных мутации** краснят верификатор без traceback, `noop` зелёный, отсутствующий лог — красный, а не крэш |
+| `tools/f584_summary.py` | `summary.json` собран **из логов**, не из памяти |
+| `tools/audit_f62_doc.py` | таблицы и числа этого документа против лога rep1 |
+| коллекция | см. `LETTER_STATUS.md` и `RESEARCH_LOG.md` |
+| регрессия | verify583 1932, 582 6213, 581 3695, 580 5703, 579 902, 578 9411, 577 2756, 576 768, 575 3696, 574 2666, 573 3186, 572 5629, 571 5974, 570 753, 569 3810 — все 0 |
+
+## 11. Что не измерено, прямо
+
+* **Настоящего сетевого устройства нет** — обе двери это veth с битом,
+  снятым рукой. Настоящий NIC, который сегментировал бы или считал сумму
+  железом, не измерен ни разу за проект.
+* Только `UDP_SEGMENT` с `mss = 512` и ровно тремя сегментами; `mss`, не
+  делящий груз, `mss > MTU`, `UDP_MAX_SEGMENTS` и `EMSGSIZE` не тронуты.
+* Ветка `SKB_GSO_FRAGLIST` (`udp_rcv_segment()` → `__udp_gso_segment_list`)
+  не достигнута: она требует GRO на приёме, а не «GSO на проводе».
+* `CHECKSUM_UNNECESSARY`/`CHECKSUM_COMPLETE` на приёме; TCP/ICMP с GSO;
+  IPv4-GSO (`udp4_*`); фрагментация; мост как выход; `inet`-семья на
+  forward-двери.
+* Внутренняя арифметика `gso_make_checksum()` (CB-сумма от сетевого
+  заголовка) не измерена по частям: я моделировал **результат**
+  `~fold16(H_i + check_i + G_i)` и он сошёлся на 150 кадрах обеих загрузок.
+* Семантика auxdata тапа — только как грубый признак (`9` = `CSUMNOTREADY`
+  против `1`); по F58 §8 на неё не опирается ни одно утверждение.
+* **Не уязвимость**: все правила ставил root в начальном user ns; по F57
+  запись в пакет вообще возможна только там.
+
+## 12. Файлы
+
+`findings/F62-gso-two-segmenters/{SUMMARY.md, summary.json, VERIFY_REPORT.md,
+LETTER_SECTION_F62.txt}` · `vm/{differ584_add.c, differ584.c,
+build_f62_differ.sh, make_initramfs584.sh, build/differ584}` ·
+`tools/{f62_run.sh, verify584.py, verify584_selftest.sh, f584_mutate.py,
+f584_summary.py, audit_f62_doc.py}` · `research/predictions_584.md` · логи
+`logs/f62_{rep1,rep2}.log`.
+
+
+===== summary.json =====
+{
+ "finding": "F62",
+ "turn": 584,
+ "log": "f62_rep1.log",
+ "arms": 25,
+ "question": "the debt named in F61 \u00a711: a UDP-GSO datagram crossing this machine, with two exit devices that differ in NETIF_F_GSO_UDP_L4 as well as in NETIF_F_HW_CSUM -- who segments, and who pays for a store made on the FORWARD door",
+ "title": "on the GSO path the bill is paid by whoever segments, and the two doors segment in different places: y2 segments on the way out and then computes every segment checksum from the actual bytes (the payload store is paid correctly), y1 ships the whole GSO datagram and the RECEIVER segments it into PARTIAL pieces that nobody ever verifies -- so the same store is paid on one door and free on the other, a store into the length field is erased by both segmenters yet leaves every checksum wrong on y2 (three drops) and trims the datagram to 24 bytes for a GRO socket on y1, and a store into the checksum field ships verbatim through y1 and destroys all three segments on y2",
+ "answer_short": "three netns (sender, router=us, receiver), 25 arms x 2 boots on 7.3.4-T563, one rule per arm in the ip6 forward chain; the sender sends ONE 1200-byte datagram with UDP_SEGMENT=512. y1 keeps NETIF_F_GSO_UDP_L4 (ac1 ...612e), y2 loses it with HW_CSUM (ac1 ...612c), so with no rule y1 puts one 1262-byte frame on the wire whose checksum field is the pseudo-header seed for the WHOLE datagram (ff72) and the receiver segments it into 512/512/176, while y2 segments first: three frames 574/574/238, each with a checksum valid for its own bytes, and the receiver gets the same three datagrams, byte for byte. The place a payload store lands decides the price: in segment 0 the store is free on y1 (field unchanged) and paid on y2, where the segmenter recomputes from the modified payload (frame 0 field 426f, and only frame 0 differs from the census); the store at payload 512 and 1196 lands in the middle and last segments with the same rule. csum flags is dead code on both doors (byte-identical arms). A store into the UDP LENGTH field is read by the segmenter: on y2 the length is rewritten (so the store vanishes from the wire) and every checksum is short by exactly 1208-0x20 = 0x0498 -> three drops; on y1 the receiver trims the skb to the written length and then refuses to segment it (EINVAL, gso_segs=3) -> Udp6InErrors +3, while a length longer than the datagram is short_packet -> +1. A store into the CHECKSUM field: y1 carries 0xdead to the socket and still delivers three datagrams (PARTIAL is never checked), y2 derives every seed from 0xdead and all three die. The AF_PACKET twin of the same 1262 bytes (no GSO) is one datagram of 1200 on both doors, its stored copy dies on the stale checksum, and the one flag that pays there is the rule's own csum flags. A UDP_GRO socket shows the segmentation point: y1 delivers ONE 1200-byte datagram with gso_size 512, y2 delivers three (there is nothing left to GRO); with the length store the GRO socket gets 24 bytes. Every rule counted one packet and logged 1248 bytes -- one message per GSO datagram, not per segment.",
+ "numbers": {
+  "arms": 25,
+  "boots": 2,
+  "socket_arms": 21,
+  "packet_arms": 4,
+  "gro_arms": 5,
+  "datagrams_delivered": 48,
+  "arms_that_delivered_nothing": 5,
+  "udp_errors": 11,
+  "rules_that_counted_one": 25,
+  "logs_at_the_forward_door": 25,
+  "logged_bytes": [
+   1248
+  ],
+  "seed_a": "ff72",
+  "seed_b": "ff73",
+  "c_a_frames": [
+   1262
+  ],
+  "c_b_frames": [
+   574,
+   574,
+   238
+  ],
+  "c_b_fields": [
+   "82af",
+   "82af",
+   "1f91"
+  ],
+  "c_b_uhlens": [
+   520,
+   520,
+   184
+  ],
+  "w_b_frame0_field": "426f",
+  "w_b_other_frames_identical": true,
+  "w_a_field": "ff72",
+  "len_a_uhlen": 32,
+  "lenbig_a_uhlen": 65535,
+  "len_b_fields": [
+   "7e17",
+   "7e17",
+   "1af9"
+  ],
+  "len_b_delta": "fb67",
+  "len_b_expected_delta": "fb67",
+  "chk_a_field": "dead",
+  "chk_b_fields": [
+   "a375",
+   "a375",
+   "4057"
+  ],
+  "chk_b_delta": "20c6",
+  "chk_b_expected_delta": "20c6",
+  "wfl_a_equals_w_a": true,
+  "wfl_b_equals_w_b": true,
+  "lens_a_equals_c_a": true,
+  "w_p_a_delivered": 0,
+  "w_p_a_errors": 1,
+  "wb_p_a_field": "55d2",
+  "wb_p_a_true_sum": "55d2",
+  "g_a_datagrams": 1,
+  "g_a_len_gso": [
+   1200,
+   512
+  ],
+  "g_b_lengths": [
+   512,
+   512,
+   176
+  ],
+  "glen_a_len_gso": [
+   24,
+   512
+  ],
+  "c_p_a_len": 1200,
+  "per_arm": {
+   "c_a": {
+    "frames": [
+     1262
+    ],
+    "uhlen": [
+     1208
+    ],
+    "field": [
+     "ff72"
+    ],
+    "delivered": 3,
+    "errors": 0
+   },
+   "c_b": {
+    "frames": [
+     574,
+     574,
+     238
+    ],
+    "uhlen": [
+     520,
+     520,
+     184
+    ],
+    "field": [
+     "82af",
+     "82af",
+     "1f91"
+    ],
+    "delivered": 3,
+    "errors": 0
+   },
+   "w_a": {
+    "frames": [
+     1262
+    ],
+    "uhlen": [
+     1208
+    ],
+    "field": [
+     "ff72"
+    ],
+    "delivered": 3,
+    "errors": 0
+   },
+   "w_b": {
+    "frames": [
+     574,
+     574,
+     238
+    ],
+    "uhlen": [
+     520,
+     520,
+     184
+    ],
+    "field": [
+     "426f",
+     "82af",
+     "1f91"
+    ],
+    "delivered": 3,
+    "errors": 0
+   },
+   "wm_a": {
+    "frames": [
+     1262
+    ],
+    "uhlen": [
+     1208
+    ],
+    "field": [
+     "ff72"
+    ],
+    "delivered": 3,
+    "errors": 0
+   },
+   "wm_b": {
+    "frames": [
+     574,
+     574,
+     238
+    ],
+    "uhlen": [
+     520,
+     520,
+     184
+    ],
+    "field": [
+     "82af",
+     "224f",
+     "1f91"
+    ],
+    "delivered": 3,
+    "errors": 0
+   },
+   "wl_a": {
+    "frames": [
+     1262
+    ],
+    "uhlen": [
+     1208
+    ],
+    "field": [
+     "ff72"
+    ],
+    "delivered": 3,
+    "errors": 0
+   },
+   "wl_b": {
+    "frames": [
+     574,
+     574,
+     238
+    ],
+    "uhlen": [
+     520,
+     520,
+     184
+    ],
+    "field": [
+     "82af",
+     "82af",
+     "f768"
+    ],
+    "delivered": 3,
+    "errors": 0
+   },
+   "lens_a": {
+    "frames": [
+     1262
+    ],
+    "uhlen": [
+     1208
+    ],
+    "field": [
+     "ff72"
+    ],
+    "delivered": 3,
+    "errors": 0
+   },
+   "len_a": {
+    "frames": [
+     1262
+    ],
+    "uhlen": [
+     32
+    ],
+    "field": [
+     "ff72"
+    ],
+    "delivered": 0,
+    "errors": 3
+   },
+   "len_b": {
+    "frames": [
+     574,
+     574,
+     238
+    ],
+    "uhlen": [
+     520,
+     520,
+     184
+    ],
+    "field": [
+     "7e17",
+     "7e17",
+     "1af9"
+    ],
+    "delivered": 0,
+    "errors": 3
+   },
+   "lenbig_a": {
+    "frames": [
+     1262
+    ],
+    "uhlen": [
+     65535
+    ],
+    "field": [
+     "ff72"
+    ],
+    "delivered": 0,
+    "errors": 1
+   },
+   "chk_a": {
+    "frames": [
+     1262
+    ],
+    "uhlen": [
+     1208
+    ],
+    "field": [
+     "dead"
+    ],
+    "delivered": 3,
+    "errors": 0
+   },
+   "chk_b": {
+    "frames": [
+     574,
+     574,
+     238
+    ],
+    "uhlen": [
+     520,
+     520,
+     184
+    ],
+    "field": [
+     "a375",
+     "a375",
+     "4057"
+    ],
+    "delivered": 0,
+    "errors": 3
+   },
+   "wfl_a": {
+    "frames": [
+     1262
+    ],
+    "uhlen": [
+     1208
+    ],
+    "field": [
+     "ff72"
+    ],
+    "delivered": 3,
+    "errors": 0
+   },
+   "wfl_b": {
+    "frames": [
+     574,
+     574,
+     238
+    ],
+    "uhlen": [
+     520,
+     520,
+     184
+    ],
+    "field": [
+     "426f",
+     "82af",
+     "1f91"
+    ],
+    "delivered": 3,
+    "errors": 0
+   },
+   "c_p_a": {
+    "frames": [
+     1262
+    ],
+    "uhlen": [
+     1208
+    ],
+    "field": [
+     "9612"
+    ],
+    "delivered": 1,
+    "errors": 0
+   },
+   "c_p_b": {
+    "frames": [
+     1262
+    ],
+    "uhlen": [
+     1208
+    ],
+    "field": [
+     "9611"
+    ],
+    "delivered": 1,
+    "errors": 0
+   },
+   "w_p_a": {
+    "frames": [
+     1262
+    ],
+    "uhlen": [
+     1208
+    ],
+    "field": [
+     "9612"
+    ],
+    "delivered": 0,
+    "errors": 1
+   },
+   "wb_p_a": {
+    "frames": [
+     1262
+    ],
+    "uhlen": [
+     1208
+    ],
+    "field": [
+     "55d2"
+    ],
+    "delivered": 1,
+    "errors": 0
+   },
+   "g_a": {
+    "frames": [
+     1262
+    ],
+    "uhlen": [
+     1208
+    ],
+    "field": [
+     "ff72"
+    ],
+    "delivered": 1,
+    "errors": 0
+   },
+   "g_b": {
+    "frames": [
+     574,
+     574,
+     238
+    ],
+    "uhlen": [
+     520,
+     520,
+     184
+    ],
+    "field": [
+     "82ae",
+     "82ae",
+     "1f90"
+    ],
+    "delivered": 3,
+    "errors": 0
+   },
+   "gw_a": {
+    "frames": [
+     1262
+    ],
+    "uhlen": [
+     1208
+    ],
+    "field": [
+     "ff72"
+    ],
+    "delivered": 1,
+    "errors": 0
+   },
+   "gw_b": {
+    "frames": [
+     574,
+     574,
+     238
+    ],
+    "uhlen": [
+     520,
+     520,
+     184
+    ],
+    "field": [
+     "426e",
+     "82ae",
+     "1f90"
+    ],
+    "delivered": 3,
+    "errors": 0
+   },
+   "glen_a": {
+    "frames": [
+     1262
+    ],
+    "uhlen": [
+     32
+    ],
+    "field": [
+     "ff72"
+    ],
+    "delivered": 1,
+    "errors": 0
+   }
+  }
+ }
+}

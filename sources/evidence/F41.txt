@@ -1,0 +1,868 @@
+===== LETTER_SECTION_F41.txt =====
+# F41 — candidate section for netfilter-devel, turn 563
+
+STATUS: NOT SENT. Not appended to the held letter (F29+F30), not sent anywhere.
+The owner decides when and whether any of these go out.
+
+Subject line candidate: `nft: payload set at @nh is off by PPPOE_SES_HLEN on
+PPPoE, and the netdev ingress branch allows the store the ARP list forbids`
+
+---
+
+`nft_meta_pktinfo_may_update()` has a second carrier of `pkt->nhoff` besides
+VLAN:
+
+    case htons(ETH_P_PPP_SES):
+            if (!nf_flow_pppoe_proto(skb, &ethertype))
+                    return;
+            nhoff = PPPOE_SES_HLEN;          /* 8, not 6 */
+            break;
+
+so on a PPPoE session frame with `meta protocol` in front the read of an `@nh`
+cell lands on the real IPv4 header, and the store of the same cell lands eight
+bytes earlier, inside the PPPoE session header. Measured on 7.3.4-T563
+(= 7.3.4 + CONFIG_PPP + CONFIG_PPPOE; the files that decide this are
+byte-identical to the image F36..F40 measured), 438 arms in each of two boots,
+bridge prerouting, one DHCP-less PPPoE session frame (`8864 | ver/type code |
+sid | length | 0x0021 | IPv4/UDP`):
+
+1. The read grid is 40/40 live at `data + nhoff + off` (nhoff = 8) and 40/40
+   dead at the store's coordinate; without `meta protocol` the read is 40/40 at
+   the store's coordinate and the store is 0/40 (the guard has no branch for
+   0x8864).
+2. The store grid with `meta protocol` is exactly `nft_nh_write_ok_ip4()`'s
+   whitelist, 14/40 — and **not one of the 14 cells writes the field it names**:
+
+        (0,2) "ip ver/ihl"   writes pppoe ver/type + code   (off 14)
+        (1,1) "ip tos"       writes pppoe code              (off 15)
+        (4,2) "ip id"        writes pppoe length            (off 18)
+        (8,1) "ip ttl"       writes ip ver/ihl              (off 22)
+        (10,1) "ip checksum" writes ip tot_len              (off 24)
+        (12,4) "ip saddr"    writes ip id + frag_off        (off 26)
+        (16,4) "ip daddr"    writes ip ttl + proto + csum   (off 30)
+
+   The real `saddr` (offset 20) and `daddr` (offset 24) are refused by the
+   whitelist, so a rule cannot write them at all. `wrrd` (store, then read the
+   same cell) is dead on a plain frame and live here: the store rewrote a byte
+   eight bytes before the one the read returns.
+3. The receiving side is a real `AF_PPPOX`/`PX_PROTO_OE` session (no pppd, no
+   negotiation: `pppoe_connect()` binds when `sid != 0` and queues frames on the
+   socket). `recv()` is the stack's own verdict in bytes: the control arm
+   delivers 48 bytes, `(4,2) = 0x0004` — the cell the whitelist exists to let a
+   rule write the IPv4 id — rewrites the **PPPoE length field** and delivers
+   4 bytes, and `(4,2) = 0x9091` drops the datagram entirely. `(12,4)`
+   "ip saddr" rewrites the id and fragment offset; `(16,4)` "ip daddr"
+   rewrites ttl, protocol and the header checksum of the delivered datagram.
+
+Second half — the ARP frame the guard approves into invalidity, now followed to
+the receiver. Three oracles per arm: the releasing chain's counter, the `arp`
+family counter at `NF_ARP_IN` (i.e. did the frame pass `arp_rcv()`), and the
+reply the kernel sends (plus `/proc/net/arp`):
+
+    frame                          cell        NF_ARP_IN  reply  neighbour
+    plain ARP request              -           1          yes    yes
+    plain, ar_op = 0x9091          (6,2)       1          no     no
+    plain, ar_op = REPLY           (6,2)       1          no     no
+    plain, sha[0..1] = 0x9091      (8,2)       1          to 90:91:cc:00:00:66
+    Q-in-Q vid 0/0                 -           1          yes    yes
+    Q-in-Q, ar_pro = 0x9091        (6,2)       1          no     no
+    Q-in-Q, real ar_op = 0x9091    (10,2)      1          no     no
+    Q-in-Q, ar_hln/ar_pln          (8,2)       0          no     no
+    Q-in-Q vid 0/200               -           0          no     no
+    netdev ingress, ar_hln/pln     (4,2)       0          no     no
+    netdev ingress, ar_op          (6,2)       1          no     no
+
+Two things follow that a source reading alone does not give. First, a Q-in-Q
+frame whose outer tag has **vid 0** does reach the ARP stack — the outer tag is
+a priority tag and `check_vlan_id` in `net/core/dev.c` pops the next one too —
+so the shifted ARP store (F40) is not just byte surgery: `(8,2)` there really
+kills the frame in `arp_rcv()` (0 against 1 for the control), while `(6,2)`
+passes `arp_rcv` (1) and dies in `arp_process` at the `ar_pro` check. Second,
+the same death is reachable where the guard is the **constant**
+`NFT_PAYLOAD_NETWORK_HEADER` at `NF_NETDEV_INGRESS` (`if (pkt->state->hook ==
+NF_NETDEV_INGRESS) return true;`): offset 4, which the ARP whitelist refuses
+because it is `ar_hln`, is allowed there, and the frame dies before the ARP
+hook.
+
+Both halves are the same shape and it is worth stating once: the guard is a
+list of coordinates in the header's own frame, and the store's reference point
+is `skb_network_offset()`, which is not the header's when the skb still carries
+a POPPED tag or a PPPoE session header. The read was repaired for both
+envelopes; the store was not.
+
+
+===== SUMMARY.md =====
+# F41 — PPPoE: восемь байт, которых страж не видит; и смерть ARP-кадра, измеренная до конца
+
+Turn 563. Новое ядро: `7.3.4-T563` = `T558` + `CONFIG_PPP` + `CONFIG_PPPOE`
+(`1efbc957…2033`; дельта конфига — ровно блок PPP/PPPOE и `SLHC`, 17 строк;
+`nft_payload.c`, `nft_meta.c`, `nf_tables_core.c`, `nft_chain_filter.c`,
+`arp.c`, `dev.c`, `vlan_core.c`, `pppoe.c`, `nf_flow_table.h` побайтово равны
+родителю). 438 плеч в каждой из двух загрузок, один и тот же `initrd`.
+
+## 1. Ответ в один абзац
+
+Долг 562-го — «PPPoE это второй носитель `pkt->nhoff`, но символа нет в
+образе, и прогноз остаётся чтением кода» — закрыт: символ в образе,
+`meta protocol` на PPPoE-кадре ставит `pkt->nhoff = 8` (не 6, как я написал в
+562-м: `PPPOE_SES_HLEN` — это **восемь**, заголовок сессии 6 байт плюс поле
+PPP-протокола 2), чтение попадает на настоящий заголовок IPv4, а **запись —
+на восемь байт раньше**, в заголовок PPPoE-сессии. Ни одна из 14 разрешённых
+клеток не пишет поле, которое называет: «ipv4 id» меняет длину PPPoE-сессии,
+«ipv4 saddr» — id и fragment offset, «ipv4 daddr» — ttl, протокол и
+контрольную сумму, а настоящие saddr/daddr недостижимы вовсе (их смещения
+список не содержит). Получатель — настоящий сокет PPPoX-сессии — видит это
+байтами: «ipv4 id» = 4 отдаёт датаграм вместо 48, «ipv4 id» = 0x9091 не
+отдаёт ничего. Второй долг — «догнать ARP-кадр, которому страж переписал
+`ar_hln`» — тоже закрыт, и он оказался вдвое интереснее: кадр Q-in-Q с
+нулевыми метками **доходит** до стека ARP (счётчик `NF_ARP_IN` = 1, ответ
+есть), и клетка `(8,2)` в этом конверте действительно убивает его на
+`arp_rcv()` (0). А та же смерть достижима и там, где страж — **константа**
+(`netdev ingress`): смещение 4, которое список ARP запрещает, в ingress
+разрешено, и написанный им `ar_hln` убивает кадр до хука. Три места смерти
+ARP-кадра теперь названы числом, а не чтением.
+
+## 2. Шесть строк, на которых это стоит
+
+| файл | что говорит |
+|---|---|
+| `include/uapi/linux/if_pppox.h` | `#define PPPOE_SES_HLEN	8` |
+| `include/net/netfilter/nf_flow_table.h` | `__nf_flow_pppoe_proto()` читает PPP-протокол по `skb_mac_header + ETH_HLEN + sizeof(struct pppoe_hdr)` |
+| `net/netfilter/nft_meta.c` | `case htons(ETH_P_PPP_SES): … nhoff = PPPOE_SES_HLEN;` и `nhoff += skb_network_offset(skb);` |
+| `net/netfilter/nft_payload.c` | чтение: `offset = skb_network_offset(skb) + pkt->nhoff`; запись: `offset = skb_network_offset(skb)` |
+| `net/netfilter/nft_payload.c` | `case NFPROTO_NETDEV: if (pkt->state->hook == NF_NETDEV_INGRESS) return true;` |
+| `net/ipv4/arp.c` | `arp_rcv()`: `ar_hln != dev->addr_len \|\| ar_pln != 4` → drop **до** `NF_ARP_IN`; `arp_process()`: `ar_hrd`/`ar_pro` по типу устройства, потом `ar_op` ∈ {REQUEST, REPLY} |
+| `drivers/net/ppp/pppoe.c` | `pppoe_rcv()`: `len = ntohs(ph->length)`, drop если `skb->len < len`, обрезка до `len`, поиск сессии по `(sid, eth_hdr()->h_source, ifindex)` |
+
+## 3. Сетка чтения: у `@nh` два адреса, и оба теперь измерены в PPPoE
+
+40 клеток × 2 кандидата. Кандидат **A** = байт, в который пишет *запись* этой
+клетки (`cap[14+off]`); **B** = куда попадает чтение при `pkt->nhoff = 8`
+(`cap[22+off]`). Записи в этих плечах нет, поэтому ни страж, ни
+`skb_ensure_writable()` между чтением и счётчиком не стоят.
+
+| кадр | gate | nhoff | живых A | живых B |
+|---|---|---|---|---|
+| `p` (голый IPv4) | без meta | 0 | **40/40** | 1/40 |
+| `ps` (PPPoE) | без meta | 0 | **40/40** | 5/40 |
+| `ps` | `meta protocol` | **8** | 5/40 | **40/40** |
+
+Пять «лишних» живых в третьей строке и в `ps`/bare — клетки, где кандидаты A и
+B это одни и те же байты; верификатор их перечисляет и требует, чтобы
+совпадение было объяснено байтами кадра, а не допуском. На каждой
+различающей клетке живой ровно один кандидат, и он на `data + nhoff + off`.
+Чтение страж не отказывает никогда — сетка 40/40 в любом конверте, включая те
+26 клеток, чью запись он запрещает.
+
+## 4. Сетка записи: тот же белый список, и все 14 клеток пишут не то
+
+| кадр | gate | живых из 40 | множество живых клеток |
+|---|---|---|---|
+| `ps` | без meta | **0/40** | — (ветви для `0x8864` нет) |
+| `ps` | `meta protocol` | **14/40** | (0,2) (1,1) (4,2) (8,1) (8,2) (10,1) (10,2) (10,4) (12,1) (12,2) (12,4) (16,1) (16,2) (16,4) |
+
+Множество совпадает с `nft_nh_write_ok_ip4()` клетка в клетку — то есть страж
+уверен, что защищает заголовок IPv4. Что он защищает на самом деле:
+
+| клетка | во что верит страж | байт кадра | что это на самом деле |
+|---|---|---|---|
+| (0,2) | ip ver/ihl | 14..15 | **pppoe ver/type + pppoe code** |
+| (1,1) | ip tos | 15 | **pppoe code** |
+| (4,2) | ip id | 18..19 | **pppoe length** |
+| (8,1) | ip ttl | 22 | **ip ver/ihl** |
+| (8,2) | ip ttl (csum fixup) | 22..23 | **ip ver/ihl + ip tos** |
+| (10,1) | ip checksum | 24 | **ip tot_len** |
+| (10,2) | ip checksum | 24..25 | **ip tot_len** |
+| (10,4) | ip checksum + saddr[0:2] | 24..27 | **ip tot_len + ip id** |
+| (12,1) | ip saddr | 26 | **ip id** |
+| (12,2) | ip saddr | 26..27 | **ip id** |
+| (12,4) | ip saddr | 26..29 | **ip id + ip frag_off** |
+| (16,1) | ip daddr | 30 | **ip ttl** |
+| (16,2) | ip daddr | 30..31 | **ip ttl + ip proto** |
+| (16,4) | ip daddr | 30..33 | **ip ttl + ip proto + ip checksum** |
+
+Ни одна. Восемь байт — это `PPPOE_SES_HLEN`, и «настоящие» saddr (20) и daddr
+(24) список не содержит вовсе: их не переписать даже неправильно. Две клетки,
+чья проверка читает кадр, тоже читают не то: `case 0` сравнивает с байтом
+`cap[14] = 0x11` (pppoe ver/type), `case 8, len 2` — с `cap[23]` (ip tos).
+
+## 5. Одно правило, один пакет, два места — теперь с разрывом 8
+
+| представление | клетка | wr | rdwr | wrrd | байты записи |
+|---|---|---|---|---|---|
+| `p` | (8) | 1 | 0 | 0 | 22:40>90 (ttl) |
+| `p` | (16) | 1 | 0 | 0 | 30..33 (daddr) |
+| `ps` | (8) | 0 | 0 | 0 | — |
+| `ps` | (16) | 0 | 0 | 0 | — |
+| `ps`+meta | (8) | 1 | **1** | **1** | 22:45>90 — **ip ver/ihl** |
+| `ps`+meta | (16) | 1 | **1** | **1** | 30..33 — **ttl, proto, csum** |
+
+`wrrd` — записать, потом прочитать ту же клетку: на голом кадре мёртв (запись
+переписала байт, который вернуло чтение), на PPPoE жив, потому что запись
+легла на восемь байт раньше, а чтение вернуло нетронутое поле. На `p` `rdwr`
+мёртв по другой причине: он сравнивает с кандидатом B, то есть с байтом,
+которого на голом кадре в этой клетке нет.
+
+## 6. Транспортная база починена целиком — и там же, где чтение
+
+| представление | rdT (истинный UDP) | rdW (data+0) | wr | байты записи |
+|---|---|---|---|---|
+| `p` | 5/5 | 0/5 | 5/5 | 34:9c>90,35:40>91 |
+| `ps` | 0/5 | 0/5 | 0/5 | — |
+| `ps`+meta | 5/5 | 0/5 | 5/5 | 42:9c>90,43:40>91 |
+
+`pkt->thoff = skb_network_offset + nhoff + ihl*4 = 0+8+20 = 28`, и оба — и
+чтение, и запись `@ih` — берут `nft_thoff(pkt)`. То есть **расщепление —
+свойство только базы `@nh`**: `@ih` в PPPoE-кадре попадает точно в поле,
+которое называет, на восемь байт дальше, чем на голом.
+
+## 7. Приёмная сторона: настоящий сокет PPPoX-сессии, без pppd и без переговоров
+
+`pppoe_connect()` привязывает сессию, если `sid != 0`: сокет `AF_PPPOX`,
+`PX_PROTO_OE`, `dev = "br0"`, `sid = 0x0063`, `remote = aa:bb:cc:00:00:66`
+(rc = 7, то есть fd). Дальше `pppoe_rcv()` находит её по
+`(sid, eth_hdr(skb)->h_source, ifindex)` и — раз сокет не `PPPOX_BOUND` —
+кладёт skb в его очередь. Значит `recv()` это вердикт приёмного стека в
+байтах, а не пересказ кода.
+
+| плечо | правило | страж | `recv()` | первые байты доставленного |
+|---|---|---|---|---|
+| `ctl` | без записи | жив | **48 байт** | `0021 4500 002e 1234 0000 4011 547a …` |
+| `id_small` | (4,2)=0x0004 «ipv4 id» | жив | **4 байта** | `0021 4500` |
+| `id_large` | (4,2)=0x9091 | жив | **отброшен** | — |
+| `vt` | (0,2)=0x1191 «ver/ihl» | жив | 48 байт | ver/type и code переписаны, стек не замечает |
+| `tos` | (1,1)=0x91 «tos» | жив | 48 байт | code переписан, стек не замечает |
+| `ttl` | (8,1)=0x90 «ttl» | жив | 48 байт | `0021 **90**00 …` — версия/ihl |
+| `ttl2` | (8,2)=0x9000 «ttl (csum fixup)» | жив | 48 байт | `0021 9000 …` |
+| `saddr` | (12,4) «ipv4 saddr» | жив | 48 байт | `0021 4500 002e **90919293** 4011 …` — id и frag_off |
+| `daddr` | (16,4) «ipv4 daddr» | жив | 48 байт | `… **90919293** 0a010001 …` — ttl, proto, checksum |
+| `tsaddr` | (20,4) настоящий saddr | **мёртв** | 48 байт | не изменено |
+| `trdaddr` | (24,4) настоящий daddr | **мёртв** | 48 байт | не изменено |
+| `id_bare` | (4,2) без `meta` | **мёртв** | 48 байт | не изменено |
+
+Две строки стоит прочитать вместе. `id_small` и `id_large` — **одна и та же
+клетка**, отличаются только значением: 0x0004 попадает в поле длины PPPoE и
+обрезает датаграм до четырёх байт (тихо, получатель видит короткие данные),
+0x9091 делает длину больше кадра и датаграм отбрасывается целиком. Это первый
+за проект случай, где **правило, поставленное ради IPv4-заголовка, меняет
+длину доставки** — и оба исхода видны в `recv()`, а не в счётчике.
+
+## 8. Смерть ARP-кадра: три места, все измерены
+
+Три оракула на каждое плечо: счётчик освобождающей цепи, счётчик семейства
+`arp` на `NF_ARP_IN` (= прошёл ли кадр `arp_rcv()`), и ответ, который ядро
+шлёт обратно (плюс `/proc/net/arp`). Кадр шлётся из `r0`, чтобы ответ пришёл
+тем же путём; `s0` переведён в `IFF_NOARP` — иначе вторая копия кадра (мост
+заливает его на `s1`) считалась и создавала соседа на `s0` (измерено).
+
+| конверт | кадр | клетка | что пишет | NF_ARP_IN | ответ | сосед |
+|---|---|---|---|---|---|---|
+| br | `pa` | — | контроль | **1** | да | aa:bb:cc:00:00:66 |
+| br | `pa` | (6,2) | ar_op = 0x9091 | **1** | нет | нет |
+| br | `pa` | (6,2) | ar_op = REPLY | **1** | нет | нет |
+| br | `pa` | (8,2) | sha[0..1] | **1** | да → 90:91:cc:00:00:66 | 90:91:cc:00:00:66 |
+| br | `pa` | (10,2) | sha[2..3] | **1** | да → aa:bb:90:91:00:66 | aa:bb:90:91:00:66 |
+| br | `tag0` | — | контроль (одна метка vid 0) | **1** | да | aa:bb:cc:00:00:66 |
+| br | `q0` | — | контроль (Q-in-Q, vid 0/0) | **1** | да | aa:bb:cc:00:00:66 |
+| br | `q0` | (6,2) | **ar_pro** | **1** | нет | нет |
+| br | `q0` | (10,2) | настоящий ar_op | **1** | нет | нет |
+| br | `q0` | (8,2) | **ar_hln/ar_pln** | **0** | нет | нет |
+| br | `q200` | — | контроль (Q-in-Q, vid 0/200) | **0** | нет | нет |
+| nd | `pa` | — | контроль (ingress) | **1** | да | aa:bb:cc:00:00:66 |
+| nd | `pa` | (4,2) | **ar_hln/ar_pln** | **0** | нет | нет |
+| nd | `pa` | (6,2) | ar_op | **1** | нет | нет |
+| nd | `pa` | (8,2) | sha[0..1] | **1** | да → 90:91:cc:00:00:66 | 90:91:cc:00:00:66 |
+| nd | `q0` | (4,2) | **ar_hrd** (метка ещё в байтах) | **1** | нет | нет |
+
+Что видно только вместе:
+
+1. **Клетка `(8,2)` в Q-in-Q действительно убивает кадр на `arp_rcv()`** —
+   `NF_ARP_IN` = 0 против 1 у контроля. Это тот самый долг, и он закрыт
+   числом, а не чтением: `ar_hln = 0x90 ≠ dev->addr_len = 6`.
+2. **Но кадр Q-in-Q с vid 0 доходит до ARP-стека**, хотя в 560-м я считал
+   иначе: внешняя метка с vid 0 — это priority tag, и `check_vlan_id` в
+   `net/core/dev.c` снимает следующую метку тоже. Проверено парой:
+   vid 0/0 → `NF_ARP_IN` 1 и ответ есть; vid 0/200 → 0 и ответа нет
+   (кадр помечается `PACKET_OTHERHOST` и `arp_rcv` его глотает).
+3. **Клетка `(6,2)` в Q-in-Q пишет `ar_pro`** (байты 20..21 кадра), кадр
+   проходит `arp_rcv` (счётчик 1) и умирает в `arp_process` — на проверке
+   `ar_pro != htons(ETH_P_IP)`. Ровно то, что 562-й предсказал по коду, и
+   теперь с последствием.
+4. **Та же смерть достижима там, где страж — константа.** Список ARP
+   запрещает смещение 4 (там `ar_hln`), а `netdev ingress` разрешает
+   **всё**; на голом ARP-кадре `(4,2)` пишет `ar_hln/ar_pln` = `0x90/0x91`,
+   и кадр не доходит до хука (0). Это первый за проект случай, где
+   «константа» из таблицы типов F33 не просто разрешает запись, а разрешает
+   ту, которую запрещает специализированный страж, — и последствие видно на
+   приёмной стороне.
+5. `(6,2)` = REPLY (op = 2) — кадр принят, сосед **не** создан и ответа нет:
+   незапрошенный ответ ядро молча глотает (`__neigh_lookup(…, 0)`), а это
+   другое последствие, чем «умер на проверке op».
+6. `(8,2)`/`(10,2)` на голом кадре — это `sha`, не `ar_hln`: ответ уходит на
+   переписанный MAC, и сосед записывается под ним (`/proc/net/arp`:
+   `90:91:cc:00:00:66`). То есть «одна и та же клетка» в двух конвертах
+   делает разные вещи: в ARP-списке это payload, в ingress — заголовок.
+
+**Поправка к 562-му, которую дало измерение.** В 562-м было написано, что на
+Q-in-Q «страж одобряет запись, делающую кадр невалидным на приёмной стороне».
+Измерение говорит точнее: это верно только для клеток `(6,2)` и `(8,2)` из
+списка ARP — и **только** потому, что кадр Q-in-Q с vid 0 вообще доходит до
+стека. Для vid ≠ 0 не доходит никакой кадр, и запись безразлична (строка
+`q200`). Кроме того, в ingress-конверте та же смерть достижима клеткой,
+которой в ARP-списке нет вовсе.
+
+## 9. Чего этот ход не измерил
+
+- Один хук на конверт (bridge prerouting, netdev ingress), одна пара veth, один
+  отправитель; одна PPPoE-сессия и один `sid`.
+- PPPoE с **IPv6** и с **ARP** внутри (PPP не несёт ARP; PPP-IPCP не
+  поднимался). `nf_flow_pppoe_proto()` знает `PPP_IPV6` — это чтение кода.
+- Метки в байтах PPPoE-кадра (`@ll` внутри PPPoE); QinQ-в-PPPoE.
+- GSO/`CHECKSUM_PARTIAL`, записи с пересчётом контрольной суммы внутри PPPoE
+  (`NFTA_PAYLOAD_CSUM_*`), сессия в состоянии `PPPOX_BOUND` (там кадр уходит в
+  `ppp_input()`, а не в очередь сокета — этот путь не тронут).
+- ARP: только REQUEST в локальный адрес моста; proxy ARP, `arp_ignore`/
+  `arp_filter`, VLAN-устройство на пути (тогда `vlan_do_receive()` вернёт true
+  и порядок снятия меток другой).
+- **Не уязвимость**: правило ставит root в начальном user ns. Следствия —
+  запись, молча попадающая в другое поле (длина PPPoE-сессии вместо id,
+  ttl/proto/checksum вместо daddr, ar_pro вместо ar_op), обрезанный или
+  отброшенный датаграм, и ARP-кадр, убитый одобренной записью.
+
+## 10. Чем проверено
+
+| | |
+|---|---|
+| `tools/verify563.py` | **1179 проверок, 0 расхождений** — провенанс (sha ядра из шапки лога против файла, initrd, differ **извлечённый из initramfs** против собранного), дельта конфига = 17 строк PPP/PPPOE/SLHC, девять исходников побайтово против T558, 18 якорей исходника, все 438 плеч против модели на Python (`pktinfo` из `nft_meta_pktinfo_may_update`, белый список из `nft_nh_write_ok_*`, `pppoe_rcv` из `pppoe.c`, три проверки `arp.c`), каждая байтовая клетка, детерминизм двух загрузок, 0 splat |
+| `tools/verify563_selftest.sh` | **17/17** — базовая линия зелёная, каждая мутация краснит **свою** проверку; крэш не считается пойманной мутацией |
+| `tools/f41_summary.py` | таблицы §3–§8 **выведены** из лога, а не набраны |
+| регрессия | verify562 2332, verify561 1937, verify560 628, verify559 765, verify558 350, verify557 115, verify556 1847, verify555 140, verify553 311, verify552 5633 |
+
+Файлы: `vm/{differ563_add.c, build_f41_differ.sh, make_initramfs563.sh}`,
+`tools/{f41_build_cfg.sh, f41_run.sh, verify563.py, verify563_selftest.sh,
+f41_mutate.py, f41_summary.py}`; ядро `src/linux-7.3.4-T563`
+(`1efbc957…2033`); логи `logs/f41_{rep1,rep2}.log`,
+`logs/f41_cfg_delta_T563.txt`.
+
+
+===== summary.json =====
+{
+ "answer_short": "No to the first: with nhoff = PPPOE_SES_HLEN = 8 the read lands on the true IPv4 header and the store eight bytes earlier, so none of the 14 cells of nft_nh_write_ok_ip4() writes the field it names -- the cell that says `ipv4 id` rewrites the PPPoE length and a real PPPoX session then delivers 4 bytes instead of 48 -- and the real saddr/daddr offsets are refused outright. Yes to the second: ar_hln rewritten by (8,2) on Q-in-Q and by (4,2) at netdev ingress both stop the frame in arp_rcv (NF_ARP_IN 0 against 1), ar_pro rewritten by (6,2) passes arp_rcv and dies in arp_process, a non-zero inner vid never reaches the hook, and the ingress guard is the constant true that allows the offset the ARP list forbids.",
+ "arms_per_boot": 438,
+ "arpd": [
+  {
+   "arc": 1,
+   "arm": "br_pa_ctl",
+   "entry": true,
+   "env": "br",
+   "frame": "pa",
+   "len": 0,
+   "off": 0,
+   "reply": true,
+   "what": "control: no store"
+  },
+  {
+   "arc": 1,
+   "arm": "br_pa_opbad",
+   "entry": false,
+   "env": "br",
+   "frame": "pa",
+   "len": 2,
+   "off": 6,
+   "reply": false,
+   "what": "ar_op = 0x9091 (unknown)"
+  },
+  {
+   "arc": 1,
+   "arm": "br_pa_oprepl",
+   "entry": false,
+   "env": "br",
+   "frame": "pa",
+   "len": 2,
+   "off": 6,
+   "reply": false,
+   "what": "ar_op = REPLY"
+  },
+  {
+   "arc": 1,
+   "arm": "br_pa_sha0",
+   "entry": true,
+   "env": "br",
+   "frame": "pa",
+   "len": 2,
+   "off": 8,
+   "reply": true,
+   "what": "sha[0..1]"
+  },
+  {
+   "arc": 1,
+   "arm": "br_pa_sha2",
+   "entry": true,
+   "env": "br",
+   "frame": "pa",
+   "len": 2,
+   "off": 10,
+   "reply": true,
+   "what": "sha[2..3]"
+  },
+  {
+   "arc": 1,
+   "arm": "br_tag0_ctl",
+   "entry": true,
+   "env": "br",
+   "frame": "tag0",
+   "len": 0,
+   "off": 0,
+   "reply": true,
+   "what": "single 802.1Q tag, vid 0: control"
+  },
+  {
+   "arc": 1,
+   "arm": "br_q0_ctl",
+   "entry": true,
+   "env": "br",
+   "frame": "q0",
+   "len": 0,
+   "off": 0,
+   "reply": true,
+   "what": "Q-in-Q vid 0: control"
+  },
+  {
+   "arc": 1,
+   "arm": "br_q0_pro",
+   "entry": false,
+   "env": "br",
+   "frame": "q0",
+   "len": 2,
+   "off": 6,
+   "reply": false,
+   "what": "Q-in-Q: ar_pro (F40's shifted cell 6)"
+  },
+  {
+   "arc": 1,
+   "arm": "br_q0_op",
+   "entry": false,
+   "env": "br",
+   "frame": "q0",
+   "len": 2,
+   "off": 10,
+   "reply": false,
+   "what": "Q-in-Q: the real ar_op (offset 10)"
+  },
+  {
+   "arc": 0,
+   "arm": "br_q0_hln",
+   "entry": false,
+   "env": "br",
+   "frame": "q0",
+   "len": 2,
+   "off": 8,
+   "reply": false,
+   "what": "Q-in-Q: the shifted cell (writes ar_hln)"
+  },
+  {
+   "arc": 0,
+   "arm": "br_q200_ctl",
+   "entry": false,
+   "env": "br",
+   "frame": "q200",
+   "len": 0,
+   "off": 0,
+   "reply": false,
+   "what": "Q-in-Q inner vid 200: control"
+  },
+  {
+   "arc": 1,
+   "arm": "nd_pa_ctl",
+   "entry": true,
+   "env": "nd",
+   "frame": "pa",
+   "len": 0,
+   "off": 0,
+   "reply": true,
+   "what": "ingress, control"
+  },
+  {
+   "arc": 0,
+   "arm": "nd_pa_hln",
+   "entry": false,
+   "env": "nd",
+   "frame": "pa",
+   "len": 2,
+   "off": 4,
+   "reply": false,
+   "what": "ingress: ar_hln/ar_pln (offset 4, refused by the ARP list)"
+  },
+  {
+   "arc": 1,
+   "arm": "nd_pa_op",
+   "entry": false,
+   "env": "nd",
+   "frame": "pa",
+   "len": 2,
+   "off": 6,
+   "reply": false,
+   "what": "ingress: ar_op"
+  },
+  {
+   "arc": 1,
+   "arm": "nd_pa_sha0",
+   "entry": true,
+   "env": "nd",
+   "frame": "pa",
+   "len": 2,
+   "off": 8,
+   "reply": true,
+   "what": "ingress: sha[0..1]"
+  },
+  {
+   "arc": 1,
+   "arm": "nd_q0_hln",
+   "entry": false,
+   "env": "nd",
+   "frame": "q0",
+   "len": 2,
+   "off": 4,
+   "reply": false,
+   "what": "ingress on Q-in-Q: offset 4 lands in the tag"
+  }
+ ],
+ "ih": {
+  "p.bare": {
+   "rdT": 5,
+   "rdW": 0,
+   "wr": 5
+  },
+  "ps.bare": {
+   "rdT": 0,
+   "rdW": 0,
+   "wr": 0
+  },
+  "ps.meta": {
+   "rdT": 5,
+   "rdW": 0,
+   "wr": 5
+  }
+ },
+ "kernel": "7.3.4-T563 (T558 + CONFIG_PPP + CONFIG_PPPOE)",
+ "pair": [
+  {
+   "cell": "8",
+   "frame": "p",
+   "gate": "bare",
+   "rdwr": 0,
+   "wr": 1,
+   "wrrd": 0
+  },
+  {
+   "cell": "16",
+   "frame": "p",
+   "gate": "bare",
+   "rdwr": 0,
+   "wr": 1,
+   "wrrd": 0
+  },
+  {
+   "cell": "8",
+   "frame": "ps",
+   "gate": "bare",
+   "rdwr": 0,
+   "wr": 0,
+   "wrrd": 0
+  },
+  {
+   "cell": "16",
+   "frame": "ps",
+   "gate": "bare",
+   "rdwr": 0,
+   "wr": 0,
+   "wrrd": 0
+  },
+  {
+   "cell": "8",
+   "frame": "ps",
+   "gate": "meta",
+   "rdwr": 1,
+   "wr": 1,
+   "wrrd": 1
+  },
+  {
+   "cell": "16",
+   "frame": "ps",
+   "gate": "meta",
+   "rdwr": 1,
+   "wr": 1,
+   "wrrd": 1
+  }
+ ],
+ "pppd": [
+  {
+   "arm": "ctl",
+   "live": 1,
+   "rx": "00214500002e123400004011547a0a0100010a0900079c401388001a000077777777777777777777",
+   "rxn": 48,
+   "what": "no store"
+  },
+  {
+   "arm": "id_small",
+   "live": 1,
+   "rx": "00214500",
+   "rxn": 4,
+   "what": "ipv4 id -> pppoe length = 4"
+  },
+  {
+   "arm": "id_large",
+   "live": 1,
+   "rx": "-",
+   "rxn": -1,
+   "what": "ipv4 id -> pppoe length = 0x9091"
+  },
+  {
+   "arm": "vt",
+   "live": 1,
+   "rx": "00214500002e123400004011547a0a0100010a0900079c401388001a000077777777777777777777",
+   "rxn": 48,
+   "what": "version/ihl -> pppoe ver/type + code"
+  },
+  {
+   "arm": "tos",
+   "live": 1,
+   "rx": "00214500002e123400004011547a0a0100010a0900079c401388001a000077777777777777777777",
+   "rxn": 48,
+   "what": "tos -> pppoe code"
+  },
+  {
+   "arm": "ttl",
+   "live": 1,
+   "rx": "00219000002e123400004011547a0a0100010a0900079c401388001a000077777777777777777777",
+   "rxn": 48,
+   "what": "ttl -> ipv4 version/ihl"
+  },
+  {
+   "arm": "ttl2",
+   "live": 1,
+   "rx": "00219000002e123400004011547a0a0100010a0900079c401388001a000077777777777777777777",
+   "rxn": 48,
+   "what": "ttl(2b) -> ipv4 version/ihl + tos"
+  },
+  {
+   "arm": "saddr",
+   "live": 1,
+   "rx": "00214500002e909192934011547a0a0100010a0900079c401388001a000077777777777777777777",
+   "rxn": 48,
+   "what": "saddr -> ipv4 id + frag_off"
+  },
+  {
+   "arm": "daddr",
+   "live": 1,
+   "rx": "00214500002e12340000909192930a0100010a0900079c401388001a000077777777777777777777",
+   "rxn": 48,
+   "what": "daddr -> ipv4 ttl + proto + csum"
+  },
+  {
+   "arm": "tsaddr",
+   "live": 0,
+   "rx": "00214500002e123400004011547a0a0100010a0900079c401388001a000077777777777777777777",
+   "rxn": 48,
+   "what": "the real saddr: refused"
+  },
+  {
+   "arm": "trdaddr",
+   "live": 0,
+   "rx": "00214500002e123400004011547a0a0100010a0900079c401388001a000077777777777777777777",
+   "rxn": 48,
+   "what": "the real daddr: refused"
+  },
+  {
+   "arm": "id_bare",
+   "live": 0,
+   "rx": "00214500002e123400004011547a0a0100010a0900079c401388001a000077777777777777777777",
+   "rxn": 48,
+   "what": "bare gate: no branch"
+  }
+ ],
+ "question": "Does `meta protocol` move the @nh store as well as the read on a PPPoE session frame, and does the ARP frame the guard approves into invalidity actually die on the receiving side?",
+ "read_grid": {
+  "p.bare": [
+   40,
+   40,
+   1,
+   40
+  ],
+  "ps.bare": [
+   40,
+   40,
+   5,
+   40
+  ],
+  "ps.meta": [
+   5,
+   40,
+   40,
+   40
+  ]
+ },
+ "shift": [
+  {
+   "len": 2,
+   "names": "ip ver/ihl",
+   "off": 0,
+   "pos": 14,
+   "target": "pppoe ver/type + pppoe code"
+  },
+  {
+   "len": 1,
+   "names": "ip tos",
+   "off": 1,
+   "pos": 15,
+   "target": "pppoe code"
+  },
+  {
+   "len": 2,
+   "names": "ip id",
+   "off": 4,
+   "pos": 18,
+   "target": "pppoe length"
+  },
+  {
+   "len": 1,
+   "names": "ip ttl",
+   "off": 8,
+   "pos": 22,
+   "target": "ip ver/ihl"
+  },
+  {
+   "len": 2,
+   "names": "ip ttl (csum fixup)",
+   "off": 8,
+   "pos": 22,
+   "target": "ip ver/ihl + ip tos"
+  },
+  {
+   "len": 1,
+   "names": "ip checksum",
+   "off": 10,
+   "pos": 24,
+   "target": "ip tot_len"
+  },
+  {
+   "len": 2,
+   "names": "ip checksum",
+   "off": 10,
+   "pos": 24,
+   "target": "ip tot_len"
+  },
+  {
+   "len": 4,
+   "names": "ip checksum + saddr[0:2]",
+   "off": 10,
+   "pos": 24,
+   "target": "ip tot_len + ip id"
+  },
+  {
+   "len": 1,
+   "names": "ip saddr",
+   "off": 12,
+   "pos": 26,
+   "target": "ip id"
+  },
+  {
+   "len": 2,
+   "names": "ip saddr",
+   "off": 12,
+   "pos": 26,
+   "target": "ip id"
+  },
+  {
+   "len": 4,
+   "names": "ip saddr",
+   "off": 12,
+   "pos": 26,
+   "target": "ip id + ip frag_off"
+  },
+  {
+   "len": 1,
+   "names": "ip daddr",
+   "off": 16,
+   "pos": 30,
+   "target": "ip ttl"
+  },
+  {
+   "len": 2,
+   "names": "ip daddr",
+   "off": 16,
+   "pos": 30,
+   "target": "ip ttl + ip proto"
+  },
+  {
+   "len": 4,
+   "names": "ip daddr",
+   "off": 16,
+   "pos": 30,
+   "target": "ip ttl + ip proto + ip checksum"
+  }
+ ],
+ "store_grid": {
+  "bare": [],
+  "meta": [
+   [
+    0,
+    2
+   ],
+   [
+    1,
+    1
+   ],
+   [
+    4,
+    2
+   ],
+   [
+    8,
+    1
+   ],
+   [
+    8,
+    2
+   ],
+   [
+    10,
+    1
+   ],
+   [
+    10,
+    2
+   ],
+   [
+    10,
+    4
+   ],
+   [
+    12,
+    1
+   ],
+   [
+    12,
+    2
+   ],
+   [
+    12,
+    4
+   ],
+   [
+    16,
+    1
+   ],
+   [
+    16,
+    2
+   ],
+   [
+    16,
+    4
+   ]
+  ]
+ },
+ "title": "PPPoE is the second carrier of pkt->nhoff -- the read moves eight bytes and the store does not -- and the ARP frame the guard approves into invalidity, followed to the receiver",
+ "turn": 563
+}

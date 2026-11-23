@@ -1,0 +1,1850 @@
+===== LETTER_SECTION_F48.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload: a static transport-store check is enforced at runtime,
+ and 14 nft spellings die silently (`tcp flags set` regressed in v7.3)
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+References: <the same Message-Id>
+
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+Theme: `meta protocol` on a PPPoE frame computes one number and two bases read
+it differently -- and at an egress door the difference decides whether the frame
+is refused or rewritten in its real transport header.
+
+No diff below: this measures the guard as it stands and proposes no change.
+
+Linux 7.3.4, nftables in the initial user namespace, one packet at a time, one
+rule at a time.  The frame is built by the kernel: a PF_PPPOX session socket
+(sid 99) bound to a veth, `send()` hands it `00 57` + IPv6/UDP, `pppoe_sendmsg()`
+adds the session header and the Ethernet header.  On the wire the IPv6 header is
+at offset 22 and `skb_network_offset` is 14, because `skb_reset_network_header()`
+runs before `dev_hard_header()`.
+
+`nft_meta_pktinfo_may_update()` computes `nhoff = 8 + skb_network_offset` = 22.
+`__nft_set_pktinfo_ipv6_validate()` then reads the version byte at
+`skb_network_offset + nhoff` = 36 (which is `saddr[6]`) while
+`ipv6_find_hdr()` starts the walk at `nhoff` = 22 (the real header).  The same
+expression therefore gives the transport base the right answer and the network
+base the wrong one; and when the version check fails,
+`nft_set_pktinfo_unspec()` resets `nhoff` to 0, so `@nh` silently falls back to
+the PPPoE header.
+
+Measured on that door (25 arms x 2 boots):
+
+  - `meta protocol` reports `0x86dd` and `meta l4proto` reports nothing;
+  - `@nh,7,1` and `@th,0,2` are both refused, for two different reasons
+    (`nft_nh_write_ok_netdev()` has no `ETH_P_PPP_SES` case; `pkt->flags` is 0);
+  - with `0x60` at offset 36 in the frame's own source address the version
+    check passes, and the same `@th,0,2` write lands at offset 62 -- the real
+    UDP source port -- while `@nh,0,4` reads the attacker's four bytes at 36;
+  - at the ingress hook of the same device, with the same bytes, `@nh,7,1` is
+    accepted (the guard is a constant there) and lands in the PPP protocol
+    field.
+
+The same instrument closes the transport base for plain IPv6: `@th,0,2` lands
+at `14 + 40` at local_out, postrouting and the netdev egress hook, the local
+class is delivered with the written source port, the forwarded class dies on the
+UDPv6 checksum until `csum type inet` (`csum_offset 6`) is added, and
+`meta l4proto` reports 51 for AH (the walk stops on the auth header) and 17
+through a routing header.
+
+Not a vulnerability: the rules are installed by root in the initial user
+namespace.  The report is about a guard whose coordinate depends on the hook and
+about a validation that looks at one place while the walk parses another.
+
+
+===== SUMMARY.md =====
+# F48 - IPv6 inside PPPoE at an egress door, and @th where the walk meets the doors
+
+Kernel `7.3.4-T563` (`1efbc957...2033`), the image of F41-F47; no new build.
+Turn 570.  Two debts, both named at the end of 569.
+
+## 1. Debt 1: `meta protocol` gives the same number to two bases, and one of them
+##    reads it twice
+
+`nft_meta_pktinfo_may_update()` on an `ETH_P_PPP_SES` frame computes
+`nhoff = PPPOE_SES_HLEN + skb_network_offset(skb)` = `8 + noff`.  Inside
+`__nft_set_pktinfo_ipv6_validate()` that one number is used in two places:
+
+```
+ip6h  = skb_header_pointer(skb, skb_network_offset + nhoff, ...)   /* version check */
+thoff = nhoff;  ipv6_find_hdr(skb, &thoff, ...)                    /* the walk        */
+```
+
+On **ingress** `skb_network_offset` is 0 (`eth_type_trans` pulled the Ethernet
+header), so the version check reads the real IPv6 header at 8 and the walk
+starts at 8: both right.  On **egress** the skb is the one `pppoe_sendmsg()`
+built -- `skb_reset_network_header()` after the PPPoE push, then 14 bytes of
+Ethernet -- so `skb_network_offset = 14`, the version check reads
+`14 + 22 = 36`, and the walk still starts at 22.  The same expression, the same
+number, two different answers.
+
+The writes never add `nhoff` at all (`nft_payload_set_eval` uses
+`skb_network_offset + off`), so on this frame they land 8 bytes early, in the
+PPPoE session header -- the F41 coordinate, now on the transmit side.
+
+## 2. What the egress door did with one frame and one cell
+
+The frame: a real PPPoE session socket (`PF_PPPOX`, `PX_PROTO_OE`, sid 99)
+bound to `x0`; `send()` hands it `00 57` + IPv6/UDP, the kernel builds the rest.
+88 bytes on the wire, the IPv6 header at 22.  Control on the same door: a plain
+IPv6 datagram from a local socket (80 bytes, header at 14).  Second control:
+the same PPPoE bytes injected on `x1`, so the *ingress* hook of `x0` sees them.
+
+| door | arm | send | meta | cell | cntp | cnts | s[6:8] | s[54:56] | s[62:64] | tap[21] | tap[54:56] | tap[62:64] |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| egr | ctl_plain | plain | - | - | 1 | 1 | 62cf | 9c40 | 7777 | 40 | 9c40 | 7777 |
+| egr | ctl_ppp | pppoe | - | - | 1 | 1 | 62cf | 1819 | 9c40 | 57 | 1819 | 9c40 |
+| egr | proto_plain | plain | proto  | - | 1 | 1 | 62cf | 9c40 | 7777 | 40 | 9c40 | 7777 |
+| egr | proto_ppp | pppoe | proto  | - | 1 | 1 | 62cf | 1819 | 9c40 | 57 | 1819 | 9c40 |
+| egr | l4_plain | plain | l4  | - | 1 | 1 | 62cf | 9c40 | 7777 | 40 | 9c40 | 7777 |
+| egr | l4_ppp | pppoe | l4  | - | 1 | 0 |  |  |  | 57 | 1819 | 9c40 |
+| egr | nh0_ppp | pppoe | - | - | 1 | 1 | 62cf | 1819 | 9c40 | 57 | 1819 | 9c40 |
+| egr | nh_m_ppp | pppoe | proto  | - | 1 | 0 |  |  |  | 57 | 1819 | 9c40 |
+| egr | nhw_plain | plain | - | @nh,7,1 | 1 | 1 | 62cf | 9c40 | 7777 | 90 | 9c40 | 7777 |
+| egr | nhw_ppp | pppoe | - | @nh,7,1 | 1 | 0 |  |  |  | 57 | 1819 | 9c40 |
+| egr | thw_plain | plain | - | @th,0,2 | 1 | 1 | 62cf | 9091 | 7777 | 40 | 9091 | 7777 |
+| egr | thw_ppp | pppoe | - | @th,0,2 | 1 | 0 |  |  |  | 57 | 1819 | 9c40 |
+| egr | thr_plain | plain | - | @th,0,2 | 1 | 1 | 62cf | 9c40 | 7777 | 40 | 9c40 | 7777 |
+| egr | thw_ppp_m | pppoe | proto  | @th,0,2 | 1 | 0 |  |  |  | 57 | 1819 | 9c40 |
+| egr | fak_l4 | pppoe | proto l4  | - | 1 | 1 | 62cf | 1718 | 9c40 | 57 | 1718 | 9c40 |
+| egr | fak_nh | pppoe | proto  | - | 1 | 1 | 62cf | 1718 | 9c40 | 57 | 1718 | 9c40 |
+| egr | fak_thw | pppoe | proto  | @th,0,2 | 1 | 1 | 62cf | 1718 | 9091 | 57 | 1718 | 9091 |
+| ing | in_ctl | inject | - | - | 1 | 1 | 0057 | 41bc | 7777 | 57 | 1819 | 9c40 |
+| ing | in_nhw | inject | - | @nh,7,1 | 1 | 1 | 0090 | 41bc | 7777 | 57 | 1819 | 9c40 |
+| ing | in_rdnh | inject | proto  | - | 1 | 1 | 0057 | 41bc | 7777 | 57 | 1819 | 9c40 |
+| ing | in_thw | inject | - | @th,0,2 | 1 | 0 |  |  |  | 57 | 1819 | 9c40 |
+| ing | in_thw_m | inject | proto  | @th,0,2 | 1 | 1 | 0057 | 41bc | 7777 | 57 | 1819 | 9c40 |
+| ing | in_rdth_m | inject | proto  | @th,0,2 | 1 | 1 | 0057 | 41bc | 7777 | 57 | 1819 | 9c40 |
+| ing | in_rdth | inject | - | @th,0,2 | 1 | 0 |  |  |  | 57 | 1819 | 9c40 |
+| egr | ctl_ppp | pppoe | - | - | 1 | 1 | 62cf | 1819 | 9c40 | 57 | 1819 | 9c40 |
+
+Four measured statements, each a row of that table:
+
+* **`meta protocol` reports the inner protocol and loses the coordinate.**
+  `proto_ppp` matches `0x86dd` (`nf_flow_pppoe_proto()` reads the PPP field
+  through the MAC header), but validation fails at 36 and
+  `nft_set_pktinfo_unspec()` resets `nhoff` to 0: `nh_m_ppp` compares `@nh,0,4`
+  with `06 07 08 09` and does not match, because the read landed at 14, the
+  PPPoE header.  `l4_ppp` does not match 17 at all.
+* **Both writes are refused, and for two different reasons.**  `nhw_ppp`:
+  `nft_nh_write_ok_netdev()` switches on `skb->protocol` and has no
+  `ETH_P_PPP_SES` case.  `thw_ppp`: `pkt->flags` is 0 after `unspec`.  The wire
+  is unchanged in both (`tap[54:56] = 18 19`, `tap[62:64] = 9c 40`).
+* **The refusal is a property of one byte in the sender's own address.**  The
+  crafted frame carries `0x60` at 36 (`saddr[6]`) and a payload length at 38;
+  validation passes, the walk still starts at 22, so `fak_l4` reports 17,
+  `fak_nh` reads `60 00 00 08` -- the attacker's bytes -- at 36, and `fak_thw`
+  writes `9091` at 62: **the real transport header** (`tap[62:64] = 90 91`).
+  One rule, one cell, one frame; the difference between refused and landed is
+  four bytes of the source address.
+* **Ingress accepts what egress refuses.**  `in_nhw` writes at `data + 7`, the
+  PPP protocol field (`s[6:8] = 00 90`), because at `NF_NETDEV_INGRESS`
+  `nft_nh_write_ok()` returns a constant true.  `in_thw_m` writes at
+  `data + 48`, the real sport, once `meta protocol` has set the flags.  Without
+  it (`in_thw`, `in_rdth`) the transport base is refused at ingress too.
+
+And one measurement about the instrument itself: on the receive path the
+AF_PACKET copy is the frame **before** the rule wrote it (`in_nhw`:
+`s[6:8] = 00 90`, `tap[21] = 57`), while on the transmit path it is the frame
+after (`fak_thw`: both 90 91).  A tap is not a witness of what a rule did on
+ingress; the NFLOG payload at the same rule is.
+
+## 3. Debt 2: `@th` in the v6 mode -- the walk and the egress doors meet
+
+Six door/class pairs of the F46/F47 harness, five frame shapes (bare,
+hop-by-hop, hop-by-hop + dest-opts, AH, routing header), one cell `@th,0,2`.
+
+| door | cls | shape | arm | l4cmp | rcs | lives | tapn | tap[40:42] | tap[54:56] | tap[62:64] | u6n | u6sport | u6err |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| out | loc | bare | thw | -1 | 0 | 1 | 1 | 0000 | 9091 | 7777 | 1 | 37009 | 0 |
+| post | loc | bare | thw | -1 | 0 | 1 | 1 | 0000 | 9091 | 7777 | 1 | 37009 | 0 |
+| egr | loc | bare | thw | -1 | 0 | 1 | 1 | 0000 | 9091 | 7777 | 1 | 37009 | 0 |
+| pre | fwd | bare | thw | -1 | 0 | 1 | 1 | 0000 | 9091 | 7777 | 0 | -1 | 1 |
+| fwd | fwd | bare | thw | -1 | 0 | 1 | 1 | 0000 | 9091 | 7777 | 0 | -1 | 1 |
+| egr | fwd | bare | thw | -1 | 0 | 1 | 1 | 0000 | 9091 | 7777 | 0 | -1 | 1 |
+| out | loc | hbh | thw | -1 | 0 | 1 | 1 | 0000 | 9091 | 7777 | 1 | 37009 | 0 |
+| post | loc | hbh | thw | -1 | 0 | 1 | 1 | 0000 | 9091 | 7777 | 1 | 37009 | 0 |
+| egr | loc | hbh | thw | -1 | 0 | 1 | 1 | 0000 | 9091 | 7777 | 1 | 37009 | 0 |
+| pre | fwd | hbh | thw | -1 | 0 | 1 | 0 | - | - | - | 0 | -1 | 1 |
+| fwd | fwd | hbh | thw | -1 | 0 | 1 | 0 | - | - | - | 0 | -1 | 1 |
+| egr | fwd | hbh | thw | -1 | 0 | 1 | 0 | - | - | - | 0 | -1 | 1 |
+| out | loc | hbd | thw | -1 | 0 | 1 | 1 | 0000 | 9091 | 7777 | 1 | 37009 | 0 |
+| post | loc | hbd | thw | -1 | 0 | 1 | 1 | 0000 | 9091 | 7777 | 1 | 37009 | 0 |
+| egr | loc | hbd | thw | -1 | 0 | 1 | 1 | 0000 | 9091 | 7777 | 1 | 37009 | 0 |
+| pre | fwd | hbd | thw | -1 | 0 | 1 | 0 | - | - | - | 0 | -1 | 1 |
+| fwd | fwd | hbd | thw | -1 | 0 | 1 | 0 | - | - | - | 0 | -1 | 1 |
+| egr | fwd | hbd | thw | -1 | 0 | 1 | 0 | - | - | - | 0 | -1 | 1 |
+| pre | fwd | ah | thw | -1 | 0 | 1 | 0 | - | - | - | 0 | -1 | 0 |
+| fwd | fwd | ah | thw | -1 | 0 | 1 | 0 | - | - | - | 0 | -1 | 0 |
+| pre | fwd | rh | thw | -1 | 0 | 1 | 0 | - | - | - | 0 | -1 | 1 |
+| fwd | fwd | rh | thw | -1 | 0 | 1 | 0 | - | - | - | 0 | -1 | 1 |
+| out | loc | bare | thr | -1 | 0 | 1 | 1 | 0000 | 9c40 | 7777 | 1 | 40000 | 0 |
+| post | loc | bare | thr | -1 | 0 | 1 | 1 | 0000 | 9c40 | 7777 | 1 | 40000 | 0 |
+| egr | loc | bare | thr | -1 | 0 | 1 | 1 | 0000 | 9c40 | 7777 | 1 | 40000 | 0 |
+| pre | fwd | bare | thr | -1 | 0 | 1 | 1 | 0000 | 9c40 | 7777 | 1 | 40000 | 0 |
+| fwd | fwd | bare | thr | -1 | 0 | 1 | 1 | 0000 | 9c40 | 7777 | 1 | 40000 | 0 |
+| egr | fwd | bare | thr | -1 | 0 | 1 | 1 | 0000 | 9c40 | 7777 | 1 | 40000 | 0 |
+| pre | fwd | hbh | l4_17 | 17 | 0 | 1 | 0 | - | - | - | 0 | -1 | 1 |
+| pre | fwd | hbh | l4_51 | 51 | 0 | 0 | 0 | - | - | - | 1 | 40000 | 0 |
+| pre | fwd | hbd | l4_17 | 17 | 0 | 1 | 0 | - | - | - | 0 | -1 | 1 |
+| pre | fwd | hbd | l4_51 | 51 | 0 | 0 | 0 | - | - | - | 1 | 40000 | 0 |
+| pre | fwd | ah | l4_17 | 17 | 0 | 0 | 0 | - | - | - | 0 | -1 | 0 |
+| pre | fwd | ah | l4_51 | 51 | 0 | 1 | 0 | - | - | - | 0 | -1 | 0 |
+| pre | fwd | rh | l4_17 | 17 | 0 | 1 | 0 | - | - | - | 0 | -1 | 1 |
+| pre | fwd | rh | l4_51 | 51 | 0 | 0 | 0 | - | - | - | 1 | 40000 | 0 |
+| pre | fwd | bare | cs | -1 | 0 | 1 | 1 | 0000 | 9091 | 7777 | 1 | 37009 | 0 |
+| fwd | fwd | bare | cs | -1 | 0 | 1 | 1 | 0000 | 9091 | 7777 | 1 | 37009 | 0 |
+| egr | fwd | bare | cs | -1 | 0 | 1 | 1 | 0000 | 9091 | 7777 | 1 | 37009 | 0 |
+| pre | fwd | hbh | cs | -1 | 0 | 1 | 0 | - | - | - | 1 | 37009 | 0 |
+| pre | fwd | hbd | cs | -1 | 0 | 1 | 0 | - | - | - | 1 | 37009 | 0 |
+| pre | fwd | ah | cs | -1 | 0 | 1 | 0 | - | - | - | 0 | -1 | 0 |
+| pre | fwd | rh | cs | -1 | 0 | 1 | 0 | - | - | - | 1 | 37009 | 0 |
+
+* **The base is right everywhere.**  `thw` on the local class lands at frame
+  54 = `14 + 40` at all three doors (the egress door sees
+  `skb_network_offset = 14` and `thoff = 54`; the layer-3 doors see 0 and 40),
+  and the receiver reports the written source port `37009`.  On the forwarded
+  class the same write at the same byte breaks the UDPv6 checksum
+  (`u6err = 1`, no delivery) and `csum type inet` with `csum_offset 6` repairs
+  it: delivered, `u6sport = 37009`.  Nothing in this base depends on the door.
+* **The walk's two named exceptions are measured.**  `meta l4proto` reports 17
+  through a hop-by-hop, through hop-by-hop + dest-opts and **through a routing
+  header** (segments_left 0, `IP6_FH_F_SKIP_RH` not set), and **51** for the AH
+  shape: `IP6_FH_F_AUTH` stops the walk on the authentication header, so the
+  transport base points at the AH header and nothing after it is reachable.
+  With `csum inet` the three non-AH shapes deliver to the written sport
+  (`u6sport = 37009`) -- the receiver names the coordinate without a tap --
+  and the AH shape delivers nothing either way.
+* **What is not measured here:** the child's packet socket did not capture the
+  three extension shapes (`tapn = 0`); their write position is proven by the
+  receiver's source port, not by a wire hexdump.
+
+## 4. Errors of the turn, all mine
+
+1. `A6_P_FS` put `0x60` at `saddr[8]` instead of `saddr[6]`; the crafted frame
+   was crafted at the wrong byte and all three `fak_*` arms read 0.  Found by
+   reading the first smoke against the model, before any number reached a
+   document.
+2. The plain control datagram carried the base helper's payload while the tap
+   needle looked for mine, so every `*_plain` arm had `tapn = 0` and I read it
+   as "no frame on the wire".
+3. `in_rdth` inherited `meta_proto = 1` from the arm before it and measured the
+   same thing twice.
+4. The `cs` arms used `csum type 6` from the prose of 565; the uapi value is
+   `NFT_PAYLOAD_CSUM_INET = 1`, and 6 returned `-EOPNOTSUPP` on every one of
+   them in the first smoke.
+5. The verifier's first three versions: the walk returned the IPv6 header
+   offset instead of the transport offset; `ipv6_find_hdr()` with `*offset = 0`
+   starts at `skb_network_offset`, not at 0; the guard reads `skb->protocol`,
+   not the inner ethertype.  Each was a red battery on correct data.
+6. Two smokes ran at once (a `nohup` that "failed" had started), and their two
+   boots interleaved into one log; the arms looked randomly duplicated.
+7. `f570_selftest` caught two real holes in the verifier (`u6sport` was never
+   checked on the local class; the printed `F570 FRAME` line was not compared
+   with the frame at the door) and one crash (`MUT_tapbyte`).
+
+## 5. How it is checked
+
+| | |
+|---|---|
+| `tools/verify570.py` | **753 checks, 0 discrepancies** over both boots -- provenance (the kernel sha in the header against the file, the initramfs hash, the differ **extracted from the initramfs** and compared byte for byte), the printed frames against their own bytes, `__nft_set_pktinfo_ipv6_validate()` and `ipv6_find_hdr()` ported to Python, all 25 ppp6e arms and all 43 th6 arms modelled per door and per envelope, every accepted write checked against the byte at the position the model predicts, every refused arm checked for an unchanged wire, the rx/tx tap asymmetry, the counters, and 68/68 derived fields identical across the two boots |
+| `tools/verify570_selftest.sh` | **12/12** -- the baseline is green and each of twelve single-field mutations reddens its own check; a crash is not counted as a caught mutation |
+| `tools/f570_summary.py` | the tables above are generated from `logs/f48_rep{1,2}.log`, not typed |
+| collection | regenerated: the F48 files are in it |
+
+**Not a vulnerability:** every rule here is installed by root in the initial
+user namespace.  The consequences measured are: a write that lands eight bytes
+early in the PPPoE session header on the transmit side, a read base that doubles
+`skb_network_offset` inside one expression, a frame whose refusal depends on the
+sender's own address bytes, and a transport base that is reachable on ingress
+and not on egress for the same bytes.
+
+
+===== summary.json =====
+{
+ "ppp6e": [
+  {
+   "door": "egr",
+   "arm": "ctl_plain",
+   "send": "0",
+   "shape": "0",
+   "meta_proto": false,
+   "meta_l4": false,
+   "nh_read": false,
+   "write": false,
+   "read": false,
+   "base": "0",
+   "off": "0",
+   "len": "0",
+   "imm": "-",
+   "cntp": "1",
+   "cnts": "1",
+   "p_len": 80,
+   "s_len": 80,
+   "tap_len": 80,
+   "s_sport": "9c40",
+   "s_ppp_proto": "62cf",
+   "s_62": "7777",
+   "tap_21": "40",
+   "tap_54": "9c40",
+   "tap_62": "7777"
+  },
+  {
+   "door": "egr",
+   "arm": "ctl_ppp",
+   "send": "1",
+   "shape": "0",
+   "meta_proto": false,
+   "meta_l4": false,
+   "nh_read": false,
+   "write": false,
+   "read": false,
+   "base": "0",
+   "off": "0",
+   "len": "0",
+   "imm": "-",
+   "cntp": "1",
+   "cnts": "1",
+   "p_len": 88,
+   "s_len": 88,
+   "tap_len": 88,
+   "s_sport": "1819",
+   "s_ppp_proto": "62cf",
+   "s_62": "9c40",
+   "tap_21": "57",
+   "tap_54": "1819",
+   "tap_62": "9c40"
+  },
+  {
+   "door": "egr",
+   "arm": "proto_plain",
+   "send": "0",
+   "shape": "0",
+   "meta_proto": true,
+   "meta_l4": false,
+   "nh_read": false,
+   "write": false,
+   "read": false,
+   "base": "0",
+   "off": "0",
+   "len": "0",
+   "imm": "-",
+   "cntp": "1",
+   "cnts": "1",
+   "p_len": 80,
+   "s_len": 80,
+   "tap_len": 80,
+   "s_sport": "9c40",
+   "s_ppp_proto": "62cf",
+   "s_62": "7777",
+   "tap_21": "40",
+   "tap_54": "9c40",
+   "tap_62": "7777"
+  },
+  {
+   "door": "egr",
+   "arm": "proto_ppp",
+   "send": "1",
+   "shape": "0",
+   "meta_proto": true,
+   "meta_l4": false,
+   "nh_read": false,
+   "write": false,
+   "read": false,
+   "base": "0",
+   "off": "0",
+   "len": "0",
+   "imm": "-",
+   "cntp": "1",
+   "cnts": "1",
+   "p_len": 88,
+   "s_len": 88,
+   "tap_len": 88,
+   "s_sport": "1819",
+   "s_ppp_proto": "62cf",
+   "s_62": "9c40",
+   "tap_21": "57",
+   "tap_54": "1819",
+   "tap_62": "9c40"
+  },
+  {
+   "door": "egr",
+   "arm": "l4_plain",
+   "send": "0",
+   "shape": "0",
+   "meta_proto": false,
+   "meta_l4": true,
+   "nh_read": false,
+   "write": false,
+   "read": false,
+   "base": "0",
+   "off": "0",
+   "len": "0",
+   "imm": "-",
+   "cntp": "1",
+   "cnts": "1",
+   "p_len": 80,
+   "s_len": 80,
+   "tap_len": 80,
+   "s_sport": "9c40",
+   "s_ppp_proto": "62cf",
+   "s_62": "7777",
+   "tap_21": "40",
+   "tap_54": "9c40",
+   "tap_62": "7777"
+  },
+  {
+   "door": "egr",
+   "arm": "l4_ppp",
+   "send": "1",
+   "shape": "0",
+   "meta_proto": false,
+   "meta_l4": true,
+   "nh_read": false,
+   "write": false,
+   "read": false,
+   "base": "0",
+   "off": "0",
+   "len": "0",
+   "imm": "-",
+   "cntp": "1",
+   "cnts": "0",
+   "p_len": 88,
+   "s_len": 0,
+   "tap_len": 88,
+   "s_sport": "",
+   "s_ppp_proto": "",
+   "s_62": "",
+   "tap_21": "57",
+   "tap_54": "1819",
+   "tap_62": "9c40"
+  },
+  {
+   "door": "egr",
+   "arm": "nh0_ppp",
+   "send": "1",
+   "shape": "0",
+   "meta_proto": false,
+   "meta_l4": false,
+   "nh_read": true,
+   "write": false,
+   "read": false,
+   "base": "0",
+   "off": "0",
+   "len": "0",
+   "imm": "-",
+   "cntp": "1",
+   "cnts": "1",
+   "p_len": 88,
+   "s_len": 88,
+   "tap_len": 88,
+   "s_sport": "1819",
+   "s_ppp_proto": "62cf",
+   "s_62": "9c40",
+   "tap_21": "57",
+   "tap_54": "1819",
+   "tap_62": "9c40"
+  },
+  {
+   "door": "egr",
+   "arm": "nh_m_ppp",
+   "send": "1",
+   "shape": "0",
+   "meta_proto": true,
+   "meta_l4": false,
+   "nh_read": true,
+   "write": false,
+   "read": false,
+   "base": "0",
+   "off": "0",
+   "len": "0",
+   "imm": "-",
+   "cntp": "1",
+   "cnts": "0",
+   "p_len": 88,
+   "s_len": 0,
+   "tap_len": 88,
+   "s_sport": "",
+   "s_ppp_proto": "",
+   "s_62": "",
+   "tap_21": "57",
+   "tap_54": "1819",
+   "tap_62": "9c40"
+  },
+  {
+   "door": "egr",
+   "arm": "nhw_plain",
+   "send": "0",
+   "shape": "0",
+   "meta_proto": false,
+   "meta_l4": false,
+   "nh_read": false,
+   "write": true,
+   "read": false,
+   "base": "1",
+   "off": "7",
+   "len": "1",
+   "imm": "90",
+   "cntp": "1",
+   "cnts": "1",
+   "p_len": 80,
+   "s_len": 80,
+   "tap_len": 80,
+   "s_sport": "9c40",
+   "s_ppp_proto": "62cf",
+   "s_62": "7777",
+   "tap_21": "90",
+   "tap_54": "9c40",
+   "tap_62": "7777"
+  },
+  {
+   "door": "egr",
+   "arm": "nhw_ppp",
+   "send": "1",
+   "shape": "0",
+   "meta_proto": false,
+   "meta_l4": false,
+   "nh_read": false,
+   "write": true,
+   "read": false,
+   "base": "1",
+   "off": "7",
+   "len": "1",
+   "imm": "90",
+   "cntp": "1",
+   "cnts": "0",
+   "p_len": 88,
+   "s_len": 0,
+   "tap_len": 88,
+   "s_sport": "",
+   "s_ppp_proto": "",
+   "s_62": "",
+   "tap_21": "57",
+   "tap_54": "1819",
+   "tap_62": "9c40"
+  },
+  {
+   "door": "egr",
+   "arm": "thw_plain",
+   "send": "0",
+   "shape": "0",
+   "meta_proto": false,
+   "meta_l4": false,
+   "nh_read": false,
+   "write": true,
+   "read": false,
+   "base": "2",
+   "off": "0",
+   "len": "2",
+   "imm": "9091",
+   "cntp": "1",
+   "cnts": "1",
+   "p_len": 80,
+   "s_len": 80,
+   "tap_len": 80,
+   "s_sport": "9091",
+   "s_ppp_proto": "62cf",
+   "s_62": "7777",
+   "tap_21": "40",
+   "tap_54": "9091",
+   "tap_62": "7777"
+  },
+  {
+   "door": "egr",
+   "arm": "thw_ppp",
+   "send": "1",
+   "shape": "0",
+   "meta_proto": false,
+   "meta_l4": false,
+   "nh_read": false,
+   "write": true,
+   "read": false,
+   "base": "2",
+   "off": "0",
+   "len": "2",
+   "imm": "9091",
+   "cntp": "1",
+   "cnts": "0",
+   "p_len": 88,
+   "s_len": 0,
+   "tap_len": 88,
+   "s_sport": "",
+   "s_ppp_proto": "",
+   "s_62": "",
+   "tap_21": "57",
+   "tap_54": "1819",
+   "tap_62": "9c40"
+  },
+  {
+   "door": "egr",
+   "arm": "thr_plain",
+   "send": "0",
+   "shape": "0",
+   "meta_proto": false,
+   "meta_l4": false,
+   "nh_read": false,
+   "write": false,
+   "read": true,
+   "base": "2",
+   "off": "0",
+   "len": "2",
+   "imm": "9c40",
+   "cntp": "1",
+   "cnts": "1",
+   "p_len": 80,
+   "s_len": 80,
+   "tap_len": 80,
+   "s_sport": "9c40",
+   "s_ppp_proto": "62cf",
+   "s_62": "7777",
+   "tap_21": "40",
+   "tap_54": "9c40",
+   "tap_62": "7777"
+  },
+  {
+   "door": "egr",
+   "arm": "thw_ppp_m",
+   "send": "1",
+   "shape": "0",
+   "meta_proto": true,
+   "meta_l4": false,
+   "nh_read": false,
+   "write": true,
+   "read": false,
+   "base": "2",
+   "off": "0",
+   "len": "2",
+   "imm": "9091",
+   "cntp": "1",
+   "cnts": "0",
+   "p_len": 88,
+   "s_len": 0,
+   "tap_len": 88,
+   "s_sport": "",
+   "s_ppp_proto": "",
+   "s_62": "",
+   "tap_21": "57",
+   "tap_54": "1819",
+   "tap_62": "9c40"
+  },
+  {
+   "door": "egr",
+   "arm": "fak_l4",
+   "send": "1",
+   "shape": "1",
+   "meta_proto": true,
+   "meta_l4": true,
+   "nh_read": false,
+   "write": false,
+   "read": false,
+   "base": "0",
+   "off": "0",
+   "len": "0",
+   "imm": "-",
+   "cntp": "1",
+   "cnts": "1",
+   "p_len": 88,
+   "s_len": 88,
+   "tap_len": 88,
+   "s_sport": "1718",
+   "s_ppp_proto": "62cf",
+   "s_62": "9c40",
+   "tap_21": "57",
+   "tap_54": "1718",
+   "tap_62": "9c40"
+  },
+  {
+   "door": "egr",
+   "arm": "fak_nh",
+   "send": "1",
+   "shape": "1",
+   "meta_proto": true,
+   "meta_l4": false,
+   "nh_read": true,
+   "write": false,
+   "read": false,
+   "base": "0",
+   "off": "0",
+   "len": "0",
+   "imm": "-",
+   "cntp": "1",
+   "cnts": "1",
+   "p_len": 88,
+   "s_len": 88,
+   "tap_len": 88,
+   "s_sport": "1718",
+   "s_ppp_proto": "62cf",
+   "s_62": "9c40",
+   "tap_21": "57",
+   "tap_54": "1718",
+   "tap_62": "9c40"
+  },
+  {
+   "door": "egr",
+   "arm": "fak_thw",
+   "send": "1",
+   "shape": "1",
+   "meta_proto": true,
+   "meta_l4": false,
+   "nh_read": false,
+   "write": true,
+   "read": false,
+   "base": "2",
+   "off": "0",
+   "len": "2",
+   "imm": "9091",
+   "cntp": "1",
+   "cnts": "1",
+   "p_len": 88,
+   "s_len": 88,
+   "tap_len": 88,
+   "s_sport": "1718",
+   "s_ppp_proto": "62cf",
+   "s_62": "9091",
+   "tap_21": "57",
+   "tap_54": "1718",
+   "tap_62": "9091"
+  },
+  {
+   "door": "ing",
+   "arm": "in_ctl",
+   "send": "2",
+   "shape": "0",
+   "meta_proto": false,
+   "meta_l4": false,
+   "nh_read": false,
+   "write": false,
+   "read": false,
+   "base": "0",
+   "off": "0",
+   "len": "0",
+   "imm": "-",
+   "cntp": "1",
+   "cnts": "1",
+   "p_len": 74,
+   "s_len": 74,
+   "tap_len": 88,
+   "s_sport": "41bc",
+   "s_ppp_proto": "0057",
+   "s_62": "7777",
+   "tap_21": "57",
+   "tap_54": "1819",
+   "tap_62": "9c40"
+  },
+  {
+   "door": "ing",
+   "arm": "in_nhw",
+   "send": "2",
+   "shape": "0",
+   "meta_proto": false,
+   "meta_l4": false,
+   "nh_read": false,
+   "write": true,
+   "read": false,
+   "base": "1",
+   "off": "7",
+   "len": "1",
+   "imm": "90",
+   "cntp": "1",
+   "cnts": "1",
+   "p_len": 74,
+   "s_len": 74,
+   "tap_len": 88,
+   "s_sport": "41bc",
+   "s_ppp_proto": "0090",
+   "s_62": "7777",
+   "tap_21": "57",
+   "tap_54": "1819",
+   "tap_62": "9c40"
+  },
+  {
+   "door": "ing",
+   "arm": "in_rdnh",
+   "send": "2",
+   "shape": "0",
+   "meta_proto": true,
+   "meta_l4": false,
+   "nh_read": true,
+   "write": false,
+   "read": false,
+   "base": "0",
+   "off": "0",
+   "len": "0",
+   "imm": "-",
+   "cntp": "1",
+   "cnts": "1",
+   "p_len": 74,
+   "s_len": 74,
+   "tap_len": 88,
+   "s_sport": "41bc",
+   "s_ppp_proto": "0057",
+   "s_62": "7777",
+   "tap_21": "57",
+   "tap_54": "1819",
+   "tap_62": "9c40"
+  },
+  {
+   "door": "ing",
+   "arm": "in_thw",
+   "send": "2",
+   "shape": "0",
+   "meta_proto": false,
+   "meta_l4": false,
+   "nh_read": false,
+   "write": true,
+   "read": false,
+   "base": "2",
+   "off": "0",
+   "len": "2",
+   "imm": "9091",
+   "cntp": "1",
+   "cnts": "0",
+   "p_len": 74,
+   "s_len": 0,
+   "tap_len": 88,
+   "s_sport": "",
+   "s_ppp_proto": "",
+   "s_62": "",
+   "tap_21": "57",
+   "tap_54": "1819",
+   "tap_62": "9c40"
+  },
+  {
+   "door": "ing",
+   "arm": "in_thw_m",
+   "send": "2",
+   "shape": "0",
+   "meta_proto": true,
+   "meta_l4": false,
+   "nh_read": false,
+   "write": true,
+   "read": false,
+   "base": "2",
+   "off": "0",
+   "len": "2",
+   "imm": "9091",
+   "cntp": "1",
+   "cnts": "1",
+   "p_len": 74,
+   "s_len": 74,
+   "tap_len": 88,
+   "s_sport": "41bc",
+   "s_ppp_proto": "0057",
+   "s_62": "7777",
+   "tap_21": "57",
+   "tap_54": "1819",
+   "tap_62": "9c40"
+  },
+  {
+   "door": "ing",
+   "arm": "in_rdth_m",
+   "send": "2",
+   "shape": "0",
+   "meta_proto": true,
+   "meta_l4": false,
+   "nh_read": false,
+   "write": false,
+   "read": true,
+   "base": "2",
+   "off": "0",
+   "len": "2",
+   "imm": "9c40",
+   "cntp": "1",
+   "cnts": "1",
+   "p_len": 74,
+   "s_len": 74,
+   "tap_len": 88,
+   "s_sport": "41bc",
+   "s_ppp_proto": "0057",
+   "s_62": "7777",
+   "tap_21": "57",
+   "tap_54": "1819",
+   "tap_62": "9c40"
+  },
+  {
+   "door": "ing",
+   "arm": "in_rdth",
+   "send": "2",
+   "shape": "0",
+   "meta_proto": false,
+   "meta_l4": false,
+   "nh_read": false,
+   "write": false,
+   "read": true,
+   "base": "2",
+   "off": "0",
+   "len": "2",
+   "imm": "9c40",
+   "cntp": "1",
+   "cnts": "0",
+   "p_len": 74,
+   "s_len": 0,
+   "tap_len": 88,
+   "s_sport": "",
+   "s_ppp_proto": "",
+   "s_62": "",
+   "tap_21": "57",
+   "tap_54": "1819",
+   "tap_62": "9c40"
+  },
+  {
+   "door": "egr",
+   "arm": "ctl_ppp",
+   "send": "1",
+   "shape": "0",
+   "meta_proto": false,
+   "meta_l4": false,
+   "nh_read": false,
+   "write": false,
+   "read": false,
+   "base": "0",
+   "off": "0",
+   "len": "0",
+   "imm": "-",
+   "cntp": "1",
+   "cnts": "1",
+   "p_len": 88,
+   "s_len": 88,
+   "tap_len": 88,
+   "s_sport": "1819",
+   "s_ppp_proto": "62cf",
+   "s_62": "9c40",
+   "tap_21": "57",
+   "tap_54": "1819",
+   "tap_62": "9c40"
+  }
+ ],
+ "frames": {
+  "ppp": {
+   "len": "88",
+   "hex": "62cf400cb9019e045da4db858864110000630044005760000000001a1140fd0102030405060708090a0b0c0d0e0ffd1112131415161718191a1b1c1d1e1f9c401388001a41bc777777777777777777777777777777777777"
+  },
+  "fake": {
+   "len": "88",
+   "hex": "62cf400cb9019e045da4db858864110000630044005760000000001a1140fd00000000006000000800000000000000081112131415161718191a1b1c1d1e9c401388001a1e05777777777777777777777777777777777777"
+  }
+ },
+ "th6": [
+  {
+   "door": "out",
+   "cls": "loc",
+   "shape": "bare",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9091",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "1",
+   "u6sport": "37009",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "post",
+   "cls": "loc",
+   "shape": "bare",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9091",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "1",
+   "u6sport": "37009",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "egr",
+   "cls": "loc",
+   "shape": "bare",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9091",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "1",
+   "u6sport": "37009",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "bare",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9091",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "1",
+   "deliv": "1"
+  },
+  {
+   "door": "fwd",
+   "cls": "fwd",
+   "shape": "bare",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9091",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "1",
+   "deliv": "1"
+  },
+  {
+   "door": "egr",
+   "cls": "fwd",
+   "shape": "bare",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9091",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "1",
+   "deliv": "1"
+  },
+  {
+   "door": "out",
+   "cls": "loc",
+   "shape": "hbh",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9091",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "1",
+   "u6sport": "37009",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "post",
+   "cls": "loc",
+   "shape": "hbh",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9091",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "1",
+   "u6sport": "37009",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "egr",
+   "cls": "loc",
+   "shape": "hbh",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9091",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "1",
+   "u6sport": "37009",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "hbh",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "1",
+   "deliv": "1"
+  },
+  {
+   "door": "fwd",
+   "cls": "fwd",
+   "shape": "hbh",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "1",
+   "deliv": "1"
+  },
+  {
+   "door": "egr",
+   "cls": "fwd",
+   "shape": "hbh",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "1",
+   "deliv": "1"
+  },
+  {
+   "door": "out",
+   "cls": "loc",
+   "shape": "hbd",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9091",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "1",
+   "u6sport": "37009",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "post",
+   "cls": "loc",
+   "shape": "hbd",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9091",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "1",
+   "u6sport": "37009",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "egr",
+   "cls": "loc",
+   "shape": "hbd",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9091",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "1",
+   "u6sport": "37009",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "hbd",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "1",
+   "deliv": "1"
+  },
+  {
+   "door": "fwd",
+   "cls": "fwd",
+   "shape": "hbd",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "1",
+   "deliv": "1"
+  },
+  {
+   "door": "egr",
+   "cls": "fwd",
+   "shape": "hbd",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "1",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "ah",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "fwd",
+   "cls": "fwd",
+   "shape": "ah",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "rh",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "1",
+   "deliv": "1"
+  },
+  {
+   "door": "fwd",
+   "cls": "fwd",
+   "shape": "rh",
+   "arm": "thw",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "1",
+   "deliv": "1"
+  },
+  {
+   "door": "out",
+   "cls": "loc",
+   "shape": "bare",
+   "arm": "thr",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9c40",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "1",
+   "u6sport": "40000",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "post",
+   "cls": "loc",
+   "shape": "bare",
+   "arm": "thr",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9c40",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "1",
+   "u6sport": "40000",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "egr",
+   "cls": "loc",
+   "shape": "bare",
+   "arm": "thr",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9c40",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "1",
+   "u6sport": "40000",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "bare",
+   "arm": "thr",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9c40",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "1",
+   "u6sport": "40000",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "fwd",
+   "cls": "fwd",
+   "shape": "bare",
+   "arm": "thr",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9c40",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "1",
+   "u6sport": "40000",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "egr",
+   "cls": "fwd",
+   "shape": "bare",
+   "arm": "thr",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9c40",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "1",
+   "u6sport": "40000",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "hbh",
+   "arm": "l4_17",
+   "l4cmp": "17",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "1",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "hbh",
+   "arm": "l4_51",
+   "l4cmp": "51",
+   "base": "2",
+   "rcs": "0",
+   "lives": "0",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "1",
+   "u6sport": "40000",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "hbd",
+   "arm": "l4_17",
+   "l4cmp": "17",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "1",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "hbd",
+   "arm": "l4_51",
+   "l4cmp": "51",
+   "base": "2",
+   "rcs": "0",
+   "lives": "0",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "1",
+   "u6sport": "40000",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "ah",
+   "arm": "l4_17",
+   "l4cmp": "17",
+   "base": "2",
+   "rcs": "0",
+   "lives": "0",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "ah",
+   "arm": "l4_51",
+   "l4cmp": "51",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "rh",
+   "arm": "l4_17",
+   "l4cmp": "17",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "1",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "rh",
+   "arm": "l4_51",
+   "l4cmp": "51",
+   "base": "2",
+   "rcs": "0",
+   "lives": "0",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "1",
+   "u6sport": "40000",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "bare",
+   "arm": "cs",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9091",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "1",
+   "u6sport": "37009",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "fwd",
+   "cls": "fwd",
+   "shape": "bare",
+   "arm": "cs",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9091",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "1",
+   "u6sport": "37009",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "egr",
+   "cls": "fwd",
+   "shape": "bare",
+   "arm": "cs",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "1",
+   "taplen": "80",
+   "tap_54": "9091",
+   "tap_62": "7777",
+   "tap_40": "0000",
+   "u6n": "1",
+   "u6sport": "37009",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "hbh",
+   "arm": "cs",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "1",
+   "u6sport": "37009",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "hbd",
+   "arm": "cs",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "1",
+   "u6sport": "37009",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "ah",
+   "arm": "cs",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "0",
+   "u6sport": "-1",
+   "u6len": "-1",
+   "u6err": "0",
+   "deliv": "1"
+  },
+  {
+   "door": "pre",
+   "cls": "fwd",
+   "shape": "rh",
+   "arm": "cs",
+   "l4cmp": "-1",
+   "base": "2",
+   "rcs": "0",
+   "lives": "1",
+   "nmsg": "1",
+   "tapn": "0",
+   "taplen": "-1",
+   "tap_54": "",
+   "tap_62": "",
+   "tap_40": "",
+   "u6n": "1",
+   "u6sport": "37009",
+   "u6len": "18",
+   "u6err": "0",
+   "deliv": "1"
+  }
+ ],
+ "determinism": {
+  "fields": 68,
+  "same": 68
+ },
+ "turn": 570,
+ "finding": "F48-pppoe-egress",
+ "kernel": "7.3.4-T563",
+ "arms_per_boot": {
+  "ppp6e": 25,
+  "th6": 43
+ },
+ "boots": 2,
+ "id": "F48",
+ "question": "at an egress door, does `meta protocol` put a PPPoE frame into the same coordinate system for the read and the write bases?",
+ "answer_short": "no: it computes nhoff = 8 + skb_network_offset and the version check adds skb_network_offset a second time, so the walk parses at 22 while the version byte is read at 36; the failed validation resets nhoff to 0, both writes are refused, and one byte of the sender own address makes the same @th write land in the real UDP source port"
+}

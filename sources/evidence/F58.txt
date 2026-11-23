@@ -1,0 +1,420 @@
+===== LETTER_SECTION_F58.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload: a static transport-store check is enforced at runtime,
+ and 14 nft spellings die silently (`tcp flags set` regressed in v7.3)
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+References: <the same Message-Id>
+
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+Theme: the four checks that stand between a payload *store* and the frame.  They
+do not answer the same question, and none of them asks the packet's length.  All
+numbers below are measured on 7.3.4 over two boots, 55 traffic arms, one rule per
+arm, two hooks (netdev ingress on a veth, and ip6 prerouting), with the frame's
+bytes read back after the store through NFLOG.
+
+1. nft_ll_write_ok() is an arithmetic comparison, and on ingress there is none.
+
+   net/netfilter/nft_payload.c:986
+       if (nft_in_ingress(pkt->state))
+               return true;
+       return offset <= skb_network_offset(pkt->skb);
+
+   skb_network_offset() is network_header - skb->data, which is 0 at a layer-3
+   door, so with offset = -mac_len + priv->offset the check is exactly
+   "off + len <= mac_len": do not cross the network header.  At ip6 prerouting
+   on a plain ethernet device, of nine cells (off,len = 12..50, 2) exactly one is
+   accepted (12,2) and eight are refused.  At the netdev ingress hook the same
+   expression is accepted for every cell, and the frame's own length is the only
+   bound left:
+
+       @ll,18,2 -> frame bytes 14..15 (the version nibble) -> Ip6InHdrErrors
+       @ll,24,4 -> frame bytes 20..23 (next header, hop limit, source[0..1])
+                   -> Ip6InUnknownProtos
+       @ll,16,2 -> frame bytes 12..13 (the ethertype) and the datagram is still
+                   delivered, because eth_type_trans() already decided
+
+2. Where the tag is a word, the accepted set of (offset,len) is not an interval.
+
+   nft_payload_need_vlan_adjust() sends a store through
+   nft_payload_set_vlan() as soon as off + len > offsetof(struct ethhdr,
+   h_proto) = 12, and that function accepts three pairs before returning
+   "the tag is a word":
+
+       10,2 accepted (frame byte 10..11)      10,4 refused
+       11,2 refused                           12,1 refused
+       12,2 accepted  -> skb->vlan_proto      12,4 accepted -> both fields
+       13,2 refused                           14,2 accepted -> skb->vlan_tci
+       14,4 refused                           15,2 refused
+       16,2 accepted  -> frame byte 12..13    18,2 -> 14..15, 20,2 -> 16..17 ...
+
+   A store that straddles offset 12 is refused, and both sides of it are
+   accepted; 13 is refused while 16 is accepted.  The word stores change *not
+   one byte of the frame* and yet decide which netdevice receives it: writing
+   vlan_proto/tci = 8100 0400, or tci = 0400, delivers the frame to the VLAN
+   device of vid 1024 and writing 8100 0fff delivers it nowhere and raises
+   rx_otherhost_dropped.  So at the ingress hook a rule chooses the demultiplexer
+   with four bytes it does not put into any frame.
+
+3. nft_nh_write_ok_ip6() is a closed whitelist keyed by the chain's family
+   (pkt->state->pf), never by the packet: offset 0 (len <= 4, version 6 read from
+   the register), 2 (len <= 2), 7 (len == 1), 8 (len <= 32), 24 (len <= 16), and
+   nothing else.  Measured: 6 accepted, 8 refused, and the refusals include the
+   next-header byte at offset 6 while the hop limit at 7 is accepted.  The same
+   byte is writable through the other base: @ll,24,4 on the ingress door writes
+   the next-header byte and kills the packet, @nh,6,1 refuses and the packet
+   arrives.  If one of the two is intended, the other is worth a comment.
+
+   One practical note on the widest lane: len <= 16 + 16 at offset 8 cannot be
+   reached with an immediate -- struct nft_data is 16 bytes and nft_value_init
+   returns -EOVERFLOW -- but two payload loads into REG32_08..REG32_15 followed
+   by a 32-byte register store are accepted and write exactly 32 bytes, ending on
+   the last byte of the header.
+
+4. nft_th_write_ok() is TCP-only, and what it protects is the single byte at
+   offset 12 (the data offset), not the header and not the ack sequence:
+
+       (0,2) accepted   (8,4) accepted   (10,4) refused   (12,1) refused
+       (13,1) accepted  (0,16) refused
+
+   For every other transport protocol the function returns true, and the only
+   remaining bound is skb_ensure_writable().  That is a real bound on the buffer
+   but it is invisible to the rule's counter: at ip6 prerouting a UDP store of
+   (60,4) is accepted by the guard, fails in skb_ensure_writable(), returns
+   NFT_BREAK, and the rule's counter still counts the packet while no log
+   message and no store exist.  "The counter incremented" is not evidence that
+   the store happened; NFLOG's HWHEADER/PAYLOAD at the same hook is.
+
+No defect claim is made here beyond the two asymmetries above (§2: the accepted
+set of @ll where the tag is a word; §3: the next-header byte writable through one
+base and not the other).  Both are filter semantics reachable only by rules
+installed with CAP_NET_ADMIN in the netns' own user namespace (and, for any
+store at all, only in a netns owned by the initial user namespace -- the
+follow-up before this one).  What I would ask for is a sentence of
+documentation on each of the four checks saying which question it answers,
+because they currently read as if they were four spellings of one rule.
+
+
+===== SUMMARY.md =====
+# F58 — the three write guards: three different questions, and none of them asks the length
+
+Turn 580. Kernel `7.3.4-T563` (`1efbc957…2033`), no new build. Instrument
+`differ580`, mode `bounds`: **55 arms × 2 boots**, one rule per arm, two doors.
+Both boots agree on every field of every arm (55 arms × 20 fields, plus every
+hexdump; no MAC is chosen at boot in this topology, so nothing had to be
+normalised).
+
+The three debts named at the end of F57 were the `@th` store bound
+(`nft_th_write_ok`), the `@nh` store bound (`nft_nh_write_ok`) and
+`nft_payload_set_vlan()`'s bounds where the tag is a word. Reading the source
+before building the instrument put all of them, and `nft_ll_write_ok()` besides,
+into one sentence: **the four guards answer four different questions, and not
+one of them asks how long the packet is.** The only thing that asks is
+`skb_ensure_writable()` / `skb_store_bits()`, i.e. `skb->len` — which is why
+"the guard accepted" and "the frame was written" are two events, and the counter
+reports the first while the log message reports the second.
+
+Topology: veth `x0↔x1`; `x1` = `fd02::91/64`; two VLAN devices on it, `x1.100`
+(vid 100) and `x1.1024` (vid 1024), both also `fd02::91/64`; a UDP6 socket on
+`fd02::91:5000`. Doors: **`n1`** = netdev ingress on `x1` (the tag is a word
+here, F55/F57), **`g6`** = ip6 prerouting (layer-3 door), plus one permanent
+**probe** chain at `g6` priority 20 that logs every frame arriving there with
+`NFULA_IFINDEX_INDEV` — the witness of *which* device the written tag selected.
+
+Frames: (1) IPv6/UDP plain 80 bytes, (5) the same with 802.1Q vid 100 → 84
+bytes, (6) IPv6/TCP SYN 74 bytes. Every arm is one rule
+`counter, [store], log(group 80), accept` on one door, so the counter says the
+rule saw the frame and the log message carries `NFULA_HWHEADER` (from
+`mac_header`) and `NFULA_PAYLOAD` (from `skb->data`) **after** the store. The
+write footprint is the byte diff against the same frame's census arm, and the
+verifier checks all 80 bytes of it.
+
+## 1. `@ll`: an arithmetic comparison of two distances from `skb->data`
+
+```
+net/netfilter/nft_payload.c:986
+static bool nft_ll_write_ok(const struct nft_pktinfo *pkt, int offset)
+{
+	if (nft_in_ingress(pkt->state))
+		return true;
+	return offset <= skb_network_offset(pkt->skb);
+}
+```
+
+and `skb_network_offset()` is `network_header - skb->data`, i.e. **zero** on a
+layer-3 door (there `data` *is* the network header). With
+`offset = (mac_header - data) + priv->offset = -mac_len + off`, the guard
+reduces to `off + len <= mac_len`: "do not cross the network header". Nine
+cells at `g6`:
+
+| cell | `@ll,off,len` | accepted | what happened |
+|---|---|---|---|
+| `g_12_2` | 12,2 | **yes** | wrote the frame's 12..13 (the inner ethertype), datagram delivered |
+| `g_13_2` | 13,2 | no | 15 > 14 |
+| `g_14_2` | 14,2 | no | 16 > 14 |
+| `g_16_2` | 16,2 | no | 18 > 14 |
+| `g_20_2` | 20,2 | no | 22 > 14 |
+| `g_24_2` | 24,2 | no | 26 > 14 |
+| `g_30_2` | 30,2 | no | 32 > 14 |
+| `g_40_2` | 40,2 | no | 42 > 14 |
+| `g_50_2` | 50,2 | no | 52 > 14 |
+
+One accepted cell out of nine. **This refutes my P4**, which expected the bound
+to be a headroom quantity and all nine cells accepted: I had read
+`skb_network_offset()` as an absolute offset from `skb->head`, and it is not.
+
+On the ingress door the guard is `true`, so the frame's own length is the only
+bound — and a store there reaches the IPv6 header:
+
+| cell | `@ll,off,len` | lands at | fate |
+|---|---|---|---|
+| `t_10_2` | 10,2 | frame 10..11 (source MAC) | delivered |
+| `t_16_2` | 16,2 | frame 12..13 (inner ethertype) | **delivered** — the stack already decided the protocol at `eth_type_trans()` |
+| `t_18_2` | 18,2 | frame 14..15 (version/traffic class) | `Ip6InHdrErrors` 1, no delivery |
+| `t_20_2` | 20,2 | frame 16..17 (flow label low) | delivered |
+| `t_24_4` | 24,4 | frame 20..23 (next header, hop limit, source[0..1]) | `Ip6InUnknownProtos` 1, no delivery |
+
+The same five bytes that `@nh` protects, `@ll` writes freely on this door — see
+§3.
+
+## 2. `@ll` where the tag is a word: the accepted domain is not an interval
+
+`nft_payload_eval`/`nft_payload_set_eval` route a `@ll` store through
+`nft_payload_set_vlan()` as soon as `off + len > offsetof(struct ethhdr, h_proto) = 12`
+(`nft_payload_need_vlan_adjust`), and that function accepts only three
+(offset,len) pairs before it returns "write the tag as a word":
+
+```
+if (offset >= offsetof(struct vlan_ethhdr, h_vlan_encapsulated_proto)) /* 16 */
+	{ *vlan_hlen = VLAN_HLEN; return true; }         /* frame byte  off-4 */
+switch (offset) {
+case 12: len == 2 -> skb->vlan_proto
+         len == 4 -> __vlan_hwaccel_put_tag(proto, tci)   /* word */
+         else return false;
+case 14: len == 2 -> skb->vlan_tci;  else return false;
+default: return false;
+}
+```
+
+15 cells at `n1`, tagged frame, tag present as `8100:0064`. The `nl` column is
+the arm's log message: present means the store expression passed the guard *and*
+the write happened.
+
+| cell | `@ll,off,len` | `nl` | footprint in the frame | who received the frame |
+|---|---|---|---|---|
+| `t_10_2` | 10,2 | 1 | 10..11 | `x1.100` |
+| `t_10_4` | 10,4 | **0** | — (10+4 > 12, `off<16`, not 12/14) | `x1.100` |
+| `t_11_2` | 11,2 | **0** | — (11+2 > 12) | `x1.100` |
+| `t_12_1` | 12,1 | **0** | — (len must be 2 or 4) | `x1.100` |
+| `t_12_2` | 12,2 | 1 | **none** — `vlan_proto = 8100` | `x1.100` |
+| `t_12_4` | 12,4 | 1 | **none** — vid 4095 | **none** (`rx_otherhost_dropped` 1) |
+| `t_12_4v` | 12,4 | 1 | **none** — vid 1024 | **`x1.1024`** |
+| `t_13_2` | 13,2 | **0** | — | `x1.100` |
+| `t_14_2` | 14,2 | 1 | **none** — vid 1024 | **`x1.1024`** |
+| `t_14_4` | 14,4 | **0** | — (the TCI takes len 2 only) | `x1.100` |
+| `t_15_2` | 15,2 | **0** | — | `x1.100` |
+| `t_16_2` | 16,2 | 1 | 12..13 | `x1.100` |
+| `t_18_2` | 18,2 | 1 | 14..15 | dead: `Ip6InHdrErrors` |
+| `t_20_2` | 20,2 | 1 | 16..17 | `x1.100` |
+| `t_24_4` | 24,4 | 1 | 20..23 | dead: `Ip6InUnknownProtos` |
+
+Read the `nl` column as a set: `{10+2 yes, 10+4 no, 11+2 no, 12+2 yes, 12+4
+yes, 13+2 no, 14+2 yes, 14+4 no, 15+2 no, 16+2 yes}`. A store that *straddles*
+12 is refused, both cells on either side of 12 (10+2 and 12+2) are accepted, and
+13 is refused while 16 is accepted. The domain is not an interval, and the rule
+that draws it is `off + len > 12` interpolated with a switch on three pairs.
+
+Two things about the word cells: they change **not one byte of the frame** (the
+verifier compares all 80 bytes of both hexdumps against the census arm), and
+they decide **which netdevice receives the frame**: `8100 0400` through the
+4-byte path (`t_12_4v`) and `0400` through the 2-byte path (`t_14_2`) both send
+it to `x1.1024`, while `8100 0fff` (`t_12_4`) sends it nowhere and raises
+`rx_otherhost_dropped`. The probe at `g6` names the device, so this is a
+positive identification and not an inference from a dead frame.
+
+## 3. `@nh`: a closed whitelist keyed by the chain's family, never by the packet
+
+```
+net/netfilter/nft_payload.c:883   nft_nh_write_ok_ip6()
+	offset 0  -> len <= 4 and ih->version == 6   (version read from the REGISTER)
+	offset 2  -> len <= 2                        (payload length)
+	offset 7  -> len == 1                        (hop limit)
+	offset 8  -> len <= 16 + 16                  (source, and source+dest)
+	offset 24 -> len <= 16                       (destination)
+	everything else -> false
+```
+
+16 cells at `g6` on the plain frame:
+
+| cell | `@nh,off,len` | accepted | what the frame became |
+|---|---|---|---|
+| `n_0_4v6` | 0,4 = `60a1a2a3` | **yes** | traffic class/flow changed, version kept |
+| `n_0_4v4` | 0,4 = `40a1a2a3` | no | version 4 in the register |
+| `n_0_2` | 0,2 = `60a1` | **yes** | |
+| `n_2_2` | 2,2 = `0066` | **yes** | payload length 102 — **delivered anyway** (the check ran before the hook) |
+| `n_4_2` | 4,2 | no | flow label has no lane |
+| `n_6_1` | 6,1 = `99` | **no** | **the next-header byte is not writable** |
+| `n_7_1` | 7,1 = `3f` | **yes** | hop limit 63 |
+| `n_7_2` | 7,2 | no | that lane is len 1 |
+| `n_8_32i` | 8,32 immediate | **-75** | the *encoder* refuses: `struct nft_data` is 16 bytes |
+| `n_8_32r` | 8,32 from two 16-byte register loads | **yes** | 32 bytes written, source and destination both |
+| `n_8_16` | 8,16 | **yes** | source only → UDP checksum fails (`Udp6InErrors` 1) |
+| `n_9_16` | 9,16 | no | offset 9 has no lane (and 9+16 would cross the header) |
+| `n_24_16` | 24,16 | **yes** | destination → `Ip6InNoRoutes` 1 |
+| `n_24_15` | 24,15 | **yes** | destination[0..14] → `Ip6InNoRoutes` 1 |
+| `n_36_4` | 36,4 | no | past the header, no lane |
+| `n_40_4` | 40,4 | no | past the header, no lane |
+
+Two observations that only exist because the instrument measured both:
+
+* **the lane is wider than the encoding.** `n_8_32i` is refused with
+  `-EOVERFLOW` by `nft_value_init` (an immediate carries at most
+  `sizeof(struct nft_data)` = 16 bytes), and the very same store built from two
+  payload *loads* into `REG32_08..15` is accepted and writes exactly 32 bytes,
+  the last of which is the last byte of the header (`8+32 = 40`). So `len <= 16+16`
+  is a real lane of the guard, reachable only by a register round-trip.
+* **the same byte, two bases, two answers.** The next-header byte is offset 6 of
+  the network header: `@nh,6,1` is refused and the packet is delivered;
+  `@ll,24,4` at `n1` and (by §1 nothing at `g6`) writes the same byte of the same
+  frame through the link-layer base and kills the packet as an unknown protocol.
+
+## 4. `@th`: only TCP, and only the byte at offset 12
+
+```
+net/netfilter/nft_payload.c:1096
+static bool nft_th_write_ok(const struct nft_pktinfo *pkt,
+			    const struct nft_payload_set *priv)
+{
+	unsigned int doff = offsetof(struct tcphdr, ack_seq) + sizeof(__be32);  /* 12 */
+	if (pkt->tprot != IPPROTO_TCP)
+		return true;
+	return priv->offset > doff || priv->offset + priv->len <= doff;
+}
+```
+
+| cell | frame | `@th,off,len` | accepted | fate |
+|---|---|---|---|---|
+| `u_0_2` | UDP | 0,2 | **yes** | source port rewritten → `Udp6InErrors` 1, not delivered |
+| `u_8_4` | UDP | 8,4 | **yes** | payload rewritten → `Udp6InErrors` 1 |
+| `u_0_16` | UDP | 0,16 | **yes** | header destroyed → `Udp6InErrors` 1 |
+| `u_60_4` | UDP | 60,4 | **yes by the guard, not written** | no log message; datagram delivered unchanged |
+| `h_0_2` | TCP | 0,2 | **yes** | source port rewritten |
+| `h_8_4` | TCP | 8,4 | **yes** | 8+4 = 12 ≤ 12 |
+| `h_10_4` | TCP | 10,4 | **no** | 10+4 > 12 and 10 ≤ 12 — it straddles 12 |
+| `h_12_1` | TCP | 12,1 | **no** | the protected byte itself |
+| `h_13_1` | TCP | 13,1 | **yes** | 13 > 12 |
+| `h_0_16` | TCP | 0,16 | **no** | 0+16 > 12 |
+
+The protected thing is not the TCP header and not the ack sequence: it is the
+single byte at offset 12, which carries the data offset (and, in the same byte,
+the reserved bits) — a store may end there or start after it, but not cover it.
+For UDP the guard is unconditionally `true`: any (offset,len) is accepted as
+long as the buffer holds it.
+
+`u_60_4` is the cell that separates "accepted" from "written": the guard says
+yes, `skb_ensure_writable(54+60)` fails on an 80-byte frame, the expression
+returns `NFT_BREAK`, the rest of the rule (log, verdict) never runs — the
+counter still counts 1, no log message is produced, and the datagram is
+delivered untouched. The counter and the log are two different witnesses, and a
+counter alone cannot tell a refused store from a successful one.
+
+## 5. Predictions: 8 of 10 clauses held, one refuted, one unreachable
+
+| # | prediction | outcome |
+|---|---|---|
+| P1 | the 14 `@ll` ingress cells split at `off+len > 12`, refused = {10,4 11,2 12,1 13,2 14,4 15,2} | **held** (all six, plus `t_15_2`) |
+| P2 | the word cells change no frame byte and only the fate | **held**, and stronger: the probe names the receiving device |
+| P3 | cells at ≥16 land at `off-4` | **held** (16→12..13, 18→14..15, 20→16..17, 24→20..23) |
+| P4 | the `@ll` bound at `g6` is a headroom quantity, all nine cells accepted | **refuted**: one accepted, eight refused at `off+len > 14` |
+| P5 | the `@nh` whitelist accepts exactly 0(v6)/2/7(1)/8/24 and refuses 0(v4)/4/6/7,2/9/36/40 | **held** in 14 of 14 cells |
+| P6 | the next-header byte written through `@ll` kills the packet, through `@nh` is refused | **held** (`t_24_4` vs `n_6_1`) |
+| P7 | `@th` protects `off > 12 || off+len <= 12` for TCP, nothing for UDP | **held** in 10 of 10 cells |
+| P8 | a store the guard accepts and the buffer refuses writes nothing and logs nothing | **held** on `u_60_4` (the planned `u_0_32` cell was refused by the encoder, see §3) |
+| P9 | a version write at `n1` kills the packet; the same bytes at `g6` are written after the check | **split**: the first clause held (`t_18_2` → `Ip6InHdrErrors`); the `g6` cell (`g_14_2`) is *beyond the bound* and was refused, so the second clause is measured instead by `n_2_2`, where a payload length of 102 is written after the length check and the datagram is delivered |
+| P10 | every armed rule counts 1, and every frame reaches `g6` once except the vid cells | **held** |
+
+## 6. What is not measured, plainly
+
+- the `@nh` ipv4 and ARP whitelists (`nft_nh_write_ok_ip4`, `..._arp`): untouched
+  in this turn, and both are wider in shape (`saddr` len ≤ 8, `check` len ≤ 10);
+- the `@nh` lanes at lengths 17..32 other than the single 32-byte cell — swept
+  only at 16 and 32;
+- `@th` writes with a checksum fixup (`NFTA_PAYLOAD_CSUM_TYPE`,
+  `..._CSUM_FLAGS`): every store here is `CSUM_NONE`, so `nft_payload_csum_*`
+  is not exercised;
+- `@ll` on a door where `mac_len ≠ 14`: F53's reordered VLAN device had 18, and
+  the bound there is 18 for the same reason (not re-measured here);
+- the `inet` family at either door; bridge doors for `@nh` (F50 measured one
+  cell, `@nh,7,1`); PPPoE and Q-in-Q at these doors; a tagged frame with more
+  than one tag;
+- GSO / `CHECKSUM_PARTIAL` on real hardware: a veth is not that.
+
+**Not a vulnerability.** Every rule in this instrument was installed by root in
+the initial user namespace, and per F57 that is the only context in which a
+store can be installed at all. What is shown here is where the guards put the
+line and where they do not: the `@ll` arithmetic and the `@th` byte-12 rule are
+properties of the *frame*, the `@nh` whitelist is a property of the *chain's
+family*, and the ingress door has no `@ll` bound at all — which is exactly the
+door F57 measured as the one behind the second gate.
+
+
+===== summary.json =====
+{
+  "turn": 580,
+  "finding": "F58",
+  "title": "the three write guards answer three different questions and none of them asks the length: @ll is an arithmetic comparison against skb_network_offset, @nh is a closed whitelist keyed by the chain's family, @th protects the single byte at offset 12 and only for TCP, and nft_payload_set_vlan accepts a set of offsets that is not an interval",
+  "answer_short": "55 arms x 2 boots on 7.3.4-T563. At a layer-3 door nft_ll_write_ok reduces to off+len <= mac_len: 1 of 9 cells accepted (12,2), 8 refused (13..50). At the netdev ingress door the guard is true, so the frame's own length is the only bound: @ll,18,2 writes the IPv6 version and the datagram dies with Ip6InHdrErrors, @ll,24,4 writes the next-header byte and it dies with Ip6InUnknownProtos. Where the tag is a word the accepted domain is not an interval: 10+2 yes, 10+4 no, 11+2 no, 12+2 yes (word), 12+4 yes (word), 13+2 no, 14+2 yes (word), 14+4 no, 15+2 no, 16+2 yes (frame byte 12) -- the gate is off+len > offsetof(struct ethhdr, h_proto) = 12 interpolated with a switch over three pairs. The word cells change not one frame byte (verified on all 80 bytes) and yet decide which VLAN device receives the frame: 8100 0fff sends it nowhere (rx_otherhost_dropped 1), 8100 0400 and 0400 both deliver it to x1.1024. @nh on the ip6 family accepts exactly {0: len<=4 and version 6, 2: len<=2, 7: len==1, 8: len<=32, 24: len<=16} and refuses the next-header byte at 6 while accepting the hop limit at 7; the same byte written through @ll kills the packet. The lane len<=32 at offset 8 is wider than any immediate (struct nft_data is 16 bytes, -EOVERFLOW), and the same 32-byte store built from two register loads is accepted. @th is TCP-only and protects the single byte at offset 12: (8,4) accepted, (10,4) refused, (12,1) refused, (13,1) accepted, (0,16) refused; for UDP the guard is unconditionally true and only skb_ensure_writable stops the store -- u_60_4 is the cell where the guard says yes, the buffer says no, the counter counts 1 and no log message exists.",
+  "numbers": {
+    "arms": 55,
+    "boots": 2,
+    "checks": 5703,
+    "selftest": "30/30",
+    "ll_l3_accepted_of_9": 1,
+    "ll_ingress_accepted_of_15": 9,
+    "nh_accepted": 6,
+    "nh_refused": 8,
+    "nh_encoder_refused": 1,
+    "th_accepted": 6,
+    "th_refused": 4
+  },
+  "prediction_score": {
+    "held": ["P1", "P2", "P3", "P5", "P6", "P7", "P8", "P10"],
+    "refuted": ["P4"],
+    "split": ["P9"]
+  },
+  "provenance": {
+    "kernel": "7.3.4-T563",
+    "kernel_sha256": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+    "initrd_sha256": "7a58600e868e15bf47225d3dc5aef261da3bdf91711c3104b6dbefe2fc1f8950",
+    "differ_sha256": "afc85a14fbf360a6cfcc99c2c59a210ccb1a6289161d610d24e8dedb874f9a19"
+  },
+  "files": [
+    "findings/F58-write-guards/SUMMARY.md",
+    "findings/F58-write-guards/VERIFY_REPORT.md",
+    "findings/F58-write-guards/summary.json",
+    "findings/F58-write-guards/LETTER_SECTION_F58.txt",
+    "vm/differ580_add.c",
+    "vm/build_f58_differ.sh",
+    "vm/make_initramfs580.sh",
+    "tools/f58_run.sh",
+    "tools/verify580.py",
+    "tools/f580_mutate.py",
+    "tools/verify580_selftest.sh",
+    "tools/audit_f58_doc.py",
+    "research/predictions_580.md",
+    "logs/f58_rep1.log",
+    "logs/f58_rep2.log"
+  ],
+  "not_measured": [
+    "the @nh ipv4 and ARP whitelists",
+    "@nh lanes at lengths 17..31 (only 16 and 32 measured)",
+    "@th stores with a checksum fixup (all arms are CSUM_NONE)",
+    "@ll on a door where mac_len != 14",
+    "the inet family, bridge doors for @nh, PPPoE and Q-in-Q at these doors",
+    "GSO / CHECKSUM_PARTIAL on real hardware"
+  ],
+  "is_vulnerability": false,
+  "why_not": "every rule was installed by root in the initial user namespace, and per F57 that is the only context where a payload store can be installed at all; what is measured is where the guards draw the line, and the one door with no @ll bound at all (netdev ingress) is exactly the door behind that second gate"
+}

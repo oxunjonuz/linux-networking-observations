@@ -1,0 +1,1072 @@
+===== LETTER_SECTION_F42.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload: a static transport-store check is enforced at runtime,
+ and 14 nft spellings die silently (`tcp flags set` regressed in v7.3)
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+References: <the same Message-Id>
+
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+Theme: the PPPoE store lands eight bytes before the field it names, and in the
+IPv6 branch one cell rewrites the PPP protocol.
+
+No diff below: the offsets it reports are the ones the guard already uses.
+
+Three measurements on Linux 7.3.4, nftables in the bridge prerouting hook,
+one rule at a time, one PPPoE session frame at a time.  The frame is a real
+one: eth | 0x8864 | PPPoE session (sid 99) | 0x0021 | IPv4/UDP, and the
+receiving side is a real PPP unit (`/dev/ppp`: PPPIOCNEWUNIT + PPPIOCATTCHAN +
+PPPIOCCONNECT with a PPPoX socket moved to PPPOX_BOUND by PPPIOCGCHAN -- the
+pppd sequence, without pppd), a real UDP socket bound on the peer address, and
+the kernel's own counters.
+
+1. `meta protocol` repairs the READ and not the STORE.
+
+nft_meta.c, PPPoE branch: `nhoff = PPPOE_SES_HLEN + skb_network_offset(skb)`,
+i.e. pkt->nhoff = 8 + 14.  nft_payload_eval() reads at
+`skb_network_offset + pkt->nhoff + offset`; nft_payload_set_eval() stores at
+`skb_network_offset + offset`.  The two are eight bytes apart, and the whole
+`(offset,len)` white list of nft_nh_write_ok_ip4() is written in the
+coordinates of the field NAME, not of the byte actually written.
+
+Measured, with the payload `10.1.0.1 -> 10.9.0.7:5000`, 18 bytes of 0x77:
+
+  (4,2) "ip id" = 0x0004      -> the PPPoE length becomes 4; ppp0 hands the
+                                 IP stack 2 bytes; ip_rcv counts them and
+                                 refuses them (InHdrErrors 1)
+  (4,2) "ip id" = 0x9091      -> skb->len < length: pppoe_rcv drops the frame
+                                 before the socket (0 bytes reach the stack,
+                                 the counter still shows the rule ran)
+  (0,2) "ver/ihl", (1,1) "tos"-> the PPPoE version/code bytes; the datagram is
+                                 delivered intact
+  (8,1) "ttl" = 0x45          -> the byte it writes is already 0x45: delivered
+  (8,1) "ttl" = 0x90, (8,2), (10,2) "check", (12,4) "saddr", (16,4) "daddr"
+                              -> all land inside the bytes covered by the IPv4
+                                 header checksum; ip_rcv reports InHdrErrors
+                                 and delivers nothing.  The guard never checks
+                                 the checksum; the receiver always does.
+  (20,4) the real saddr, (24,4) the real daddr, (6,2) the PPP protocol field
+                              -> refused by the white list.  The five refused
+                                 cells leave the frame byte-identical to the
+                                 control: a refusal is not a drop.
+
+2. `@ll` is bounded by 14 and that boundary is the Ethernet header, not the
+   link header of the frame.
+
+  @ll,6,2  allowed (8 <= 14) and it writes the SOURCE MAC.  pppoe_rcv() finds
+           the session with __get_item(pn, ph->sid, eth_hdr(skb)->h_source,
+           dev->ifindex), so the frame is then dropped: nothing reaches ppp0.
+  @ll,13,1 allowed, writes the ethertype's low byte (0x8864 -> 0x88ff).  The
+           frame is still delivered -- because the dispatch uses the
+           skb->protocol that eth_type_trans() cached BEFORE the hook.  The
+           same bytes sent from outside with no rule at all are not PPPoE and
+           are not delivered.  The write is visible on the wire and invisible
+           to the dispatch.
+  @ll,14,2 refused (16 > 14): the PPPoE header is outside the "link header".
+
+3. In the IPv6 branch one cell of the white list changes the PATH of the frame.
+
+  nft_nh_write_ok_ip6() allows offset 7 with len 1 -- offsetof(ipv6hdr,
+  hop_limit).  On a PPPoE frame the store is at 14 + 7 = 21, which is the low
+  byte of the two-byte PPP protocol field.  With an IPv6 datagram
+  (PPP protocol 0x0057) the cell writes 0x90, the protocol becomes 0x0090,
+  proto_to_npindex() returns -EINVAL, and ppp_receive_nonmp_frame() queues the
+  frame for pppd instead of handing it to the IPv6 stack.  What the kernel
+  reports: the unit file yields the whole 68-byte frame, ppp0's
+  /proc/net/dev counts 66 bytes received, and Ip6InReceives stays 0.  The
+  device says "received", the stack says "nothing".
+
+  The rest of the IPv6 list lands elsewhere too: (0,4) and (2,2) reach the
+  PPPoE version/code and the SESSION ID (after which the session lookup fails
+  and the frame is dropped); (8,16) -- the cell named saddr -- reaches the
+  first 16 bytes of the IPv6 header (version, payload length, next header, hop
+  limit, and the first 8 saddr bytes), so the same value is harmless and
+  0x90... gives version 9 and Ip6InHdrErrors; (24,16) reaches saddr[8..15] and
+  daddr[0..7], after which the destination is no longer local.  IPv6 has no
+  header checksum, so nothing here is caught by a checksum: the version check
+  and the routing table are the only things standing in the way, and one cell
+  (7,1) gets past both by choosing a different protocol number.
+
+4. For completeness: the same ARP frame, vid 100, with and without a VLAN
+   device on the bridge.  Without it, the frame is PACKET_OTHERHOST and the
+   arp family counter stays 0.  With `v1` (vlan 100 on br0) vlan_do_receive()
+   returns true, the frame reaches arp_rcv() through v1 (counter 1), the kernel
+   replies with 42 bytes and /proc/net/arp names v1 as the interface.  (8,2)
+   on a single-tagged frame does not shift (the tag is already in the skb
+   metadata) and really writes sha: the reply goes to the written MAC.
+
+None of this is a privilege boundary: the rule is installed by root in the
+initial user namespace.  What is worth a maintainer's look is the shape:
+nft_nh_write_ok() is presented as a per-family white list of fields, but the
+store is expressed in skb coordinates that do not match the coordinates the
+list is written in, and the mismatch is the protocol header length.  The
+IPv6 branch has a cell that reaches into another header entirely.
+
+Reported as measurements with the instrument, the logs and the verifier on
+disk; every number above is a cell of a table that was generated from the log
+and checked back against it.
+
+-- status --
+
+NOT SENT.  This file is a section for the held letter, written and left on
+disk like F29+F30, F31, F32, F36, F37, F38, F39, F40 and F41.  Sending is the
+owner's decision.
+
+
+===== SUMMARY.md =====
+# F42 — приёмная сторона PPPoE: кадр становится настоящим пакетом, и поле, которое решает путь, лежит ровно там, куда достаёт одна клетка списка IPv6
+
+Turn 564. Ядер не собирал: весь ход — на том же `7.3.4-T563`
+(`1efbc957…2033`, образ F41). Новый только прибор `differ564`: **36 плеч в
+каждой из двух загрузок**, и обе загрузки совпадают побайтово (после
+нормировки на MAC моста, который ядро выбирает заново при каждой загрузке).
+
+## 1. Ответ в один абзац
+
+В 563-м я записал: «приёмную сторону PPPoE я тронул только в очереди
+сокета; в состоянии `PPPOX_BOUND` кадр уходит в `ppp_input()` и создаёт
+`pppN` — это первый путь, где запись из моста доходит до IP-стека настоящим
+пакетом». Это измерено: с настоящим юнитом (`/dev/ppp`: `PPPIOCNEWUNIT` +
+`PPPIOCATTCHAN` + `PPPIOCCONNECT`, без pppd и без переговоров) датаграм из
+моста приходит **в сокет на `10.9.0.7:5000` восемнадцатью байтами** своего
+содержимого. И тут же выяснилось, что принимающий стек **отбрасывает все
+записи, которые страж разрешает**: `meta protocol` чинит `nhoff = 8` только
+для чтения, а запись по-прежнему идёт от `skb_network_offset()` — на
+**восемь байт раньше** настоящего заголовка IPv4, — и каждая разрешённая
+клетка ложится в поле, которое покрыто контрольной суммой заголовка.
+Проверку суммы делает стек, страж её не делает никогда: пять клеток
+(`ttl`, `ttl2`, `csum`, `saddr`, `daddr`) кончаются `IpInHdrErrors = 1` и
+нулём доставок, а две клетки, чьё имя обещает то же самое
+(`(0,2)` «ver/ihl» и `(1,1)` «tos»), попадают в **заголовок PPPoE-сессии** и
+датаграм доходит целой. Второе: **отказ стража — не отбрасывание**. Пять
+плеч, где запись запрещена (`bare`, `trsaddr`, `trdaddr`, `nh6`, `ll14`),
+доставили датаграм **побайтово равным контролю**: снаружи отказ неотличим от
+«правила не было». Третье — и это главное для письма: в ветви IPv6 у
+списка есть клетка `(7,1)` «hop_limit», и на PPPoE-кадре она пишет байт 21,
+то есть **младший байт поля PPP-протокола**: `0x0057` → `0x0090`, кадр
+перестаёт быть пакетом IPv6 и уходит в очередь юнита (pppd), а `ppp0` при
+этом всё равно считает его принятым — `dev_sw_netstats_rx_add()` стоит
+**до** развилки по протоколу. Это первая измеренная клетка за проект, которая
+меняет не поле, а **путь** кадра.
+
+## 2. Семь строк, на которых это стоит
+
+| файл | что говорит |
+|---|---|
+| `drivers/net/ppp/pppoe.c` | `skb_pull_rcsum(skb, sizeof(*ph));` затем `len = ntohs(ph->length)`, drop если `skb->len < len`, и `pskb_trim_rcsum(skb, len)` |
+| `drivers/net/ppp/pppoe.c` | `if (sk->sk_state & PPPOX_BOUND) ppp_input(&po->chan, skb);` иначе `sock_queue_rcv_skb()` |
+| `drivers/net/ppp/pppoe.c` | `po = __get_item(pn, ph->sid, eth_hdr(skb)->h_source, dev->ifindex);` — ключ поиска сессии |
+| `drivers/net/ppp/ppp_generic.c` | `dev_sw_netstats_rx_add(dev, skb->len - PPP_PROTO_LEN);` **до** `npi = proto_to_npindex(proto)` |
+| `drivers/net/ppp/ppp_generic.c` | `skb->protocol = htons(npindex_to_ethertype[npi]); netif_rx(skb);` — и `(dev->flags & IFF_UP) == 0` освобождает кадр |
+| `net/ipv4/ip_input.c` | `if (unlikely(ip_fast_csum((u8 *)iph, iph->ihl))) goto csum_error;` — сумма проверяется **до** проверки длины |
+| `net/netfilter/nft_payload.c` | `case NFT_PAYLOAD_NETWORK_HEADER: … offset = skb_network_offset(skb);` — запись не знает про `nhoff` |
+| `net/netfilter/nft_payload.c` | `nft_nh_write_ok_ip6()`: клетки `0, 2, 7 (hop_limit), 8 (saddr), 24 (daddr)` |
+| `net/netfilter/nft_payload.c` | `nft_ll_write_ok(): return offset <= skb_network_offset(pkt->skb);` — 14 на ethernet |
+| `net/8021q/vlan_core.c` | `vlan_dev = vlan_find_dev(skb->dev, vlan_proto, vlan_id);` — без устройства кадр помечается `PACKET_OTHERHOST` |
+
+## 3. Сетка `bound`: 19 плеч, и что сделал принимающий стек
+
+Кадр — один и тот же: `eth | 8864 | PPPoE(sid 99, length 48) | 0021 | IPv4/UDP`,
+датаграм 46 байт, `10.1.0.1 → 10.9.0.7:5000`, полезная нагрузка — 18 байт
+`0x77`. Прибор: `s0` (отправитель) → мост `br0` → `r1`/`r0` (дальняя сторона);
+копия кадра уходит в локальный стек `br0`, где её берёт PPPoX-сессия,
+привязанная к `br0` и переведённая в `PPPOX_BOUND`. Оракулы: счётчик цепи,
+`IpInReceives/InHdrErrors/InDelivers` из `/proc/net/snmp`, байты `ppp0` из
+`/proc/net/dev`, `read()` с юнита и с канала, `recv()` на UDP-сокете и кадр,
+ушедший на дальнюю сторону.
+
+| # | arm | off,len | live | ipin | ihdr | ideliv | prx | udp4 | urn |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | `ctl` | 0,0 | 1 | 1 | 0 | 1 | 46 | 18 | 0 |
+| 2 | `bare` | 4,2 | 0 | 1 | 0 | 1 | 46 | 18 | 0 |
+| 3 | `vt` | 0,2 | 1 | 1 | 0 | 1 | 46 | 18 | 0 |
+| 4 | `tos` | 1,1 | 1 | 1 | 0 | 1 | 46 | 18 | 0 |
+| 5 | `id4` | 4,2 | 1 | 1 | 1 | 0 | 2 | -1 | 0 |
+| 6 | `idbig` | 4,2 | 1 | 0 | 0 | 0 | 0 | -1 | 0 |
+| 7 | `ttl` | 8,1 | 1 | 1 | 1 | 0 | 46 | -1 | 0 |
+| 8 | `ttlsame` | 8,1 | 1 | 1 | 0 | 1 | 46 | 18 | 0 |
+| 9 | `ttl2` | 8,2 | 1 | 1 | 1 | 0 | 46 | -1 | 0 |
+| 10 | `csum` | 10,2 | 1 | 1 | 1 | 0 | 46 | -1 | 0 |
+| 11 | `saddr` | 12,4 | 1 | 1 | 1 | 0 | 46 | -1 | 0 |
+| 12 | `daddr` | 16,4 | 1 | 1 | 1 | 0 | 46 | -1 | 0 |
+| 13 | `trsaddr` | 20,4 | 0 | 1 | 0 | 1 | 46 | 18 | 0 |
+| 14 | `trdaddr` | 24,4 | 0 | 1 | 0 | 1 | 46 | 18 | 0 |
+| 15 | `nh6` | 6,2 | 0 | 1 | 0 | 1 | 46 | 18 | 0 |
+| 16 | `ll6` | 6,2 | 1 | 0 | 0 | 0 | 0 | -1 | 0 |
+| 17 | `ll13` | 13,1 | 1 | 1 | 0 | 1 | 46 | 18 | 0 |
+| 18 | `ll14` | 14,2 | 0 | 1 | 0 | 1 | 46 | 18 | 0 |
+| 19 | `pre88ff` | -1,-1 | 0 | 0 | 0 | 0 | 0 | -1 | 0 |
+
+Колонки: `live` — дельта счётчика цепи (стража прошла ли запись);
+`ipin/ihdr/ideliv` — дельты `IpInReceives/InHdrErrors/InDelivers`;
+`prx` — байты `ppp0`; `udp4` — сколько байт вернул `recv()` на сокете
+(`-1` = ничего); `urn` — байты, прочитанные из очереди **юнита**.
+
+Три вещи видны только вместе. **(5)** `(4,2)=4` пишет длину PPPoE: стек
+получает **два байта** (`prx = 2`), `ip_rcv` их считает (`ipin = 1`) и
+отвергает (`ihdr = 1`) — то есть запись дожила до настоящего пакета.
+**(6)** `(4,2)=0x9091` пишет ту же длину больше кадра, и `pppoe_rcv`
+отбрасывает кадр **до** сокета (`prx = 0`, `ipin = 0`), хотя правило
+сработало (`live = 1`) и кадр ушёл на дальнюю сторону. **(8)** `(8,1)=0x45`
+пишет в байт, где уже лежит `0x45`: датаграм доходит целой. Разница между
+(7) и (8) — одно значение, и она же разница между «стек принял» и «стек
+отверг по сумме».
+
+| что запись сделала | плечи | следствие у получателя |
+|---|---|---|
+| попала в заголовок PPPoE-сессии | `vt`, `tos`, `id4`, `idbig` | кадр жив, если длина не врёт; `id4` → 2 байта IP |
+| попала в байт, который не меняется | `ttlsame` | доставка, как у контроля |
+| изменила байт, покрытый суммой | `ttl`, `ttl2`, `csum`, `saddr`, `daddr` | `IpInHdrErrors = 1`, доставок 0 |
+| не выполнена стражем | `bare`, `trsaddr`, `trdaddr`, `nh6`, `ll14` | доставка, байты равны контролю |
+| попала в MAC источника (`@ll,6`) | `ll6` | ключ поиска сессии не совпал → `prx = 0` |
+| попала в ethertype (`@ll,13`) | `ll13` | байты на проводе изменились, доставка осталась |
+
+## 4. Отказ стража — не отбрасывание кадра
+
+Пять плеч с `live = 0` доставили датаграм (`ipin = 1`, `udp4 = 18`), и
+`rhex` каждого из них **побайтово равен** `rhex` контроля: кадр, ушедший на
+дальнюю сторону, не отличается от контрольного. Это не мелочь: снаружи
+отказ стража выглядит как «правила не было», и единственный способ увидеть
+его — счётчик цепи, а не получатель. В прошлых ходах я записывал такие плечи
+как «мёртвые»; мёртвая у них **запись**, а не кадр.
+
+## 5. `@ll` достаёт до MAC источника и до ethertype — и второе ничего не решает
+
+`@ll` на этом кадре ограничен 14 байтами (`nft_ll_write_ok`), то есть
+заголовком Ethernet; заголовок PPPoE-сессии начинается с 14-го байта и
+недостижим (`ll14`: `live = 0`). Зато `(6,2)` — это MAC источника, и после
+записи `pppoe_rcv` не находит сессию: `__get_item()` ищет по
+`(sid, h_source, ifindex)`, а `h_source` уже другой. `(13,1)` — младший байт
+ethertype: на проводе `88 64` становится `88 ff`, и кадр всё равно доходит.
+Разделяет эти два объяснения пара плеч:
+
+| плечо | что на проводе | доставка |
+|---|---|---|
+| `ll13` (запись `0xff` в байт 13 на лету) | `88 ff` | **есть** (`udp4 = 18`) |
+| `pre88ff` (те же байты снаружи, правила нет) | `88 ff` | **нет** (`udp4 = -1`, `ipin = 0`) |
+
+Один и тот же кадр: отправленный с `0x88ff` извне он не PPPoE, а
+переписанный по дороге — PPPoE. Значит `pppoe_rcv` вызывается по тому
+`skb->protocol`, который `eth_type_trans()` записал **до** хука, и запись в
+ethertype приёмный путь не видит вовсе.
+
+## 6. IPv6 в PPPoE: клетка `hop_limit` пишет поле PPP-протокола
+
+Кадр: `eth | 8864 | PPPoE(sid 99) | 0057 | IPv6 | UDP` (88 байт, сумма UDPv6
+посчитана прибором). `nf_flow_pppoe_proto()` знает `PPP_IPV6`, поэтому
+`meta protocol` ставит `ethertype = 0x86dd` и `nhoff = 8` — и применяется
+список IPv6, а запись по-прежнему идёт от 14-го байта.
+
+| # | arm | off,len | live | i6in | i6hdr | i6deliv | prx | urn | udp6 |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | `ctl` | 0,0 | 1 | 1 | 0 | 1 | 66 | 0 | 18 |
+| 2 | `hop` | 7,1 | 1 | 0 | 0 | 0 | 66 | 68 | -1 |
+| 3 | `hopsame` | 7,1 | 1 | 1 | 0 | 1 | 66 | 0 | 18 |
+| 4 | `dscp` | 0,4 | 1 | 0 | 0 | 0 | 0 | 0 | -1 |
+| 5 | `flow2` | 2,2 | 1 | 0 | 0 | 0 | 0 | 0 | -1 |
+| 6 | `hdr_same` | 8,16 | 1 | 1 | 0 | 1 | 66 | 0 | 18 |
+| 7 | `hdr_bad` | 8,16 | 1 | 1 | 1 | 0 | 66 | 0 | -1 |
+| 8 | `dst` | 24,16 | 1 | 1 | 0 | 0 | 66 | 0 | -1 |
+| 9 | `one` | 1,2 | 0 | 1 | 0 | 1 | 66 | 0 | 18 |
+| 10 | `three` | 3,2 | 0 | 1 | 0 | 1 | 66 | 0 | 18 |
+| 11 | `six` | 6,1 | 0 | 1 | 0 | 1 | 66 | 0 | 18 |
+
+`(7,1)` — это `offsetof(struct ipv6hdr, hop_limit)`, единственная клетка
+списка длиной 1 ниже восьмёрки; её адрес `14 + 7 = 21`, а байт 21 — младший
+байт PPP-протокола `0x0057`. После записи `0x90` протокол становится
+`0x0090`, `proto_to_npindex()` возвращает `-EINVAL`, и `ppp_receive_nonmp_frame`
+кладёт кадр в очередь **юнита**: `urn = 68` (весь кадр целиком),
+`i6in = 0`. И рядом: `prx = 66` — `ppp0` считает кадр принятым, потому что
+`dev_sw_netstats_rx_add()` стоит до развилки по протоколу. «Устройство
+приняло 66 байт» и «стек не видел ничего» — одновременно и оба верны.
+`hopsame` — та же клетка со значением самого байта: доставка, как у
+контроля.
+
+Остальные клетки списка IPv6 на этом кадре тоже попадают не туда, куда
+обещают: `(0,4)` и `(2,2)` — это `ver/type`, `code` и **sid** PPPoE-сессии,
+и после записи `pppoe_rcv` не находит сессию (`prx = 0`); `(8,16)` — это
+**первые 16 байт заголовка IPv6** (версия, длина, next header, hop limit и
+первые 8 байт saddr), а не saddr: запись тех же байтов ничего не меняет
+(`hdr_same`), запись `0x90…` даёт версию 9 и `Ip6InHdrErrors = 1`
+(`hdr_bad`). Настоящий saddr (смещение 16) и daddr (24 от заголовка) в
+списке есть только как `8` и `24`, и оба ложатся на восемь байт раньше:
+`(24,16)` — это `saddr[8..15] + daddr[0..7]`, после чего адрес перестаёт
+быть локальным (`i6deliv = 0`). У IPv6 нет контрольной суммы заголовка,
+поэтому здесь запись ловит не сумма, а проверка версии и таблица
+маршрутизации.
+
+## 7. ARP за настоящим VLAN-устройством: тот же кадр, vid 100, два раза
+
+Один кадр — ARP-запрос в одной метке `0x8100` vid 100 — отправлен из `r0`
+дважды: до создания `v1` (vlan 100 поверх `br0`) и после.
+
+| pass | arm | live | arc | repn | /proc/net/arp |
+|---|---|---|---|---|---|
+| novlan | `ctl_novlan` | 1 | 0 | -1 | - |
+| novlan | `sha_novlan` | 1 | 0 | -1 | - |
+| vlan | `ctl_vlan` | 1 | 1 | 42 | ;0x1;0x2;aa:bb:cc:00:00:66;*;v1 |
+| vlan | `sha_vlan` | 1 | 1 | 42 | ;0x1;0x2;90:91:cc:00:00:66;*;v1 |
+| vlan | `op_vlan` | 1 | 1 | -1 | - |
+| vlan | `hln_vlan` | 0 | 1 | 42 | ;0x1;0x2;aa:bb:cc:00:00:66;*;v1 |
+
+`arc` — счётчик семейства `arp` на `NF_ARP_IN`, `repn` — длина ответа,
+который ядро отправило обратно. Без устройства `arc = 0` и ответа нет;
+с устройством `arc = 1`, ответ 42 байта, и `/proc/net/arp` называет
+интерфейсом **`v1`** — то есть кадр действительно прошёл `vlan_do_receive()`
+и попал в стек через vlan-устройство. `(8,2)` на однотеговом кадре
+сдвига нет (метка уже в метаданных, ARP-заголовок начинается с 14-го
+байта), поэтому запись ложится в `sha`, и ядро отвечает **написанному MAC**
+(`90:91:cc:00:00:66`). `(6,2)=0x9091` проходит `arp_rcv()` и умирает в
+`arp_process()` — счётчик 1, ответа нет. `(4,2)` список ARP запрещает:
+`live = 0`, кадр доставлен нетронутым.
+
+## 8. Ошибки хода, все мои
+
+1. **Шесть предсказаний из двадцати трёх неверны, и пять из них — один и
+   тот же класс.** Я записал «отказ стража ⇒ кадр не дойдёт» для `bare`,
+   `trsaddr`, `trdaddr`, `nh6`, `ll14`. Измерено: кадр доходит и байты
+   равны контролю. Отказ стража — это пропуск записи, а не вердикт о кадре.
+2. **P17 неверно: запись в ethertype не убивает доставку.** Я ждал
+   `ipin = 0`; измерено `ipin = 1`, `udp4 = 18`. Причина найдена не
+   чтением, а парой `ll13`/`pre88ff`: приёмный путь судит по
+   `skb->protocol`, записанному до хука.
+3. **P25/P26 неверны по адресу.** Я описал клетку `(8,16)` как «настоящий
+   saddr»; на самом деле запись `@nh` идёт от `skb_network_offset() = 14`,
+   то есть в **первые 16 байт заголовка IPv6**. Поймал `Ip6InHdrErrors = 1`
+   на плече, где я ждал доставку; плечи переименованы в `hdr_same` и
+   `hdr_bad`, и в отчёте написано, что они пишут на самом деле.
+4. **Плечо `tos`.** Запись `(1,1)` ложится в **код PPPoE** (байт 15), а не в
+   `tos` IPv4 — и датаграм доходит. Я сам поставил его в группу «убитых
+   контрольной суммой» в проверке, и проверка покраснела на верных данных;
+   это была моя ошибка в проверке, а не в приборе.
+5. **Шесть ошибок в самом верификаторе, все до первого числа в документе:**
+   смещение записи `@ll` считалось как `14 + off` (для `@ll` это `off`);
+   полезная нагрузка читалась как `ip[20:28]` (это заголовок UDP, магия
+   лежит в `ip[28:36]`); хэш initrd искался среди двух полных прогонов;
+   якорь `vlan_do_receive` искался не в том файле (это `net/8021q/vlan_core.c`);
+   проверка детерминизма сравнивала MAC моста, который ядро выбирает заново
+   при каждой загрузке (4 строки расходились на верных данных);
+   и `live` в разделе `vlan` не печатался вовсе, так что «отказ» был неотличим
+   от «доставки» — добавлен.
+6. **Прибор:** первая сборка не собралась на инициализаторе структуры
+   (`char dev[]` в плоском списке) — `-Wint-conversion`; вторая версия
+   печатала `udp4`-байты и байты очереди юнита в один буфер (`hu`) — ровно
+   ошибка F40 №2, поймана до запуска, разведены на `hux`/`hun`.
+
+## 9. Чем проверено
+
+| | |
+|---|---|
+| `tools/verify564.py` | **895 проверок, 0 расхождений** — провенанс (sha ядра из шапки лога против файла, initrd против записи сборки, differ **извлечённый из initramfs** против собранного бинарника), 19 якорей исходника, разбор обоих кадров из их же байтов (поля, суммы, магия), **все 36 плеч** против питоновской модели `pppoe_rcv` → `ppp_input` → `ppp_receive_nonmp_frame` → `ip_rcv`/`ip6_rcv`, побайтовая сверка дальнего кадра на каждом плече, проверка «отказ ≠ отбрасывание», три различающих факта (`ll13`/`pre88ff`, `id4`/`idbig`, `ttlsame`), детерминизм двух загрузок, 0 splat |
+| `tools/verify564_selftest.sh` | **29/29** — базовая линия зелёная, 26 мутаций по одному полю (включая байты кадров), каждая краснит свою проверку; отдельно проверено, что порча только второй загрузки и отсутствующий лог тоже дают отказ; крэш верификатора не считается пойманной мутацией |
+| `tools/audit_f42_doc.py` | таблицы §3, §6, §7 сверены с логом клетка в клетку, и числа в прозе — с точностью до значения |
+| коллекция | перегенерирована; регрессия: verify563, verify562, verify561, verify560, verify559, verify558, verify557, verify556, verify555, verify553, verify552 |
+
+Две загрузки одного `initrd`, по 36 плеч каждая, строки `F564` совпадают
+побайтово (MAC моста нормирован — его выбирает ядро). 6 дымовых загрузок:
+по одной на раздел до правок и после.
+
+## 10. Что не измерено, прямо
+
+Один хук (bridge prerouting), одна пара veth, один отправитель, один юнит,
+один `sid`, один адрес на `ppp0`. **pppd не участвовал**: `PPPIOCATTCHAN` +
+`PPPIOCCONNECT` без переговоров LCP, без CCP-сжатия, без `PPP_MP` — то
+есть ветки `proto >= 0xc000`, `PPP_COMP` и мультилинка не тронуты (и
+`crn = 0` во всех 36 плечах по той причине, что страж не может написать
+байт PPP-протокола: `@ll` до него не достаёт, а в списках `@nh` его нет —
+в IPv4; в IPv6 достаёт клетка `(7,1)`, но она пишет `0x0090`, а не `0xc0…`).
+IPv6-стек получателя: сумма UDPv6 посчитана **прибором**, соседей и
+маршрутизатора нет, `ICMPv6` не измерялся, `DAD` выключен
+(`dad_transmits = 0`), чтобы не было шума. Не тронуты GSO/`CHECKSUM_PARTIAL`,
+`@th` в состоянии `BOUND`, QinQ поверх PPPoE, настоящий `vlan`-фильтр моста.
+`IpInReceives`/`Ip6InReceives` — глобальные счётчики: дельта на плечо могла
+бы поймать посторонний пакет, поэтому каждый раз она читается в узком окне и
+сверяется с моделью, а обе загрузки совпадают побайтово. Одна честная
+строка про `pre88ff`: у него `live = 0` не потому, что страж отказал, а
+потому что правила нет вовсе (цепь очищена).
+
+**Не уязвимость**: правило ставит root в начальном user ns. Следствия,
+измеренные здесь: молча не выполненная запись; запись, попадающая в поле
+другого протокола (длина и sid PPPoE, код PPPoE, MAC источника); кадр,
+который после клетки «ipv6 hop_limit» уходит в pppd вместо IP-стека, а
+устройство всё равно считает его принятым; ARP-ответ, отправленный на MAC,
+который выбрало правило.
+
+## 11. Файлы
+
+`findings/F42-pppoe-bound/{SUMMARY.md, summary.json, VERIFY_REPORT.md}`;
+`vm/{differ564_add.c, build_f42_differ.sh, make_initramfs564.sh, build/differ564}`;
+`tools/{f42_run.sh, verify564.py, verify564_selftest.sh, f42_mutate.py, f42_summary.py, audit_f42_doc.py}`;
+`research/predictions_564.md`; логи `logs/f42_{rep1,rep2}.log`.
+Письма не тронуты: материал этого хода — отдельный
+`LETTER_SECTION_F42.txt`, **NOT SENT**, как F29+F30, F31, F32, F36–F41.
+Отправка твоя.
+
+
+===== summary.json =====
+{
+ "answer_short": "Yes to the first: with a real unit (PPPIOCNEWUNIT/ATTCHAN/CONNECT, no pppd) the datagram written from the bridge arrives at a UDP socket on ppp0 with its 18 payload bytes, but every accepted ip4 cell lands eight bytes before the field it names, inside the bytes the IP header checksum covers, so the receiving stack drops them as IpInHdrErrors while the five refused cells leave the frame byte-identical to the control (a refusal is not a drop). @ll rewrites the source MAC (the session lookup then fails) and the ethertype byte (the wire changes, the dispatch does not: the same bytes from outside are not PPPoE at all). In the ip6 list the hop_limit cell lands on the PPP protocol's low byte, 0x0057 becomes 0x0090, the frame goes to the pppd unit queue while ppp0 still counts 66 bytes as received. And the same vid-100 ARP frame reaches NF_ARP_IN only when a vlan device exists: 0 without it, 1 with it, a 42-byte reply and /proc/net/arp naming v1.",
+ "arms_per_boot": 36,
+ "bound": [
+  {
+   "arm": "ctl",
+   "base": 1,
+   "crn": 0,
+   "gate": 1,
+   "iaddr": 0,
+   "ideliv": 1,
+   "ihdr": 0,
+   "ipin": 1,
+   "len": 0,
+   "live": 1,
+   "off": 0,
+   "prp": 1,
+   "prx": 46,
+   "rhex": "ffffffffffffaabbcc000066886411000063003000214500002e123400004011547a0a0100010a0900079c401388001a",
+   "rn": 68,
+   "udp4": 18,
+   "uhex": "777777777777777777777777777777777777",
+   "urn": 0,
+   "what": "control: no store"
+  },
+  {
+   "arm": "bare",
+   "base": 1,
+   "crn": 0,
+   "gate": 0,
+   "iaddr": 0,
+   "ideliv": 1,
+   "ihdr": 0,
+   "ipin": 1,
+   "len": 2,
+   "live": 0,
+   "off": 4,
+   "prp": 1,
+   "prx": 46,
+   "rhex": "ffffffffffffaabbcc000066886411000063003000214500002e123400004011547a0a0100010a0900079c401388001a",
+   "rn": 68,
+   "udp4": 18,
+   "uhex": "777777777777777777777777777777777777",
+   "urn": 0,
+   "what": "bare gate: the same cell, no meta protocol, no branch"
+  },
+  {
+   "arm": "vt",
+   "base": 1,
+   "crn": 0,
+   "gate": 1,
+   "iaddr": 0,
+   "ideliv": 1,
+   "ihdr": 0,
+   "ipin": 1,
+   "len": 2,
+   "live": 1,
+   "off": 0,
+   "prp": 1,
+   "prx": 46,
+   "rhex": "ffffffffffffaabbcc000066886411910063003000214500002e123400004011547a0a0100010a0900079c401388001a",
+   "rn": 68,
+   "udp4": 18,
+   "uhex": "777777777777777777777777777777777777",
+   "urn": 0,
+   "what": "pppoe ver/type+code (first byte must equal the old one)"
+  },
+  {
+   "arm": "tos",
+   "base": 1,
+   "crn": 0,
+   "gate": 1,
+   "iaddr": 0,
+   "ideliv": 1,
+   "ihdr": 0,
+   "ipin": 1,
+   "len": 1,
+   "live": 1,
+   "off": 1,
+   "prp": 1,
+   "prx": 46,
+   "rhex": "ffffffffffffaabbcc000066886411910063003000214500002e123400004011547a0a0100010a0900079c401388001a",
+   "rn": 68,
+   "udp4": 18,
+   "uhex": "777777777777777777777777777777777777",
+   "urn": 0,
+   "what": "tos -> pppoe code"
+  },
+  {
+   "arm": "id4",
+   "base": 1,
+   "crn": 0,
+   "gate": 1,
+   "iaddr": 0,
+   "ideliv": 0,
+   "ihdr": 1,
+   "ipin": 1,
+   "len": 2,
+   "live": 1,
+   "off": 4,
+   "prp": 1,
+   "prx": 2,
+   "rhex": "ffffffffffffaabbcc000066886411000063000400214500002e123400004011547a0a0100010a0900079c401388001a",
+   "rn": 68,
+   "udp4": -1,
+   "uhex": "-",
+   "urn": 0,
+   "what": "ipv4 id -> pppoe length = 4"
+  },
+  {
+   "arm": "idbig",
+   "base": 1,
+   "crn": 0,
+   "gate": 1,
+   "iaddr": 0,
+   "ideliv": 0,
+   "ihdr": 0,
+   "ipin": 0,
+   "len": 2,
+   "live": 1,
+   "off": 4,
+   "prp": 0,
+   "prx": 0,
+   "rhex": "ffffffffffffaabbcc000066886411000063909100214500002e123400004011547a0a0100010a0900079c401388001a",
+   "rn": 68,
+   "udp4": -1,
+   "uhex": "-",
+   "urn": 0,
+   "what": "ipv4 id -> pppoe length = 0x9091"
+  },
+  {
+   "arm": "ttl",
+   "base": 1,
+   "crn": 0,
+   "gate": 1,
+   "iaddr": 0,
+   "ideliv": 0,
+   "ihdr": 1,
+   "ipin": 1,
+   "len": 1,
+   "live": 1,
+   "off": 8,
+   "prp": 1,
+   "prx": 46,
+   "rhex": "ffffffffffffaabbcc000066886411000063003000219000002e123400004011547a0a0100010a0900079c401388001a",
+   "rn": 68,
+   "udp4": -1,
+   "uhex": "-",
+   "urn": 0,
+   "what": "ttl -> ip ver/ihl"
+  },
+  {
+   "arm": "ttlsame",
+   "base": 1,
+   "crn": 0,
+   "gate": 1,
+   "iaddr": 0,
+   "ideliv": 1,
+   "ihdr": 0,
+   "ipin": 1,
+   "len": 1,
+   "live": 1,
+   "off": 8,
+   "prp": 1,
+   "prx": 46,
+   "rhex": "ffffffffffffaabbcc000066886411000063003000214500002e123400004011547a0a0100010a0900079c401388001a",
+   "rn": 68,
+   "udp4": 18,
+   "uhex": "777777777777777777777777777777777777",
+   "urn": 0,
+   "what": "ttl -> ip ver/ihl, same value: the write changes nothing"
+  },
+  {
+   "arm": "ttl2",
+   "base": 1,
+   "crn": 0,
+   "gate": 1,
+   "iaddr": 0,
+   "ideliv": 0,
+   "ihdr": 1,
+   "ipin": 1,
+   "len": 2,
+   "live": 1,
+   "off": 8,
+   "prp": 1,
+   "prx": 46,
+   "rhex": "ffffffffffffaabbcc000066886411000063003000219000002e123400004011547a0a0100010a0900079c401388001a",
+   "rn": 68,
+   "udp4": -1,
+   "uhex": "-",
+   "urn": 0,
+   "what": "ttl(2b) -> ver/ihl + tos"
+  },
+  {
+   "arm": "csum",
+   "base": 1,
+   "crn": 0,
+   "gate": 1,
+   "iaddr": 0,
+   "ideliv": 0,
+   "ihdr": 1,
+   "ipin": 1,
+   "len": 2,
+   "live": 1,
+   "off": 10,
+   "prp": 1,
+   "prx": 46,
+   "rhex": "ffffffffffffaabbcc0000668864110000630030002145009091123400004011547a0a0100010a0900079c401388001a",
+   "rn": 68,
+   "udp4": -1,
+   "uhex": "-",
+   "urn": 0,
+   "what": "check -> ip tot_len"
+  },
+  {
+   "arm": "saddr",
+   "base": 1,
+   "crn": 0,
+   "gate": 1,
+   "iaddr": 0,
+   "ideliv": 0,
+   "ihdr": 1,
+   "ipin": 1,
+   "len": 4,
+   "live": 1,
+   "off": 12,
+   "prp": 1,
+   "prx": 46,
+   "rhex": "ffffffffffffaabbcc000066886411000063003000214500002e909192934011547a0a0100010a0900079c401388001a",
+   "rn": 68,
+   "udp4": -1,
+   "uhex": "-",
+   "urn": 0,
+   "what": "saddr -> ip id + frag_off"
+  },
+  {
+   "arm": "daddr",
+   "base": 1,
+   "crn": 0,
+   "gate": 1,
+   "iaddr": 0,
+   "ideliv": 0,
+   "ihdr": 1,
+   "ipin": 1,
+   "len": 4,
+   "live": 1,
+   "off": 16,
+   "prp": 1,
+   "prx": 46,
+   "rhex": "ffffffffffffaabbcc000066886411000063003000214500002e12340000909192930a0100010a0900079c401388001a",
+   "rn": 68,
+   "udp4": -1,
+   "uhex": "-",
+   "urn": 0,
+   "what": "daddr -> ttl + proto + csum"
+  },
+  {
+   "arm": "trsaddr",
+   "base": 1,
+   "crn": 0,
+   "gate": 1,
+   "iaddr": 0,
+   "ideliv": 1,
+   "ihdr": 0,
+   "ipin": 1,
+   "len": 4,
+   "live": 0,
+   "off": 20,
+   "prp": 1,
+   "prx": 46,
+   "rhex": "ffffffffffffaabbcc000066886411000063003000214500002e123400004011547a0a0100010a0900079c401388001a",
+   "rn": 68,
+   "udp4": 18,
+   "uhex": "777777777777777777777777777777777777",
+   "urn": 0,
+   "what": "the real saddr: refused by the list"
+  },
+  {
+   "arm": "trdaddr",
+   "base": 1,
+   "crn": 0,
+   "gate": 1,
+   "iaddr": 0,
+   "ideliv": 1,
+   "ihdr": 0,
+   "ipin": 1,
+   "len": 4,
+   "live": 0,
+   "off": 24,
+   "prp": 1,
+   "prx": 46,
+   "rhex": "ffffffffffffaabbcc000066886411000063003000214500002e123400004011547a0a0100010a0900079c401388001a",
+   "rn": 68,
+   "udp4": 18,
+   "uhex": "777777777777777777777777777777777777",
+   "urn": 0,
+   "what": "the real daddr: refused by the list"
+  },
+  {
+   "arm": "nh6",
+   "base": 1,
+   "crn": 0,
+   "gate": 1,
+   "iaddr": 0,
+   "ideliv": 1,
+   "ihdr": 0,
+   "ipin": 1,
+   "len": 2,
+   "live": 0,
+   "off": 6,
+   "prp": 1,
+   "prx": 46,
+   "rhex": "ffffffffffffaabbcc000066886411000063003000214500002e123400004011547a0a0100010a0900079c401388001a",
+   "rn": 68,
+   "udp4": 18,
+   "uhex": "777777777777777777777777777777777777",
+   "urn": 0,
+   "what": "the PPP protocol field: no such cell in the ip4 list"
+  },
+  {
+   "arm": "ll6",
+   "base": 0,
+   "crn": 0,
+   "gate": 1,
+   "iaddr": 0,
+   "ideliv": 0,
+   "ihdr": 0,
+   "ipin": 0,
+   "len": 2,
+   "live": 1,
+   "off": 6,
+   "prp": 0,
+   "prx": 0,
+   "rhex": "ffffffffffffffffcc000066886411000063003000214500002e123400004011547a0a0100010a0900079c401388001a",
+   "rn": 68,
+   "udp4": -1,
+   "uhex": "-",
+   "urn": 0,
+   "what": "@ll offset 6: inside the 14-boundary, writes the source MAC"
+  },
+  {
+   "arm": "ll13",
+   "base": 0,
+   "crn": 0,
+   "gate": 1,
+   "iaddr": 0,
+   "ideliv": 1,
+   "ihdr": 0,
+   "ipin": 1,
+   "len": 1,
+   "live": 1,
+   "off": 13,
+   "prp": 1,
+   "prx": 46,
+   "rhex": "ffffffffffffaabbcc00006688ff11000063003000214500002e123400004011547a0a0100010a0900079c401388001a",
+   "rn": 68,
+   "udp4": 18,
+   "uhex": "777777777777777777777777777777777777",
+   "urn": 0,
+   "what": "@ll offset 13: the last allowed byte, the ethertype's low byte"
+  },
+  {
+   "arm": "ll14",
+   "base": 0,
+   "crn": 0,
+   "gate": 1,
+   "iaddr": 0,
+   "ideliv": 1,
+   "ihdr": 0,
+   "ipin": 1,
+   "len": 2,
+   "live": 0,
+   "off": 14,
+   "prp": 1,
+   "prx": 46,
+   "rhex": "ffffffffffffaabbcc000066886411000063003000214500002e123400004011547a0a0100010a0900079c401388001a",
+   "rn": 68,
+   "udp4": 18,
+   "uhex": "777777777777777777777777777777777777",
+   "urn": 0,
+   "what": "@ll offset 14: the PPPoE header, refused (boundary 14)"
+  },
+  {
+   "arm": "pre88ff",
+   "base": -1,
+   "crn": 0,
+   "gate": -1,
+   "iaddr": 0,
+   "ideliv": 0,
+   "ihdr": 0,
+   "ipin": 0,
+   "len": -1,
+   "live": 0,
+   "off": -1,
+   "prp": 0,
+   "prx": 0,
+   "rhex": "-",
+   "rn": -1,
+   "udp4": -1,
+   "uhex": "-",
+   "urn": 0,
+   "what": "the ll13 bytes, sent from outside with no rule"
+  }
+ ],
+ "finding": "F42",
+ "frame_ps": "ffffffffffffaabbcc000066886411000063003000214500002e123400004011547a0a0100010a0900079c401388001a0000777777777777777777777777777777777777",
+ "frame_v6": "ffffffffffffaabbcc0000668864110000630044005760000000001a1140fd000000000000000000000000980001fd0000000000000000000000009900099c401388001a2182777777777777777777777777777777777777",
+ "kernel": "7.3.4-T563",
+ "kernel_sha256": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+ "question": "Does a bridge @nh write reach a real IP stack through PPPoE in the PPPOX_BOUND state, what does IPv6 inside PPPoE do to the same white list, and does an ARP frame with vid 100 arrive once a real vlan device exists?",
+ "turn": 564,
+ "v6p": [
+  {
+   "arm": "ctl",
+   "i6addr": 0,
+   "i6deliv": 1,
+   "i6hdr": 0,
+   "i6in": 1,
+   "len": 0,
+   "live": 1,
+   "off": 0,
+   "prx": 66,
+   "rhex": "ffffffffffffaabbcc0000668864110000630044005760000000001a1140fd000000000000000000000000980001fd00",
+   "udp6": 18,
+   "urhex": "-",
+   "urn": 0,
+   "what": "control: no store"
+  },
+  {
+   "arm": "hop",
+   "i6addr": 0,
+   "i6deliv": 0,
+   "i6hdr": 0,
+   "i6in": 0,
+   "len": 1,
+   "live": 1,
+   "off": 7,
+   "prx": 66,
+   "rhex": "ffffffffffffaabbcc0000668864110000630044009060000000001a1140fd000000000000000000000000980001fd00",
+   "udp6": -1,
+   "urhex": "009060000000001a1140fd000000000000000000000000980001fd0000000000000000000000009900099c401388001a2182777777777777777777777777777777777777",
+   "urn": 68,
+   "what": "hop_limit (len 1) -> wire 21 = the PPP protocol's low byte"
+  },
+  {
+   "arm": "hopsame",
+   "i6addr": 0,
+   "i6deliv": 1,
+   "i6hdr": 0,
+   "i6in": 1,
+   "len": 1,
+   "live": 1,
+   "off": 7,
+   "prx": 66,
+   "rhex": "ffffffffffffaabbcc0000668864110000630044005760000000001a1140fd000000000000000000000000980001fd00",
+   "udp6": 18,
+   "urhex": "-",
+   "urn": 0,
+   "what": "the same cell, the PPP protocol's own byte: no change"
+  },
+  {
+   "arm": "dscp",
+   "i6addr": 0,
+   "i6deliv": 0,
+   "i6hdr": 0,
+   "i6in": 0,
+   "len": 4,
+   "live": 1,
+   "off": 0,
+   "prx": 0,
+   "rhex": "ffffffffffffaabbcc0000668864609091920044005760000000001a1140fd000000000000000000000000980001fd00",
+   "udp6": -1,
+   "urhex": "-",
+   "urn": 0,
+   "what": "version/tc (len 4) -> pppoe ver/type + code + sid"
+  },
+  {
+   "arm": "flow2",
+   "i6addr": 0,
+   "i6deliv": 0,
+   "i6hdr": 0,
+   "i6in": 0,
+   "len": 2,
+   "live": 1,
+   "off": 2,
+   "prx": 0,
+   "rhex": "ffffffffffffaabbcc0000668864110090910044005760000000001a1140fd000000000000000000000000980001fd00",
+   "udp6": -1,
+   "urhex": "-",
+   "urn": 0,
+   "what": "flow label low half -> pppoe sid"
+  },
+  {
+   "arm": "hdr_same",
+   "i6addr": 0,
+   "i6deliv": 1,
+   "i6hdr": 0,
+   "i6in": 1,
+   "len": 16,
+   "live": 1,
+   "off": 8,
+   "prx": 66,
+   "rhex": "ffffffffffffaabbcc0000668864110000630044005760000000001a1140fd000000000000000000000000980001fd00",
+   "udp6": 18,
+   "urhex": "-",
+   "urn": 0,
+   "what": "saddr (16) -> wire 22: the header's first 16 bytes, unchanged"
+  },
+  {
+   "arm": "hdr_bad",
+   "i6addr": 0,
+   "i6deliv": 0,
+   "i6hdr": 1,
+   "i6in": 1,
+   "len": 16,
+   "live": 1,
+   "off": 8,
+   "prx": 66,
+   "rhex": "ffffffffffffaabbcc00006688641100006300440057909192939495969798999a9b9c9d9e9f0000000000980001fd00",
+   "udp6": -1,
+   "urhex": "-",
+   "urn": 0,
+   "what": "saddr (16) -> wire 22: version 9"
+  },
+  {
+   "arm": "dst",
+   "i6addr": 0,
+   "i6deliv": 0,
+   "i6hdr": 0,
+   "i6in": 1,
+   "len": 16,
+   "live": 1,
+   "off": 24,
+   "prx": 66,
+   "rhex": "ffffffffffffaabbcc0000668864110000630044005760000000001a1140fd0000000000000090919293949596979899",
+   "udp6": -1,
+   "urhex": "-",
+   "urn": 0,
+   "what": "daddr (16) -> wire 38: saddr[8..15] + daddr[0..7]"
+  },
+  {
+   "arm": "one",
+   "i6addr": 0,
+   "i6deliv": 1,
+   "i6hdr": 0,
+   "i6in": 1,
+   "len": 2,
+   "live": 0,
+   "off": 1,
+   "prx": 66,
+   "rhex": "ffffffffffffaabbcc0000668864110000630044005760000000001a1140fd000000000000000000000000980001fd00",
+   "udp6": 18,
+   "urhex": "-",
+   "urn": 0,
+   "what": "offset 1: no such cell in the ip6 list"
+  },
+  {
+   "arm": "three",
+   "i6addr": 0,
+   "i6deliv": 1,
+   "i6hdr": 0,
+   "i6in": 1,
+   "len": 2,
+   "live": 0,
+   "off": 3,
+   "prx": 66,
+   "rhex": "ffffffffffffaabbcc0000668864110000630044005760000000001a1140fd000000000000000000000000980001fd00",
+   "udp6": 18,
+   "urhex": "-",
+   "urn": 0,
+   "what": "offset 3: no such cell in the ip6 list"
+  },
+  {
+   "arm": "six",
+   "i6addr": 0,
+   "i6deliv": 1,
+   "i6hdr": 0,
+   "i6in": 1,
+   "len": 1,
+   "live": 0,
+   "off": 6,
+   "prx": 66,
+   "rhex": "ffffffffffffaabbcc0000668864110000630044005760000000001a1140fd000000000000000000000000980001fd00",
+   "udp6": 18,
+   "urhex": "-",
+   "urn": 0,
+   "what": "offset 6: no such cell in the ip6 list"
+  }
+ ],
+ "vlan": [
+  {
+   "arc": 0,
+   "arm": "ctl_novlan",
+   "ent": "-",
+   "len": 0,
+   "live": 1,
+   "off": 0,
+   "pass": "novlan",
+   "rephex": "-",
+   "repn": -1,
+   "what": "vid 100, no vlan device: control"
+  },
+  {
+   "arc": 0,
+   "arm": "sha_novlan",
+   "ent": "-",
+   "len": 2,
+   "live": 1,
+   "off": 8,
+   "pass": "novlan",
+   "rephex": "-",
+   "repn": -1,
+   "what": "vid 100, no vlan device: sha[0..1]"
+  },
+  {
+   "arc": 1,
+   "arm": "ctl_vlan",
+   "ent": ";0x1;0x2;aa:bb:cc:00:00:66;*;v1",
+   "len": 0,
+   "live": 1,
+   "off": 0,
+   "pass": "vlan",
+   "rephex": "aabbcc0000661a9abf28ee84080600010800060400021a9abf28ee840a090001aabbcc0000660a010040",
+   "repn": 42,
+   "what": "vid 100, v1 on br0: control"
+  },
+  {
+   "arc": 1,
+   "arm": "sha_vlan",
+   "ent": ";0x1;0x2;90:91:cc:00:00:66;*;v1",
+   "len": 2,
+   "live": 1,
+   "off": 8,
+   "pass": "vlan",
+   "rephex": "9091cc0000661a9abf28ee84080600010800060400021a9abf28ee840a0900019091cc0000660a010041",
+   "repn": 42,
+   "what": "vid 100, v1 on br0: sha[0..1]"
+  },
+  {
+   "arc": 1,
+   "arm": "op_vlan",
+   "ent": "-",
+   "len": 2,
+   "live": 1,
+   "off": 6,
+   "pass": "vlan",
+   "rephex": "-",
+   "repn": -1,
+   "what": "vid 100, v1: ar_op = 0x9091 (unknown)"
+  },
+  {
+   "arc": 1,
+   "arm": "hln_vlan",
+   "ent": ";0x1;0x2;aa:bb:cc:00:00:66;*;v1",
+   "len": 2,
+   "live": 0,
+   "off": 4,
+   "pass": "vlan",
+   "rephex": "aabbcc0000661a9abf28ee84080600010800060400021a9abf28ee840a090001aabbcc0000660a010043",
+   "repn": 42,
+   "what": "vid 100, v1: offset 4 (ar_hln/pln) is not in the ARP list"
+  }
+ ]
+}

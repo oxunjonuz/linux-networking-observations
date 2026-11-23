@@ -1,0 +1,2765 @@
+===== LETTER_SECTION_F70.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: UDP GRO: skb_condense() is called only when rmem > rcvbuf/2, and
+ the queue can sit exactly on that boundary -- measured with a kprobe, not
+ inferred from the queue
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+STATUS: NOT SENT -- draft for the F28 thread; sending is the owner's call.
+
+F70 -- the branch, and its boundary
+
+Kernel 7.3.4-T563 (no new build). Instrument: three netns on IPv4, one veth
+pair per door, a sender and a receiver in their own namespaces, and a kprobe on
+skb_condense() with fetchargs at the field offsets pahole reads out of this
+kernel's own DWARF (len 112, data_len 116, tail 188, end 192, truesize 216,
+flags 126). Five more counters: __pskb_pull_tail, __udp_enqueue_schedule_skb,
+___pskb_trim, skb_segment_list. Records are attributed to an arm by markers in
+trace_marker, because writing to `trace` does not clear it in this kernel.
+
+1. The head of a fraglist aggregate reaches the enqueue path already linear,
+   carrying the whole aggregate.
+
+       p:kprobes/cond skb_condense len=+112(%di):u32 dlen=+116(%di):u32 ...
+
+   measures, for six datagrams of 512 bytes arriving as one fraglist aggregate
+   on a queue above half a buffer:
+
+       len=512 dlen=0 tail=556 end=704 ts=7680 fl=0     <- the head
+       len=512 dlen=0 tail=556 end=704 ts=1280 fl=0     <- segment 2
+       ... five more at 1280
+
+   7680 is 6 * 1280: the sum of the merged datagrams' truesizes, exactly what
+   skb_gro_receive_list() accumulates. skb_segment_list() subtracts len and
+   data_len from this skb and never touches truesize, so the last line of
+   skb_condense() -- skb->truesize = SKB_TRUESIZE(skb_end_offset(skb)) --
+   rewrites 7680 into 1280. __pskb_pull_tail is called 0 times in all 36
+   attempts: the early-return block is skipped because data_len is 0, not
+   because a clause inside it failed.
+
+2. The comparison is strictly greater, and the queue can sit on the boundary.
+
+   `rcvbuf >> 1` is 19200 when SO_RCVBUF(19200) is requested. A filler sent one
+   datagram at a time (250 ms apart, so it never aggregates) puts rmem exactly
+   on 19200, and then the same six-datagram burst leaves the queue 14080 bytes
+   heavier with 5 calls of skb_condense(). One more filler datagram -- rmem
+   20480 -- and the same burst costs 7680 with 6 calls, the first of them on
+   the head at 7680. Two attempts per arm, two boots, four measurements per
+   cell, all identical.
+
+3. The same charge can come from two different mechanisms, and the queue
+   cannot tell them apart.
+
+   Fraglist door: 6 calls, the first carrying 7680, total 7680.
+   Linear door: 6 calls, every one carrying 1280, total 7680.
+   On the linear door skb_segment() builds fresh segments and the aggregate
+   never reaches the queue, so condense() fires six times and changes nothing.
+   Only the probe separates the two -- which is why I stopped inferring this
+   branch from the bill.
+
+4. A total truesize is a sum, and condense reprices each part.
+
+   Five datagrams of 512 and one of 200: the head arrives at 7360
+   (5 * 1280 + 960), the short one at 960, and after condense the queue gains
+   7360 -- the same number, now as five times 1280 plus 960. Every record that
+   is not an aggregate head satisfies ts == end + 576 in this kernel; the same
+   constant follows from the 1200-byte datagram measured earlier (2304 - 1728).
+
+Nothing here is a kernel bug: it is the price of a documented memory-pressure
+branch, and the numbers are what __udp_enqueue_schedule_skb() is supposed to
+charge. What is worth knowing is that the queue's byte account cannot be used
+to infer which door a datagram came through, while a single field of the skb at
+the moment skb_condense() runs can.
+
+
+===== SUMMARY.md =====
+# F70 — the branch measured at the function, and the boundary measured on one datagram
+
+Turn 592. Kernel `7.3.4-T563` (`1efbc957…2033`), **no new build**. Instrument
+`differ592`, mode `cond`: **9 arms × 2 attempts × 2 boots = 36 attempts**, all
+with the marker window intact.
+
+Two debts, in their own words from the earlier documents:
+
+* F67 §6: *«Где именно теряется `N·s`, я не установил.»* — the function that
+  drops an aggregate's truesize was named by reading, never observed.
+* F68 §9: *«строгость `>` в сравнении с половиной буфера не проверена — ни одно
+  плечо не ставит очередь ровно на `R/2`, и мутация `half-inclusive` выжила
+  (это дыра, а не мелочь)».*
+
+Both are closed by putting the queue **exactly** on the boundary and by
+watching the function itself.
+
+## 0. The model being tested
+
+`net/ipv4/udp.c`, `__udp_enqueue_schedule_skb()`, in this order:
+
+```c
+	rmem = atomic_read(&sk->sk_rmem_alloc);
+	rcvbuf = READ_ONCE(sk->sk_rcvbuf);
+	size = skb->truesize;
+	...
+	if (rmem + size > rcvbuf) {          /* (1) drop, unless queue empty */
+		if (rcvbuf > INT_MAX >> 1) goto drop;
+		if (rmem) goto drop;
+	}
+	if (rmem > (rcvbuf >> 1)) {          /* (2) the branch under test */
+		skb_condense(skb);
+		size = skb->truesize;
+	}
+```
+
+`net/core/skbuff.c`, `skb_condense()`:
+
+```c
+	if (skb->data_len) {
+		if (skb->data_len > skb->end - skb->tail ||
+		    skb_cloned(skb) || !skb_frags_readable(skb))
+			return;                  /* (3) early return */
+		__pskb_pull_tail(skb, skb->data_len);   /* (4) linearise */
+	}
+	skb->truesize = SKB_TRUESIZE(skb_end_offset(skb));  /* (5) reset */
+```
+
+The model says: on the fraglist door the receiver cuts the aggregate with
+`skb_segment_list()`, which subtracts `len` and `data_len` from the head and
+never touches `truesize`; so the head arrives at (2) **already linear**,
+carrying the whole aggregate, and clause (3) is skipped because `data_len == 0`
+— line (5) alone does the work.
+
+## 1. The instrument: a kprobe on the function, not an inference from the queue
+
+`CONFIG_KPROBE_EVENTS=y` in this kernel, so the tracefs interface can attach a
+probe to the function itself. Five events, created by the differ at boot:
+
+```
+p:kprobes/f592cond skb_condense len=+112(%di):u32 dlen=+116(%di):u32
+                    tail=+188(%di):u32 end=+192(%di):u32
+                    ts=+216(%di):u32 fl=+126(%di):u8
+p:kprobes/f592pull __pskb_pull_tail
+p:kprobes/f592enq  __udp_enqueue_schedule_skb
+p:kprobes/f592trim ___pskb_trim
+p:kprobes/f592seg  skb_segment_list
+```
+
+The six field offsets are **not guessed**: they are read out of the DWARF of
+the very `vmlinux` that boots —
+
+```
+$ pahole -C sk_buff vmlinux
+	unsigned int  len;        /* 112 */
+	unsigned int  data_len;   /* 116 */
+	sk_buff_data_t tail;      /* 188 */
+	sk_buff_data_t end;       /* 192 */
+	unsigned int  truesize;   /* 216 */
+	__u8 cloned:1;            /* 126: 0 */
+```
+
+— and the kernel echoes the definition back in `kprobe_events`, which the
+differ prints verbatim as `F592 DEF|…` (five lines, checked complete).
+
+Attribution is by **marker**, not by clearing the buffer: writing to `trace` did
+**not** reset it in this kernel (measured in the first smoke: the counts of arm
+2 included arm 1), so every arm writes `BEGIN i=NN att=K` and `END i=NN att=K`
+into `trace_marker` and only the records between them count. The filler is sent
+before `BEGIN`, so its enqueues are outside the window by construction.
+
+## 2. The head that carries the aggregate — F69's inference, now a record
+
+`c_gt`: queue at 20480 = `R/2 + 1280` before the burst, 6 datagrams of 512
+back to back through the fraglist door.
+
+| record | `len` | `dlen` | `tail` | `end` | `ts` | `fl` |
+|---|---|---|---|---|---|---|
+| 1 (the head) | 512 | **0** | 556 | 704 | **7680** | 0 |
+| 2 | 512 | 0 | 556 | 704 | 1280 | 0 |
+| 3–6 | 512 | 0 | 556 | 704 | 1280 | 0 |
+
+7680 = 6 × 1280: the first `skb_condense()` call of the burst sees an skb that
+is **already linear** (`dlen = 0`, so clause 3 is never reached) and carries the
+**whole aggregate's** truesize. `end - tail = 148` — the tailroom is not even
+consulted, because `data_len == 0` skips the block entirely. `__pskb_pull_tail`
+is called **0** times in all 36 attempts: nothing is linearised, because
+nothing needed to be.
+
+The queue agrees to the byte: the arm gains **7680** = 6 × 1280, not
+`(2·6−1)·1280 = 14080`.
+
+## 3. The strict `>` — one filler datagram decides two different worlds
+
+The filler is sent **one datagram at a time, 250 ms apart**, so it never
+aggregates and each datagram costs exactly one `s = 1280`. That makes the
+queue's position a number we choose, not a number we hope for.
+
+`rcvbuf` is requested as 19200 → `sk_rcvbuf = 38400` → `rcvbuf >> 1 = 19200`.
+
+| arm | filler | `rmem` before the burst | vs half | calls of `skb_condense` | queue delta |
+|---|---|---|---|---|---|
+| `c_zero` | 0 | 0 | below | **0** | 14080 |
+| `c_lt` | 13 | 16640 | below | **5** | 14080 |
+| **`c_eq`** | 15 | **19200** | **exactly half** | **5** | **14080** |
+| **`c_gt`** | 16 | 20480 | above | **6** | **7680** |
+| `c_eq2` | 15 | 19200 | exactly half | 5 | 14080 |
+| `c_gt2` | 16 | 20480 | above | 6 | 7680 |
+
+All four measurements of every row agree (2 attempts × 2 boots).
+
+`c_eq` is the cell F68 said did not exist: the queue sits on `R/2` to the byte
+(`WAIT|want=19200|rmem=19200`), and the head is **not** condensed — 5 calls, the
+queue gains 14080, and no record anywhere in that arm carries 7680. One extra
+filler datagram (`c_gt`) moves the head across the boundary and the same send
+costs 7680 with 6 calls. The `>` is strict, measured, and a `>=` mutation now
+dies on this data (`half-inclusive`, §12).
+
+## 4. One number, two mechanisms
+
+`c_gt` and `c_lin` both leave the queue 7680 bytes heavier:
+
+| arm | door at x0 | `skb_segment_list` | calls | `ts` of every record | delta |
+|---|---|---|---|---|---|
+| `c_gt` | fraglist (`rx-gro-list`) | 1 | 6 | **7680**, 1280, 1280, 1280, 1280, 1280 | 7680 |
+| `c_lin` | linear (`rx-udp-gro-forwarding`) | **0** | 6 | 1280 × 6 | 7680 |
+
+On the linear door `skb_segment()` builds fresh segments, so the aggregate never
+reaches the enqueue path at all and `skb_condense()` sees six ordinary
+datagrams, each already priced at 1280 — it fires six times and changes
+nothing. On the fraglist door it fires six times and changes everything once.
+**The queue cannot tell these two apart; the probe can.** That is the whole
+argument for measuring the branch instead of the bill.
+
+## 5. The call that changes nothing, and the flag it carries
+
+`c_one`: one datagram, queue above half. One call, `ts = 1280`, delta 1280 —
+the branch fires and has nothing to do. The record also shows `fl = 1`, i.e.
+**`cloned = 1`** (bit 0 of byte 126). It does not matter here: `data_len == 0`
+skips the block before the cloned test can be reached. It is nevertheless the
+only arm of the nine whose single record is flagged, and it is named as such.
+
+The flags byte separates the doors elsewhere: on the linear door
+(`c_lin`) the records are `fl = 0,1,1,1,1,1` — the first segment fresh, the
+other five cloned — while every fraglist arm is `fl = 0,…,0`. Clause 3's
+`skb_cloned()` test is therefore reached by *nothing* in this instrument,
+because clause 3 is entered only when `data_len != 0` and no arm here has one.
+
+## 6. The short tail: the head's truesize is a sum, and condense reprices each part
+
+`c_tail`: 5 datagrams of 512 and a last one of 200 bytes, queue above half.
+
+| record | `len` | `end` | `ts` |
+|---|---|---|---|
+| 1 (the head) | 512 | 704 | **7360** |
+| 2–5 | 512 | 704 | 1280 × 4 |
+| 6 (the short tail) | 200 | 384 | **960** |
+
+7360 = 5 × 1280 + 960 — the head arrives carrying the **sum** of the merged
+datagrams' truesizes (`skb_gro_receive_list()` does `p->truesize +=
+skb->truesize`), and the short datagram is worth 960, not 1280. After
+condense every segment is priced at its own `SKB_TRUESIZE(end)`, so the total
+is 1280 × 5 + 960 = **7360** — the same number by a different route. The queue
+confirms: delta 7360, four measurements, identical.
+
+## 7. `SKB_TRUESIZE(x) = x + 576` in this kernel
+
+Every record that is not an aggregate head satisfies `ts == end + 576`, across
+two segment sizes: `704 + 576 = 1280` and `384 + 576 = 960`. The constant is
+not assumed: the same 576 was derived in F67 from `1280 − 704` and
+`2304 − 1728` (a 1200-byte datagram), and this instrument re-derives it on a
+third size. The verifier checks the identity on **every** record of all 36
+attempts (`ts-is-skb-truesize`).
+
+## 8. Predictions: 12 held, 2 refuted
+
+Frozen before the first boot (`research/predictions_592.md`,
+`0d574b40…d9783`).
+
+Held: **P1** (the probe works at all), **P2** (the offsets are the right ones:
+every `len` is 512 or 200, never a neighbouring field), **P3** (the head carries
+7680 with `dlen = 0`), **P4** (0 calls, delta 14080), **P5** (5 calls, 14080),
+**P6** (`c_eq` behaves like `c_lt`, not like `c_gt`), **P7** (6 calls, 7680,
+first record 7680), **P8** (1 call, 1280), **P9** (linear door: 6 × 1280, 7680),
+**P10** (`__pskb_pull_tail` = 0 everywhere), **P11** (segmenter 1 / 0), **P13**
+(repeats identical).
+
+**Refuted, P12**: I predicted a trim path in `c_tail` (`___pskb_trim > 0`, and a
+record with `dlen > end − tail`). Measured: `trim = 0` in all 36 attempts, and
+`dlen = 0` on every one of the **160** records. The tail datagram's segment is
+built with its own length by `skb_segment_list()`; there is nothing to trim.
+
+**Refuted in its number, P14**: I wrote "`__udp_enqueue_schedule_skb` is entered
+exactly `j + n` times per arm". The instrument counts inside the marker window,
+so it sees **n** — the filler's enqueues are outside by construction. The
+substance holds: `enq == n` exactly in every attempt, i.e. the primer is never
+enqueued (it goes to a port with no socket).
+
+## 9. My errors this turn
+
+1. **No primer → the burst split.** The first smoke's `c_zero` gained 12800
+   instead of 14080: the six datagrams were processed as 2 + 4, so the head
+   carried only 2 × 1280 and there were two aggregates. F69's primer (one
+   datagram to a dead port, so x0's NAPI is already inside a poll when the
+   measured burst starts) was in the *old* runner and I did not carry it into
+   mine. Fixed; every arm since has delta exactly on the model.
+2. **The trace buffer is not cleared by writing to `trace`.** My first smoke's
+   counters were cumulative, and every arm after the first looked as if it had
+   condense calls it never had. Fixed by attributing records to markers instead
+   of relying on a clear. This is the same class as F57's "the log's order is
+   not the program's order".
+3. **A witness that lies about its own size, third time in the project.** The
+   kernel's echo of the five probe definitions was read into a 256-byte buffer
+   and printed as five lines — the fifth (`skb_segment_list`) came out as
+   `p:k`. F40 #2 and F50 #5 were the first two. Caught by `verify592.py`'s
+   `probe/def-lines-complete` on the *first* pair of boots; both boots were
+   repeated with a 4 KB buffer (the truncated pair is kept as
+   `logs/f70_rep{1,2}_deftrunc.log`).
+
+## 10. What is not measured, plainly
+
+* **The three early-return clauses.** `data_len > end − tail`,
+  `skb_cloned()`, `!skb_frags_readable()` are all unreachable in these arms,
+  because `data_len == 0` skips the whole block. Hitting clause 1 needs a
+  datagram delivered whole (`UDP_GRO` socket) or a large payload; hitting
+  clause 2 needs a shared skb *with* fragments. Both are named debts, not
+  conclusions.
+* **The trim path** (`___pskb_trim()` calling `skb_condense()` at
+  `skbuff.c:2806`): 0 calls here. P12 tried to reach it and failed.
+* **Payloads other than 512 and a 200-byte tail**, and `s` for 1200-byte
+  datagrams only through F69's ladder.
+* **The linear door's segment prices** are measured only as the sum (`k·s`);
+  per-segment records there are all 1280 by construction.
+* Not touched at all: TCP, tunnels, `CHECKSUM_COMPLETE`, a real NIC (both doors
+  are veth with bits cleared by hand), IPv6 in this instrument (F66/F67 cover
+  it).
+* **Not a vulnerability**: every rule-free arm still runs as root in the
+  initial user namespace; the probes were created by root, and creating a
+  kprobe requires `CAP_SYS_ADMIN`-class privilege, which any measurement of
+  this kind needs (F57).
+
+## 11. What this changes in the earlier findings
+
+* **F67 §6 is closed, not revised.** The sentence "`skb_condense()` стоит в
+  `__udp_enqueue_schedule_skb()` ниже проверки отказа — значит эта ветка не
+  может быть тем, что даёт отказу увидеть уменьшенное число" was *correct
+  about the order* and wrong about the consequence: the branch does not have to
+  influence the drop check to matter — it changes the number the **accounting**
+  uses afterwards, which is exactly the 81920 → 1280 that F67 measured.
+* **F68 §9's hole is closed** by `c_eq`: a queue exactly on `R/2` is not above
+  it.
+* **F69's arithmetic stands**, and now has a witness: `(2k−1)·s` below half,
+  `k·s` above, decided by whether the *head* is enqueued above half.
+
+## 12. How it was verified
+
+| | |
+|---|---|
+| `tools/verify592.py` | **2034 checks, 0 failed** — provenance (kernel sha from the header and from the disk, initrd from the header and from the file, the differ **extracted from the initramfs**, `predictions_592.md` unchanged), 8 source anchors (the drop check before the branch, the strict `>`, three early-return clauses, the reset line, `skb_segment_list` never mentioning truesize), the six offsets **re-derived here by pahole** and compared with the ones printed and with the kernel's echo, the arm table **parsed from `vm/differ592_add.c`** against 12 printed parameters per arm, the queue (`rb = 2·req`, the filler landing exactly on `exp_f`, the delta), the probe (calls, `__pskb_pull_tail` = 0, segmenter, enqueue = n, markers), the arithmetic of **every** record (`dlen = 0`, `len` is a datagram's, `end − tail > 0`, `ts == end + 576` for every non-head, the head's `ts` is the sum), the agreement of the two instruments, determinism inside each boot and between the boots |
+| `tools/verify592_selftest.py` | **26/26** — 25 single-clause mutations red without a traceback, `noop` green, none refused. `half-inclusive` — the mutation F68 saw **survive** — dies here on `c_eq` |
+| `tools/f70_summary.py` | every table above is built from the logs (`summary.json`); nothing is typed by hand |
+| `tools/audit_f70_doc.py` | the document's numbers against `summary.json` and against the logs; single substitutions in a copy of the document must be caught |
+| collection | see `RESEARCH_LOG.md` of this turn |
+| letter form | see `LETTER_STATUS.md` |
+
+## 13. Files
+
+`findings/F70-condense/{SUMMARY.md, summary.json, VERIFY_REPORT.md,
+LETTER_SECTION_F70.txt}`; `vm/{differ592_add.c, differ592.c,
+build_f70_differ.sh, make_initramfs592.sh, build/differ592}`;
+`tools/{f70_run.sh, f70_two.sh, verify592.py, verify592_selftest.py,
+f70_summary.py, audit_f70_doc.py}`; `research/predictions_592.md`;
+logs `f70_rep1.log`, `f70_rep2.log` (+ the two truncated-echo boots kept as
+`f70_rep{1,2}_deftrunc.log`).
+
+
+===== summary.json =====
+{
+ "finding": "F70-condense",
+ "turn": 592,
+ "headline": "skb_condense() fires only above half a receive buffer, replaces an aggregate head's truesize with one datagram's, and the comparison is strictly greater -- measured at the function with a kprobe",
+ "kernel_sha": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+ "question": "What does skb_condense() actually see when __udp_enqueue_schedule_skb() calls it, and is the `rmem > (rcvbuf >> 1)` comparison strict at the boundary?",
+ "answer_short": "On the fraglist door the aggregate's head arrives at the branch already linear (data_len 0) carrying the whole aggregate (7680 = 6*1280) and the last line of skb_condense() rewrites it into 1280; a queue exactly on rcvbuf/2 is NOT above it (5 calls, delta 14080) while one datagram more gives 6 calls and 7680. A linear-door aggregate costs the same 7680 by a different route, and only the probe separates the two.",
+ "answer": "36 attempts (9 arms x 2 attempts x 2 boots), 160 records, 2034 checks, 0 failed; selftest 26/26 with half-inclusive among the dead; 12 of 14 predictions held, P12 and P14 refuted and named.",
+ "arms": [
+  {
+   "name": "c_zero",
+   "xg": "f",
+   "j": 0,
+   "n": 6,
+   "pl": 512,
+   "sh": -1,
+   "sl": 0,
+   "rcvbuf": 19200,
+   "exp_f": 0,
+   "exp_delta": 14080,
+   "exp_calls": 0,
+   "att": [
+    {
+     "boot": "f70_rep1.log",
+     "att": 0,
+     "rb": 38400,
+     "filler_rmem": 0,
+     "rmem_after": 14080,
+     "delta": 14080,
+     "datagrams": 6,
+     "nf": 0,
+     "nt": 6,
+     "cond": 0,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [],
+     "dlen": [],
+     "len": [],
+     "tail": [],
+     "end": [],
+     "fl": []
+    },
+    {
+     "boot": "f70_rep1.log",
+     "att": 1,
+     "rb": 38400,
+     "filler_rmem": 0,
+     "rmem_after": 14080,
+     "delta": 14080,
+     "datagrams": 6,
+     "nf": 0,
+     "nt": 6,
+     "cond": 0,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [],
+     "dlen": [],
+     "len": [],
+     "tail": [],
+     "end": [],
+     "fl": []
+    },
+    {
+     "boot": "f70_rep2.log",
+     "att": 0,
+     "rb": 38400,
+     "filler_rmem": 0,
+     "rmem_after": 14080,
+     "delta": 14080,
+     "datagrams": 6,
+     "nf": 0,
+     "nt": 6,
+     "cond": 0,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [],
+     "dlen": [],
+     "len": [],
+     "tail": [],
+     "end": [],
+     "fl": []
+    },
+    {
+     "boot": "f70_rep2.log",
+     "att": 1,
+     "rb": 38400,
+     "filler_rmem": 0,
+     "rmem_after": 14080,
+     "delta": 14080,
+     "datagrams": 6,
+     "nf": 0,
+     "nt": 6,
+     "cond": 0,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [],
+     "dlen": [],
+     "len": [],
+     "tail": [],
+     "end": [],
+     "fl": []
+    }
+   ]
+  },
+  {
+   "name": "c_lt",
+   "xg": "f",
+   "j": 13,
+   "n": 6,
+   "pl": 512,
+   "sh": -1,
+   "sl": 0,
+   "rcvbuf": 19200,
+   "exp_f": 16640,
+   "exp_delta": 14080,
+   "exp_calls": 5,
+   "att": [
+    {
+     "boot": "f70_rep1.log",
+     "att": 0,
+     "rb": 38400,
+     "filler_rmem": 16640,
+     "rmem_after": 30720,
+     "delta": 14080,
+     "datagrams": 19,
+     "nf": 13,
+     "nt": 6,
+     "cond": 5,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "boot": "f70_rep1.log",
+     "att": 1,
+     "rb": 38400,
+     "filler_rmem": 16640,
+     "rmem_after": 30720,
+     "delta": 14080,
+     "datagrams": 19,
+     "nf": 13,
+     "nt": 6,
+     "cond": 5,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "boot": "f70_rep2.log",
+     "att": 0,
+     "rb": 38400,
+     "filler_rmem": 16640,
+     "rmem_after": 30720,
+     "delta": 14080,
+     "datagrams": 19,
+     "nf": 13,
+     "nt": 6,
+     "cond": 5,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "boot": "f70_rep2.log",
+     "att": 1,
+     "rb": 38400,
+     "filler_rmem": 16640,
+     "rmem_after": 30720,
+     "delta": 14080,
+     "datagrams": 19,
+     "nf": 13,
+     "nt": 6,
+     "cond": 5,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "name": "c_eq",
+   "xg": "f",
+   "j": 15,
+   "n": 6,
+   "pl": 512,
+   "sh": -1,
+   "sl": 0,
+   "rcvbuf": 19200,
+   "exp_f": 19200,
+   "exp_delta": 14080,
+   "exp_calls": 5,
+   "att": [
+    {
+     "boot": "f70_rep1.log",
+     "att": 0,
+     "rb": 38400,
+     "filler_rmem": 19200,
+     "rmem_after": 33280,
+     "delta": 14080,
+     "datagrams": 21,
+     "nf": 15,
+     "nt": 6,
+     "cond": 5,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "boot": "f70_rep1.log",
+     "att": 1,
+     "rb": 38400,
+     "filler_rmem": 19200,
+     "rmem_after": 33280,
+     "delta": 14080,
+     "datagrams": 21,
+     "nf": 15,
+     "nt": 6,
+     "cond": 5,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "boot": "f70_rep2.log",
+     "att": 0,
+     "rb": 38400,
+     "filler_rmem": 19200,
+     "rmem_after": 33280,
+     "delta": 14080,
+     "datagrams": 21,
+     "nf": 15,
+     "nt": 6,
+     "cond": 5,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "boot": "f70_rep2.log",
+     "att": 1,
+     "rb": 38400,
+     "filler_rmem": 19200,
+     "rmem_after": 33280,
+     "delta": 14080,
+     "datagrams": 21,
+     "nf": 15,
+     "nt": 6,
+     "cond": 5,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "name": "c_gt",
+   "xg": "f",
+   "j": 16,
+   "n": 6,
+   "pl": 512,
+   "sh": -1,
+   "sl": 0,
+   "rcvbuf": 19200,
+   "exp_f": 20480,
+   "exp_delta": 7680,
+   "exp_calls": 6,
+   "att": [
+    {
+     "boot": "f70_rep1.log",
+     "att": 0,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 28160,
+     "delta": 7680,
+     "datagrams": 22,
+     "nf": 16,
+     "nt": 6,
+     "cond": 6,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      7680,
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "boot": "f70_rep1.log",
+     "att": 1,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 28160,
+     "delta": 7680,
+     "datagrams": 22,
+     "nf": 16,
+     "nt": 6,
+     "cond": 6,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      7680,
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "boot": "f70_rep2.log",
+     "att": 0,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 28160,
+     "delta": 7680,
+     "datagrams": 22,
+     "nf": 16,
+     "nt": 6,
+     "cond": 6,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      7680,
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "boot": "f70_rep2.log",
+     "att": 1,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 28160,
+     "delta": 7680,
+     "datagrams": 22,
+     "nf": 16,
+     "nt": 6,
+     "cond": 6,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      7680,
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "name": "c_eq2",
+   "xg": "f",
+   "j": 15,
+   "n": 6,
+   "pl": 512,
+   "sh": -1,
+   "sl": 0,
+   "rcvbuf": 19200,
+   "exp_f": 19200,
+   "exp_delta": 14080,
+   "exp_calls": 5,
+   "att": [
+    {
+     "boot": "f70_rep1.log",
+     "att": 0,
+     "rb": 38400,
+     "filler_rmem": 19200,
+     "rmem_after": 33280,
+     "delta": 14080,
+     "datagrams": 21,
+     "nf": 15,
+     "nt": 6,
+     "cond": 5,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "boot": "f70_rep1.log",
+     "att": 1,
+     "rb": 38400,
+     "filler_rmem": 19200,
+     "rmem_after": 33280,
+     "delta": 14080,
+     "datagrams": 21,
+     "nf": 15,
+     "nt": 6,
+     "cond": 5,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "boot": "f70_rep2.log",
+     "att": 0,
+     "rb": 38400,
+     "filler_rmem": 19200,
+     "rmem_after": 33280,
+     "delta": 14080,
+     "datagrams": 21,
+     "nf": 15,
+     "nt": 6,
+     "cond": 5,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "boot": "f70_rep2.log",
+     "att": 1,
+     "rb": 38400,
+     "filler_rmem": 19200,
+     "rmem_after": 33280,
+     "delta": 14080,
+     "datagrams": 21,
+     "nf": 15,
+     "nt": 6,
+     "cond": 5,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "name": "c_gt2",
+   "xg": "f",
+   "j": 16,
+   "n": 6,
+   "pl": 512,
+   "sh": -1,
+   "sl": 0,
+   "rcvbuf": 19200,
+   "exp_f": 20480,
+   "exp_delta": 7680,
+   "exp_calls": 6,
+   "att": [
+    {
+     "boot": "f70_rep1.log",
+     "att": 0,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 28160,
+     "delta": 7680,
+     "datagrams": 22,
+     "nf": 16,
+     "nt": 6,
+     "cond": 6,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      7680,
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "boot": "f70_rep1.log",
+     "att": 1,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 28160,
+     "delta": 7680,
+     "datagrams": 22,
+     "nf": 16,
+     "nt": 6,
+     "cond": 6,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      7680,
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "boot": "f70_rep2.log",
+     "att": 0,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 28160,
+     "delta": 7680,
+     "datagrams": 22,
+     "nf": 16,
+     "nt": 6,
+     "cond": 6,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      7680,
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "boot": "f70_rep2.log",
+     "att": 1,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 28160,
+     "delta": 7680,
+     "datagrams": 22,
+     "nf": 16,
+     "nt": 6,
+     "cond": 6,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      7680,
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "name": "c_one",
+   "xg": "f",
+   "j": 16,
+   "n": 1,
+   "pl": 512,
+   "sh": -1,
+   "sl": 0,
+   "rcvbuf": 19200,
+   "exp_f": 20480,
+   "exp_delta": 1280,
+   "exp_calls": 1,
+   "att": [
+    {
+     "boot": "f70_rep1.log",
+     "att": 0,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 21760,
+     "delta": 1280,
+     "datagrams": 17,
+     "nf": 16,
+     "nt": 1,
+     "cond": 1,
+     "pull": 0,
+     "enq": 1,
+     "trim": 0,
+     "seg": 0,
+     "mark": 1,
+     "ts": [
+      1280
+     ],
+     "dlen": [
+      0
+     ],
+     "len": [
+      512
+     ],
+     "tail": [
+      556
+     ],
+     "end": [
+      704
+     ],
+     "fl": [
+      1
+     ]
+    },
+    {
+     "boot": "f70_rep1.log",
+     "att": 1,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 21760,
+     "delta": 1280,
+     "datagrams": 17,
+     "nf": 16,
+     "nt": 1,
+     "cond": 1,
+     "pull": 0,
+     "enq": 1,
+     "trim": 0,
+     "seg": 0,
+     "mark": 1,
+     "ts": [
+      1280
+     ],
+     "dlen": [
+      0
+     ],
+     "len": [
+      512
+     ],
+     "tail": [
+      556
+     ],
+     "end": [
+      704
+     ],
+     "fl": [
+      1
+     ]
+    },
+    {
+     "boot": "f70_rep2.log",
+     "att": 0,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 21760,
+     "delta": 1280,
+     "datagrams": 17,
+     "nf": 16,
+     "nt": 1,
+     "cond": 1,
+     "pull": 0,
+     "enq": 1,
+     "trim": 0,
+     "seg": 0,
+     "mark": 1,
+     "ts": [
+      1280
+     ],
+     "dlen": [
+      0
+     ],
+     "len": [
+      512
+     ],
+     "tail": [
+      556
+     ],
+     "end": [
+      704
+     ],
+     "fl": [
+      1
+     ]
+    },
+    {
+     "boot": "f70_rep2.log",
+     "att": 1,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 21760,
+     "delta": 1280,
+     "datagrams": 17,
+     "nf": 16,
+     "nt": 1,
+     "cond": 1,
+     "pull": 0,
+     "enq": 1,
+     "trim": 0,
+     "seg": 0,
+     "mark": 1,
+     "ts": [
+      1280
+     ],
+     "dlen": [
+      0
+     ],
+     "len": [
+      512
+     ],
+     "tail": [
+      556
+     ],
+     "end": [
+      704
+     ],
+     "fl": [
+      1
+     ]
+    }
+   ]
+  },
+  {
+   "name": "c_lin",
+   "xg": "u",
+   "j": 16,
+   "n": 6,
+   "pl": 512,
+   "sh": -1,
+   "sl": 0,
+   "rcvbuf": 19200,
+   "exp_f": 20480,
+   "exp_delta": 7680,
+   "exp_calls": 6,
+   "att": [
+    {
+     "boot": "f70_rep1.log",
+     "att": 0,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 28160,
+     "delta": 7680,
+     "datagrams": 22,
+     "nf": 16,
+     "nt": 6,
+     "cond": 6,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 0,
+     "mark": 1,
+     "ts": [
+      1280,
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      1,
+      1,
+      1,
+      1,
+      1
+     ]
+    },
+    {
+     "boot": "f70_rep1.log",
+     "att": 1,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 28160,
+     "delta": 7680,
+     "datagrams": 22,
+     "nf": 16,
+     "nt": 6,
+     "cond": 6,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 0,
+     "mark": 1,
+     "ts": [
+      1280,
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      1,
+      1,
+      1,
+      1,
+      1
+     ]
+    },
+    {
+     "boot": "f70_rep2.log",
+     "att": 0,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 28160,
+     "delta": 7680,
+     "datagrams": 22,
+     "nf": 16,
+     "nt": 6,
+     "cond": 6,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 0,
+     "mark": 1,
+     "ts": [
+      1280,
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      1,
+      1,
+      1,
+      1,
+      1
+     ]
+    },
+    {
+     "boot": "f70_rep2.log",
+     "att": 1,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 28160,
+     "delta": 7680,
+     "datagrams": 22,
+     "nf": 16,
+     "nt": 6,
+     "cond": 6,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 0,
+     "mark": 1,
+     "ts": [
+      1280,
+      1280,
+      1280,
+      1280,
+      1280,
+      1280
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      512
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556,
+      556
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704,
+      704
+     ],
+     "fl": [
+      0,
+      1,
+      1,
+      1,
+      1,
+      1
+     ]
+    }
+   ]
+  },
+  {
+   "name": "c_tail",
+   "xg": "f",
+   "j": 16,
+   "n": 6,
+   "pl": 512,
+   "sh": 5,
+   "sl": 200,
+   "rcvbuf": 19200,
+   "exp_f": 20480,
+   "exp_delta": -1,
+   "exp_calls": -1,
+   "att": [
+    {
+     "boot": "f70_rep1.log",
+     "att": 0,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 27840,
+     "delta": 7360,
+     "datagrams": 22,
+     "nf": 16,
+     "nt": 6,
+     "cond": 6,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      7360,
+      1280,
+      1280,
+      1280,
+      1280,
+      960
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      200
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556,
+      244
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704,
+      384
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "boot": "f70_rep1.log",
+     "att": 1,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 27840,
+     "delta": 7360,
+     "datagrams": 22,
+     "nf": 16,
+     "nt": 6,
+     "cond": 6,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      7360,
+      1280,
+      1280,
+      1280,
+      1280,
+      960
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      200
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556,
+      244
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704,
+      384
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "boot": "f70_rep2.log",
+     "att": 0,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 27840,
+     "delta": 7360,
+     "datagrams": 22,
+     "nf": 16,
+     "nt": 6,
+     "cond": 6,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      7360,
+      1280,
+      1280,
+      1280,
+      1280,
+      960
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      200
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556,
+      244
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704,
+      384
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    },
+    {
+     "boot": "f70_rep2.log",
+     "att": 1,
+     "rb": 38400,
+     "filler_rmem": 20480,
+     "rmem_after": 27840,
+     "delta": 7360,
+     "datagrams": 22,
+     "nf": 16,
+     "nt": 6,
+     "cond": 6,
+     "pull": 0,
+     "enq": 6,
+     "trim": 0,
+     "seg": 1,
+     "mark": 1,
+     "ts": [
+      7360,
+      1280,
+      1280,
+      1280,
+      1280,
+      960
+     ],
+     "dlen": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "len": [
+      512,
+      512,
+      512,
+      512,
+      512,
+      200
+     ],
+     "tail": [
+      556,
+      556,
+      556,
+      556,
+      556,
+      244
+     ],
+     "end": [
+      704,
+      704,
+      704,
+      704,
+      704,
+      384
+     ],
+     "fl": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ]
+    }
+   ]
+  }
+ ],
+ "delta": {
+  "c_zero": [
+   14080
+  ],
+  "c_lt": [
+   14080
+  ],
+  "c_eq": [
+   14080
+  ],
+  "c_gt": [
+   7680
+  ],
+  "c_eq2": [
+   14080
+  ],
+  "c_gt2": [
+   7680
+  ],
+  "c_one": [
+   1280
+  ],
+  "c_lin": [
+   7680
+  ],
+  "c_tail": [
+   7360
+  ]
+ },
+ "calls": {
+  "c_zero": [
+   0
+  ],
+  "c_lt": [
+   5
+  ],
+  "c_eq": [
+   5
+  ],
+  "c_gt": [
+   6
+  ],
+  "c_eq2": [
+   5
+  ],
+  "c_gt2": [
+   6
+  ],
+  "c_one": [
+   1
+  ],
+  "c_lin": [
+   6
+  ],
+  "c_tail": [
+   6
+  ]
+ },
+ "seg": {
+  "c_zero": [
+   1
+  ],
+  "c_lt": [
+   1
+  ],
+  "c_eq": [
+   1
+  ],
+  "c_gt": [
+   1
+  ],
+  "c_eq2": [
+   1
+  ],
+  "c_gt2": [
+   1
+  ],
+  "c_one": [
+   0
+  ],
+  "c_lin": [
+   0
+  ],
+  "c_tail": [
+   1
+  ]
+ },
+ "pull": {
+  "c_zero": [
+   0
+  ],
+  "c_lt": [
+   0
+  ],
+  "c_eq": [
+   0
+  ],
+  "c_gt": [
+   0
+  ],
+  "c_eq2": [
+   0
+  ],
+  "c_gt2": [
+   0
+  ],
+  "c_one": [
+   0
+  ],
+  "c_lin": [
+   0
+  ],
+  "c_tail": [
+   0
+  ]
+ },
+ "trim": {
+  "c_zero": [
+   0
+  ],
+  "c_lt": [
+   0
+  ],
+  "c_eq": [
+   0
+  ],
+  "c_gt": [
+   0
+  ],
+  "c_eq2": [
+   0
+  ],
+  "c_gt2": [
+   0
+  ],
+  "c_one": [
+   0
+  ],
+  "c_lin": [
+   0
+  ],
+  "c_tail": [
+   0
+  ]
+ },
+ "head_ts": {
+  "c_zero": [],
+  "c_lt": [
+   [
+    1280
+   ]
+  ],
+  "c_eq": [
+   [
+    1280
+   ]
+  ],
+  "c_gt": [
+   [
+    7680
+   ]
+  ],
+  "c_eq2": [
+   [
+    1280
+   ]
+  ],
+  "c_gt2": [
+   [
+    7680
+   ]
+  ],
+  "c_one": [
+   [
+    1280
+   ]
+  ],
+  "c_lin": [
+   [
+    1280
+   ]
+  ],
+  "c_tail": [
+   [
+    7360
+   ]
+  ]
+ },
+ "fl": {
+  "c_zero": [
+   []
+  ],
+  "c_lt": [
+   [
+    0,
+    0,
+    0,
+    0,
+    0
+   ]
+  ],
+  "c_eq": [
+   [
+    0,
+    0,
+    0,
+    0,
+    0
+   ]
+  ],
+  "c_gt": [
+   [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ]
+  ],
+  "c_eq2": [
+   [
+    0,
+    0,
+    0,
+    0,
+    0
+   ]
+  ],
+  "c_gt2": [
+   [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ]
+  ],
+  "c_one": [
+   [
+    1
+   ]
+  ],
+  "c_lin": [
+   [
+    0,
+    1,
+    1,
+    1,
+    1,
+    1
+   ]
+  ],
+  "c_tail": [
+   [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ]
+  ]
+ },
+ "attempts": 36
+}

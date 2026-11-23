@@ -1,0 +1,5948 @@
+===== LETTER_SECTION_F72.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: UDP GRO: whether a zerocopy sender can be aggregated is decided by
+ the device bit, and the receiver's queue charges it four times as much
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+STATUS: NOT SENT -- draft for the F28 thread; sending is the owner's call.
+
+F72 -- what a user page does to the two UDP GRO doors, measured at the doors
+
+Kernel 7.3.4-T563 (`1efbc957…2033`), no new build. Same three-netns IPv4 path as before, with
+three additions: the sender can set SO_ZEROCOPY and pass MSG_ZEROCOPY, the
+receiver can open a packet socket on its device that either keeps every frame
+or carries a `ret 0` filter so it keeps none, and the forward chain finally
+carries a `log` rule, so "what the rule saw" is a number rather than an
+inference. Thirteen arms, two attempts each, two boots, all 52 identical in
+every modelled field.
+
+1. skb_gro_receive() refuses a zerocopy datagram outright
+   (net/core/gro.c:112: `if (skb_zcopy(p) || skb_zcopy(skb)) return
+   -ETOOMANYREFS;`). Six 512-byte datagrams sent with MSG_ZEROCOPY through
+   rx-udp-gro-forwarding reach the forwarding hook as SIX packets, each with
+   the UDP length field 520. The same six copied datagrams reach it as ONE
+   packet with the length field 3080. skb_gro_receive_list() -- the
+   rx-gro-list door -- has no such check and merges the same zerocopy burst
+   into one packet of 3080. The sender's memory, not the socket, decides.
+
+2. The receiving queue is where zerocopy costs the most. Every enqueue record
+   satisfies ts = end + 576 + PAGE_ALIGN(data_len) for a zerocopy skb and
+   ts = end + 576 otherwise: 5056 for a 512-byte payload, 5056 for 1200, 9152
+   for 5000, against 1280 for a copied 512-byte datagram. The charge is one
+   page per payload, not one page per page touched -- a payload deliberately
+   placed across a page boundary is charged the same 4096. With
+   SO_RCVBUF 19200 (sk_rcvbuf 38400) a 64-datagram zerocopy burst leaves 7
+   datagrams and 57 drops, where a copied burst would leave 30.
+
+3. The copy happens in the receiver and only one door pays it per datagram.
+   ip_local_deliver_finish() calls skb_orphan_frags_rx() ->
+   skb_copy_ubufs() for anything with SKBFL_ZEROCOPY_ENABLE. Counted on the
+   function: six copies for six datagrams on the linear door, and ONE for the
+   fraglist aggregate -- because the aggregate IS its first member, so that
+   member's payload is copied and its flag cleared while the five frag_list
+   members keep the sender's pages all the way to the receiving socket.
+
+4. SKBFL_PURE_ZEROCOPY -- the only thing that makes skb_frags_readable()
+   false, and therefore the third clause of skb_condense()'s early return --
+   is written in exactly one place in this tree (net/ipv4/tcp.c:1331). A UDP
+   skb cannot carry it; the copy in (3) is the proof that the predicate was
+   true, since skb_copy_ubufs() returns -EFAULT for a PURE skb and the caller
+   drops the packet.
+
+5. skb_cloned() is a predicate about liveness, not a bit. With the two
+   datagrams 512+148 merged into one 668-byte packet and delivered whole:
+   no second consumer -> one __pskb_pull_tail of 148 bytes, charge 1280;
+   an egress AF_PACKET tap -> no pull, charge 2240; an ingress AF_PACKET tap
+   -> the same, through skb_share_check() in ip_rcv_core() instead of
+   dev_queue_xmit_nit(); and a packet_type with a `ret 0` filter, which never
+   keeps a frame -> no clone at all, the bit is 0, the pull happens and the
+   charge is 1280. The last case is the interesting one: merely registering a
+   second consumer changes nothing, because __netif_receive_skb_core() calls
+   the last packet_type without taking a reference.
+
+Nothing here is a vulnerability: every rule was installed by root in the
+initial user namespace, and creating a kprobe needs CAP_SYS_ADMIN.
+
+
+===== SUMMARY.md =====
+# F72 — a zerocopy sender, two doors, and the three ways into `skb_condense()`'s early return
+
+Turn 594. Kernel `7.3.4-T563` (`1efbc957…2033`), **no new build**. Instrument
+`differ594`, modes `zc`/`cl` — **13 arms × 2 attempts × 2 boots = 52 measured
+attempts**. Predictions frozen before the first boot (`research/predictions_594.md`).
+
+The two debts, in F71 §8's own words:
+
+> **Клауза 3** (`!skb_frags_readable`) не срабатывает и от «прошла» здесь
+> неотличима: skb с `SKBFL_PURE_ZEROCOPY` в этой топологии нет.
+
+and the standing intention *«кто ещё на приёмном пути ставит `skb_cloned` … и
+достижима ли клауза 2 без наблюдателя»*.
+
+Both are answered — one by a reachability argument backed by a measurement of
+the copy that *does* happen, one by a ladder of four arms in which the
+predicate, not the bit, decides. And the zerocopy sender itself turned out to
+be a much richer instrument than expected: it splits the two GRO doors apart
+and it makes the receive queue charge **four times more**, not less.
+
+## 0. What the source says, and what the arms are built from
+
+Four readings decide the arms (`research/predictions_594.md` §1, frozen
+before the first boot):
+
+1. **`skb_gro_receive()`** (`net/core/gro.c:112`) refuses, before anything else,
+   `if (skb_zcopy(p) || skb_zcopy(skb)) return -ETOOMANYREFS;` — the **linear**
+   door (`rx-udp-gro-forwarding`) cannot merge a datagram whose payload lives in
+   user pages. **`skb_gro_receive_list()`** (the **fraglist** door,
+   `rx-gro-list`) has no such check.
+2. **`SKBFL_PURE_ZEROCOPY` is set in exactly one place** in this tree,
+   `net/ipv4/tcp.c:1331`, and cleared at `tcp.c:1020`. UDP's `ip_append_data()`
+   sets `SKBFL_ZEROCOPY_FRAG` (`ZEROCOPY_ENABLE|SHARED_FRAG`), never the PURE
+   bit, so a UDP datagram cannot make `skb_frags_readable()` false.
+3. **`ip_local_deliver_finish()`** (`net/ipv4/ip_input.c:231`) calls
+   `skb_orphan_frags_rx()` → `skb_copy_ubufs()` for anything carrying
+   `SKBFL_ZEROCOPY_ENABLE`: the payload is copied into kernel pages **in the
+   receiving host**, before `udp_rcv()`.
+4. **`skb_gro_receive_list()`** ORs only `SKBFL_SHARED_FRAG` into the
+   aggregate, and the aggregate **is** its first member — so the head's own
+   payload is copied and its zerocopy flag cleared, while the frag_list
+   members keep their user pages.
+
+New in the instrument (F71's three-netns IPv4 path unchanged): the **sender**
+can use `SO_ZEROCOPY` + `MSG_ZEROCOPY`, the **receiver** can open a packet
+socket on y3 that either keeps every frame or carries a `ret 0` filter so it
+keeps none, and the forward chain — **empty since F68** — finally carries a
+`log` rule, so "what the rule saw" is a number (NFLOG packet count and every
+UDP length field) instead of an inference.
+
+Probes (8): `skb_condense`, `__udp_enqueue_schedule_skb` (the gate),
+`__pskb_pull_tail`, `skb_segment_list`, `___pskb_trim`, `skb_clone`,
+`pskb_expand_head`, and new in this turn **`skb_copy_ubufs`** — the copy
+itself.
+
+## 1. The two doors disagree about zerocopy, in one table
+
+Six datagrams of 512 bytes, one burst, same socket, same route; only the
+sender's memory and one device bit change:
+
+| arm | sender | door | packets at the rule | `uh->len` | gate | charge |
+|---|---|---|---|---|---|---|
+| `z_ctl6` | copy | linear | **1** | 3080 | 6 enq, `dlen` 0 | 7680 |
+| `z_lin6` | MSG_ZEROCOPY | linear | **6** | 520 each | 6 enq, `dlen` **512** | **30336** |
+| `z_fl6` | MSG_ZEROCOPY | fraglist | **1** | 3080 | 6 enq, `dlen` 512 | **55616** |
+
+The linear door merges *nothing*: every zerocopy datagram flushes the flow
+(`skb_zcopy()` → `-ETOOMANYREFS`), so six datagrams reach the rule as six
+packets while the same six copied datagrams reach it as one packet of 3080
+bytes. The fraglist door has no such check and merges them. Same datagrams,
+same door bit that F65–F71 used for a different question, opposite answer —
+and the reason is a property of **the sender's memory**, which no socket
+option exposes.
+
+`z_ctl6` also refutes half of P1: on a *plain* socket the aggregate is
+segmented by `skb_segment()` before the queue, so the gate sees six records
+with `dlen` 0 and `ts` 1280, not one record with `dlen` 2560 (F71 saw that
+shape only on the UDP_GRO socket).
+
+## 2. A zerocopy datagram costs the receive queue a whole page — four times a plain one
+
+Every enqueue record satisfies one identity:
+
+```
+ts = end + 576 + (PAGE_ALIGN(dlen) if the skb is zerocopy else 0)
+```
+
+| arm | payload | gate record | `ts` |
+|---|---|---|---|
+| `z_lin1` | 512 | `dlen` 512, `end` 384 | **5056** = 384+576+4096 |
+| `z_lin1q` | 1200 | `dlen` 1200, `end` 384 | **5056** |
+| `z_lin1w` | 5000 | `dlen` 5000, `end` 384 | **9152** = 384+576+8192 |
+| `c_none` (plain) | 512 + 148 | `dlen` 148, `end` 704 | 2240 (sum: 1280 + 960) |
+
+Zero-copy is not cheaper for the receiver — it is **3.95× more expensive per
+512-byte datagram** (5056 against 1280), and the charge is one page per
+*payload*, not one page per page the payload touches: `z_lin6x`, whose payload
+starts at offset 3600 and therefore straddles a page boundary, still charges
+4096. Three payload sizes and three buffer alignments, one formula.
+
+The consequence is a budget, not a footnote: with `SO_RCVBUF 19200` →
+`sk_rcvbuf 38400`, 64 zerocopy datagrams leave **7** in the queue
+(`7 × 5056 = 35392 ≤ 38400 < 8 × 5056`) and 57 errors; the same buffer holds
+**30** plain 512-byte datagrams (P10 predicted “more than 30”).
+
+## 3. The copy happens in the receiver, and only one door pays it per datagram
+
+`skb_copy_ubufs()` counted per arm:
+
+| arm | copies | where the payload ends up |
+|---|---|---|
+| `z_lin6` | **6** | all six copied in the receiving host, none left zerocopy |
+| `z_fl6` | **1** | only the aggregate's own head is copied; five members keep the sender's pages to the socket |
+| `z_lin1`/`z_lin1q`/`z_lin1w` | **1** | the single datagram copied |
+| `c_*` (no zerocopy) | 0 | — |
+
+So the fraglist door is not “worse” or “better”: it delivers the same six
+datagrams with **five of them still pointing at the sender's memory**, at the
+price of a 55616-byte queue charge instead of 30336 — and the aggregate record
+`30336` is exactly `6 × 5056`, because `skb_gro_receive_list()` does
+`p->truesize += skb->truesize` for every member.
+
+## 4. Clause 3: a TCP flag on a UDP-only queue, and the copy proves it
+
+`SKBFL_PURE_ZEROCOPY` is written in one place in this tree and read by
+`skb_frags_readable()`, which is the third clause of the early return. A UDP
+zerocopy skb carries `ZEROCOPY_ENABLE|SHARED_FRAG` and never the PURE bit, so
+clause 3 cannot fire for UDP at all. This is not only a reading: `skb_copy_ubufs()`
+returns `-EFAULT` when `!skb_frags_readable()` (`net/core/skbuff.c`), and
+`ip_local_deliver_finish()` *drops the packet* on that error. The 6 and 1
+copies above are the measurement that the predicate was true — the payloads
+were copied, not discarded.
+
+## 5. Clause 2: the bit is not the predicate, and an observer that keeps nothing leaves nothing
+
+Four arms, the same two datagrams (512 + 148) merged at x0 into one packet of
+668 bytes, delivered whole to the UDP_GRO socket:
+
+| arm | second consumer | `fl` bit 0 | `__pskb_pull_tail` | charge |
+|---|---|---|---|---|
+| `c_none` | none | 0 | 1 (`eat` 148) | **1280** |
+| `c_egr` | egress tap on y1 (`dev_queue_xmit_nit`) | 1 | 0 | **2240** |
+| `c_ing_k` | **ingress** tap on y3 (`skb_share_check` in `ip_rcv_core`) | 1 | 0 | **2240** |
+| `c_ing_d` | ingress packet_type with a `ret 0` filter (keeps nothing) | **0** | 1 | **1280** |
+
+Two different code sites set the bit and both fire the clause, so *which*
+observer does not matter. What matters is whether the second reference to the
+same data is **alive at the gate**: a packet_type that drops its copy leaves
+no trace at all — not even the bit, because `__netif_receive_skb_core()` calls
+the *last* packet_type without taking a reference, so `skb_share_check()` sees
+`users == 1` and never clones. P14 had the bit at 1 here; it is 0.
+
+So the answer to “is clause 2 reachable without an observer” is: on this path,
+no. Every mechanism that shares the head is a packet socket, a mirror or a
+topology feature that does not survive forwarding — and the forwarder itself
+defends against a clone that does reach it (`ip_forward()` copies before
+decrementing the TTL, `skb_cow()` → `pskb_expand_head()`).
+
+## 6. What `head_frag = 1` would need — a source answer, not a measurement
+
+The `else if (skb->head_frag)` branch of `skb_gro_receive()` moves the
+incoming skb's linear head into a page frag of the aggregate. It never fires
+in this stand and cannot: the only writers of `head_frag = 1` in this tree are
+`build_skb()`, `build_skb_around()`, `napi_build_skb()` and `napi_alloc_skb()`
+(`net/core/skbuff.c:513,535,581,815` are the four `skb->head_frag = 1` lines
+plus `napi_alloc_skb`'s own at 885), and every caller is a device driver,
+`net/core/xdp.c`, or `napi_get_frags()`. veth forwards skbs unchanged, vxlan
+reuses the outer skb, and TUN — the only virtual driver that would use
+`napi_get_frags()` — is not in this kernel's config. F71 measured the bit at
+the door (byte 126, bit 5) as 0 in all 66 records; this turn's 52 attempts show
+it in no record either. The branch stays a named debt with a source answer
+attached, not a cell.
+
+## 7. Predictions: 8 confirmed, 2 half, 4 refuted
+
+| # | claim | verdict |
+|---|---|---|
+| P1 | `z_ctl6`: 1 packet, `uh->len` 3080, one enqueue `dlen` 2560, charge 7680 | **half** — the rule side exactly; the socket side is six enqueues, because a plain socket segments the aggregate |
+| P2 | `z_lin6`: 6 packets of 520 | ✔ |
+| P3 | `z_lin6`: 6 enqueues, `dlen` 512 | ✔ |
+| P4 | `z_lin6`: 6 copies, 0 pulls | ✔ |
+| P5 | charge `6·ts` with 700 ≤ ts ≤ 1200 | **refuted**: ts = 5056 |
+| P6 | `z_fl6`: 1 packet, 6 datagrams | ✔ |
+| P7 | `z_fl6`: **0** copies | **refuted**: 1 |
+| P8 | `z_fl6`: charge < 7680 | **refuted**: 55616 |
+| P9 | `z_lin1`: `dlen` 512 with no GRO, no pull | ✔ |
+| P10 | `z_lin64`: kept > 30 | **refuted**: 7 |
+| P11 | `c_none`: 1 enqueue, `dlen` 148, pull 1 `eat` 148, charge 1280, `fl` 0 | ✔ |
+| P12 | `c_egr`: 0 pulls, 2240, `fl` 1 | ✔ |
+| P13 | `c_ing_k`: 0 pulls, 2240, `fl` 1 | ✔ |
+| P14 | `c_ing_d`: charge 1280, pull 1, **`fl` 1** | **half** — charge and pull as predicted, the bit is 0 |
+
+The four refutations are all one misunderstanding: I assumed a zerocopy skb is
+*cheaper* for the receiver and that the aggregate would keep its members'
+zerocopy state. It is the opposite on both counts, and the mechanism
+(`PAGE_ALIGN` per payload, and the head being a member) is now measured.
+
+## 8. Errors of the run, all mine
+
+1. **The `'d'` command was 8 bytes while the sender reads 16** — the command
+   stream desynchronised after the first arm of smoke A; its odd numbers (the
+   5056/9152 alternation, empty second attempts) came from scrambled
+   parameters, not from the kernel. Smoke A is discarded; `z_lin6x` was built
+   to *test* the alternation theory and did not reproduce it.
+2. **The `c_*` arms were first built on a plain socket**, where the aggregate
+   is segmented before the queue; the gate then never sees `data_len > 0`.
+   Switched to the UDP_GRO socket — F71's own cell — before the measured boots.
+3. **The forward chain had been empty since F68**: no rule, no NFLOG, so the
+   first two smokes had no witness at the rule at all. A `log`+`count`+`accept`
+   rule was installed and the two later smokes show `n=1` vs `n=6`.
+4. **My `exp_*` columns in the arm table were wrong** for several arms
+   (`z_ctl6`: `exp_enq` 1 while six are enqueued; `exp_cond` 6 while
+   `skb_condense()` only runs above half a buffer). The table is frozen; the
+   verifier does not use those columns, and the disagreements are listed here.
+5. **The verifier crashed twice instead of going red** (`KeyError` on the
+   attempt loop after the arm count changed) — found by running, not by a
+   selftest, because the selftest did not exist yet. It now turns any crash
+   into a red count with exit 2.
+6. **`z_lin1w` reads 4096 bytes of a 5000-byte datagram**: the receiver's
+   buffer is 4 KiB, so `dl0=4096` is the witness truncating, not the kernel
+   trimming. The gate record (`dlen` 5000, `ts` 9152) is unaffected; the
+   delivered length in that arm must not be quoted.
+7. **`clone=5` in `z_ctl6`** is not modelled: five `skb_clone()` calls in an
+   arm with no packet socket, with `skb_segment_list` never called — the
+   aggregate is split by `skb_segment()`, and something in that path clones.
+   Measured, not explained.
+
+## 9. What is not measured, stated plainly
+
+The exact site of the `PAGE_ALIGN` charge: the only such line in the copy path
+is `zerocopy_fill_skb_from_iter()`'s `skb->truesize += PAGE_ALIGN(copied + start)`,
+and with `start` = the payload's offset in its page it would predict 8192 for
+`z_lin6x` (offset 3600); measured 4096 at three offsets. Either that `start` is
+not the buffer's page offset or another site charges the page — **not
+established**. Also: the five clones of `z_ctl6`; `cond=3` in the 64-datagram
+arm (three condense calls above half a buffer, not modelled); IPv6 (all of F72
+is IPv4); TCP (where PURE_ZEROCOPY actually lives); tunnels;
+`CHECKSUM_COMPLETE`; a real NIC. **Not a vulnerability**: every rule was
+installed by root in the initial user namespace and creating a kprobe requires
+`CAP_SYS_ADMIN` (F57).
+
+## 10. How it was checked
+
+| | |
+|---|---|
+| `tools/verify594.py` | **2872 checks, 0** — provenance (kernel sha in the log vs the bzImage, the initrd sha, and the differ **extracted from the initramfs** byte for byte; the predictions file older than the first boot), 25 source anchors, the arm table **from `vm/differ594_add.c`** against twelve printed parameters of every attempt, the rule-side packet count and every UDP length **from NFLOG**, the gate identity `ts = end + 576 + PAGE_ALIGN(dlen)` on **every** record, the aggregate head against the sum of its members, the charge from `rmem`, the kept-datagram law, `skb_segment_list`/`skb_copy_ubufs` counts, the four clause-2 cells, and full cross-boot and cross-attempt determinism |
+| `tools/verify594_selftest.py` | **41/41** — 25 model mutations and **16 data mutations** (a field of a log copy changed: `ts`, `dlen`, `enq`, `ubuf`, `seg`, `pull`, `mark`, `uhlen`, the packet count, `rmem`, the received count, `sent`, the kernel sha, `pl`, a `fl` bit, and the second boot) all go red without a traceback; the no-op copy is green |
+| run | `logs/f72_rep1.log`, `logs/f72_rep2.log` — 52 attempts, identical in every modelled field |
+| smokes | A (broken command stream), B (no NFLOG rule), C (13 arms, the table that went to the measured boots) |
+
+
+===== summary.json =====
+{
+ "turn": 594,
+ "finding": "F72-zerocopy-doors",
+ "kernel": "7.3.4-T563",
+ "kernel_sha256": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+ "differ_sha256": "47a6b28ec36cc36d231852696c899031446c7050501e4ec579677c22b8f08987",
+ "initrd_sha256": "f3af92a8a245a0dedb016a8c3e56236bc6191701cc02cd495484b3d4b6426837",
+ "add_source_sha256": "469ef3885263aa3bc52826dca89aa928d4f5aa383a9ba9f0ae5d00410daa772c",
+ "predictions_sha256": "3faeee5a2a9dca4222b4e936ce01ff6e129e6acf16e25d721c7372139e1970ff",
+ "predictions_frozen_before_first_boot": true,
+ "model": {
+  "gate_truesize": "ts = end + 576 + (PAGE_ALIGN(dlen) if the skb is zerocopy else 0); the head of an aggregate carries the sum over its members",
+  "rule_packets": "skb_gro_receive() refuses skb_zcopy() (-ETOOMANYREFS): the linear door cannot merge a zerocopy sender; skb_gro_receive_list() has no such check",
+  "charge": "condensed (SKB_TRUESIZE(end)) when __pskb_pull_tail ran, else the sum of the truesizes at the gate",
+  "kept": "floor(sk_rcvbuf / ts) for the non-aggregated 64-datagram arm",
+  "clause2": "skb_cloned() = cloned && dataref != 1: a second packet_type that KEEPS the skb fires it, one that drops it leaves no trace"
+ },
+ "boots": [
+  {
+   "log": "f72_rep1.log",
+   "kernel_sha_in_log": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+   "initrd_sha_in_log": "f3af92a8a245a0dedb016a8c3e56236bc6191701cc02cd495484b3d4b6426837",
+   "arms": [
+    {
+     "i": 0,
+     "att": 0,
+     "name": "z_ctl6",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 0,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       3080
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       3080
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       1280,
+       1280,
+       1280,
+       1280,
+       1280,
+       1280
+      ],
+      "dlen": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       556,
+       556,
+       556,
+       556,
+       556,
+       556
+      ],
+      "end": [
+       704,
+       704,
+       704,
+       704,
+       704,
+       704
+      ],
+      "fl": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       1
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 5,
+      "exp": 1,
+      "ubuf": 0,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 7680,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    },
+    {
+     "i": 0,
+     "att": 1,
+     "name": "z_ctl6",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 0,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       3080
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       3080
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       1280,
+       1280,
+       1280,
+       1280,
+       1280,
+       1280
+      ],
+      "dlen": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       556,
+       556,
+       556,
+       556,
+       556,
+       556
+      ],
+      "end": [
+       704,
+       704,
+       704,
+       704,
+       704,
+       704
+      ],
+      "fl": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       1
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 5,
+      "exp": 1,
+      "ubuf": 0,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 7680,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    },
+    {
+     "i": 1,
+     "att": 0,
+     "name": "z_lin6",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 6,
+      "uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ],
+      "model_packets": 6,
+      "model_uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 7,
+      "ubuf": 6,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 30336,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 1,
+     "att": 1,
+     "name": "z_lin6",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 6,
+      "uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ],
+      "model_packets": 6,
+      "model_uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 7,
+      "ubuf": 6,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 30336,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 2,
+     "att": 0,
+     "name": "z_lin6a",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 1,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 6,
+      "uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ],
+      "model_packets": 6,
+      "model_uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 7,
+      "ubuf": 6,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 30336,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 2,
+     "att": 1,
+     "name": "z_lin6a",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 1,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 6,
+      "uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ],
+      "model_packets": 6,
+      "model_uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 7,
+      "ubuf": 6,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 30336,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 3,
+     "att": 0,
+     "name": "z_lin6x",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 2,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 6,
+      "uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ],
+      "model_packets": 6,
+      "model_uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 7,
+      "ubuf": 6,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 30336,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 3,
+     "att": 1,
+     "name": "z_lin6x",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 2,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 6,
+      "uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ],
+      "model_packets": 6,
+      "model_uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 7,
+      "ubuf": 6,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 30336,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 4,
+     "att": 0,
+     "name": "z_fl6",
+     "params": {
+      "xg": "f",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       3080
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       3080
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       30336,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 1,
+      "trim": 0,
+      "clone": 0,
+      "exp": 1,
+      "ubuf": 1,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 55616,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 4,
+     "att": 1,
+     "name": "z_fl6",
+     "params": {
+      "xg": "f",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       3080
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       3080
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       30336,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 1,
+      "trim": 0,
+      "clone": 0,
+      "exp": 1,
+      "ubuf": 1,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 55616,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 5,
+     "att": 0,
+     "name": "z_lin1",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 1,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       520
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       520
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       5056
+      ],
+      "dlen": [
+       512
+      ],
+      "len": [
+       512
+      ],
+      "tail": [
+       44
+      ],
+      "end": [
+       384
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 2,
+      "ubuf": 1,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 1,
+      "n1": 0,
+      "rmem0": 5056,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "1",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 5,
+     "att": 1,
+     "name": "z_lin1",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 1,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       520
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       520
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       5056
+      ],
+      "dlen": [
+       512
+      ],
+      "len": [
+       512
+      ],
+      "tail": [
+       44
+      ],
+      "end": [
+       384
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 2,
+      "ubuf": 1,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 1,
+      "n1": 0,
+      "rmem0": 5056,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "1",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 6,
+     "att": 0,
+     "name": "z_lin1q",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 1,
+      "pl": 1200,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       1208
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       1208
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       5056
+      ],
+      "dlen": [
+       1200
+      ],
+      "len": [
+       1200
+      ],
+      "tail": [
+       44
+      ],
+      "end": [
+       384
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 2,
+      "ubuf": 1,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 1,
+      "n1": 0,
+      "rmem0": 5056,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "1",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 6,
+     "att": 1,
+     "name": "z_lin1q",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 1,
+      "pl": 1200,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       1208
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       1208
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       5056
+      ],
+      "dlen": [
+       1200
+      ],
+      "len": [
+       1200
+      ],
+      "tail": [
+       44
+      ],
+      "end": [
+       384
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 2,
+      "ubuf": 1,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 1,
+      "n1": 0,
+      "rmem0": 5056,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "1",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 7,
+     "att": 0,
+     "name": "z_lin1w",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 1,
+      "pl": 5000,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       5008
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       5008
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       9152
+      ],
+      "dlen": [
+       5000
+      ],
+      "len": [
+       5000
+      ],
+      "tail": [
+       44
+      ],
+      "end": [
+       384
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 1,
+      "ubuf": 1,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 1,
+      "n1": 0,
+      "rmem0": 9152,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "1",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 7,
+     "att": 1,
+     "name": "z_lin1w",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 1,
+      "pl": 5000,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       5008
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       5008
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       9152
+      ],
+      "dlen": [
+       5000
+      ],
+      "len": [
+       5000
+      ],
+      "tail": [
+       44
+      ],
+      "end": [
+       384
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 1,
+      "ubuf": 1,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 1,
+      "n1": 0,
+      "rmem0": 9152,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "1",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 8,
+     "att": 0,
+     "name": "z_lin64",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 64,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 19200,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 64,
+      "uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ],
+      "model_packets": 64,
+      "model_uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ]
+     },
+     "gate": {
+      "n": "16",
+      "ts": [
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 64,
+      "cond": 3,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 65,
+      "ubuf": 64,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 7,
+      "n1": 0,
+      "rmem0": 35392,
+      "rmem1": 0,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "64",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 8,
+     "att": 1,
+     "name": "z_lin64",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 64,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 19200,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 64,
+      "uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ],
+      "model_packets": 64,
+      "model_uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ]
+     },
+     "gate": {
+      "n": "16",
+      "ts": [
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 64,
+      "cond": 3,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 65,
+      "ubuf": 64,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 7,
+      "n1": 0,
+      "rmem0": 35392,
+      "rmem1": 0,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "64",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 9,
+     "att": 0,
+     "name": "c_none",
+     "params": {
+      "xg": "u",
+      "skt": "g",
+      "j": 16,
+      "n": 2,
+      "pl": 512,
+      "sh": 1,
+      "sl": 148,
+      "rcvbuf": 19200,
+      "tap": 0,
+      "zc": 0,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       668
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       668
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       2240
+      ],
+      "dlen": [
+       148
+      ],
+      "len": [
+       660
+      ],
+      "tail": [
+       556
+      ],
+      "end": [
+       704
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 1,
+      "pull": 1,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 2,
+      "ubuf": 0,
+      "eat": 148,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 0,
+      "n1": 17,
+      "rmem0": 0,
+      "rmem1": 21760,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "2",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    },
+    {
+     "i": 9,
+     "att": 1,
+     "name": "c_none",
+     "params": {
+      "xg": "u",
+      "skt": "g",
+      "j": 16,
+      "n": 2,
+      "pl": 512,
+      "sh": 1,
+      "sl": 148,
+      "rcvbuf": 19200,
+      "tap": 0,
+      "zc": 0,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       668
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       668
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       2240
+      ],
+      "dlen": [
+       148
+      ],
+      "len": [
+       660
+      ],
+      "tail": [
+       556
+      ],
+      "end": [
+       704
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 1,
+      "pull": 1,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 2,
+      "ubuf": 0,
+      "eat": 148,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 0,
+      "n1": 17,
+      "rmem0": 0,
+      "rmem1": 21760,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "2",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    },
+    {
+     "i": 10,
+     "att": 0,
+     "name": "c_egr",
+     "params": {
+      "xg": "u",
+      "skt": "g",
+      "j": 16,
+      "n": 2,
+      "pl": 512,
+      "sh": 1,
+      "sl": 148,
+      "rcvbuf": 19200,
+      "tap": 1,
+      "zc": 0,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       668
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       668
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       2240
+      ],
+      "dlen": [
+       148
+      ],
+      "len": [
+       660
+      ],
+      "tail": [
+       556
+      ],
+      "end": [
+       704
+      ],
+      "fl": [
+       1
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 1,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 2,
+      "exp": 2,
+      "ubuf": 0,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 0,
+      "n1": 17,
+      "rmem0": 0,
+      "rmem1": 22720,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "2",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    },
+    {
+     "i": 10,
+     "att": 1,
+     "name": "c_egr",
+     "params": {
+      "xg": "u",
+      "skt": "g",
+      "j": 16,
+      "n": 2,
+      "pl": 512,
+      "sh": 1,
+      "sl": 148,
+      "rcvbuf": 19200,
+      "tap": 1,
+      "zc": 0,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       668
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       668
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       2240
+      ],
+      "dlen": [
+       148
+      ],
+      "len": [
+       660
+      ],
+      "tail": [
+       556
+      ],
+      "end": [
+       704
+      ],
+      "fl": [
+       1
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 1,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 2,
+      "exp": 2,
+      "ubuf": 0,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 0,
+      "n1": 17,
+      "rmem0": 0,
+      "rmem1": 22720,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "2",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    },
+    {
+     "i": 11,
+     "att": 0,
+     "name": "c_ing_k",
+     "params": {
+      "xg": "u",
+      "skt": "g",
+      "j": 16,
+      "n": 2,
+      "pl": 512,
+      "sh": 1,
+      "sl": 148,
+      "rcvbuf": 19200,
+      "tap": 0,
+      "zc": 0,
+      "al": 0,
+      "dtap": 1
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       668
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       668
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       2240
+      ],
+      "dlen": [
+       148
+      ],
+      "len": [
+       660
+      ],
+      "tail": [
+       556
+      ],
+      "end": [
+       704
+      ],
+      "fl": [
+       1
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 1,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 2,
+      "exp": 2,
+      "ubuf": 0,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 0,
+      "n1": 17,
+      "rmem0": 0,
+      "rmem1": 22720,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "2",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    },
+    {
+     "i": 11,
+     "att": 1,
+     "name": "c_ing_k",
+     "params": {
+      "xg": "u",
+      "skt": "g",
+      "j": 16,
+      "n": 2,
+      "pl": 512,
+      "sh": 1,
+      "sl": 148,
+      "rcvbuf": 19200,
+      "tap": 0,
+      "zc": 0,
+      "al": 0,
+      "dtap": 1
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       668
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       668
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       2240
+      ],
+      "dlen": [
+       148
+      ],
+      "len": [
+       660
+      ],
+      "tail": [
+       556
+      ],
+      "end": [
+       704
+      ],
+      "fl": [
+       1
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 1,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 2,
+      "exp": 2,
+      "ubuf": 0,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 0,
+      "n1": 17,
+      "rmem0": 0,
+      "rmem1": 22720,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "2",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    },
+    {
+     "i": 12,
+     "att": 0,
+     "name": "c_ing_d",
+     "params": {
+      "xg": "u",
+      "skt": "g",
+      "j": 16,
+      "n": 2,
+      "pl": 512,
+      "sh": 1,
+      "sl": 148,
+      "rcvbuf": 19200,
+      "tap": 0,
+      "zc": 0,
+      "al": 0,
+      "dtap": 2
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       668
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       668
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       2240
+      ],
+      "dlen": [
+       148
+      ],
+      "len": [
+       660
+      ],
+      "tail": [
+       556
+      ],
+      "end": [
+       704
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 1,
+      "pull": 1,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 2,
+      "ubuf": 0,
+      "eat": 148,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 0,
+      "n1": 17,
+      "rmem0": 0,
+      "rmem1": 21760,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "2",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    },
+    {
+     "i": 12,
+     "att": 1,
+     "name": "c_ing_d",
+     "params": {
+      "xg": "u",
+      "skt": "g",
+      "j": 16,
+      "n": 2,
+      "pl": 512,
+      "sh": 1,
+      "sl": 148,
+      "rcvbuf": 19200,
+      "tap": 0,
+      "zc": 0,
+      "al": 0,
+      "dtap": 2
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       668
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       668
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       2240
+      ],
+      "dlen": [
+       148
+      ],
+      "len": [
+       660
+      ],
+      "tail": [
+       556
+      ],
+      "end": [
+       704
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 1,
+      "pull": 1,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 2,
+      "ubuf": 0,
+      "eat": 148,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 0,
+      "n1": 17,
+      "rmem0": 0,
+      "rmem1": 21760,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "2",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    }
+   ]
+  },
+  {
+   "log": "f72_rep2.log",
+   "kernel_sha_in_log": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+   "initrd_sha_in_log": "f3af92a8a245a0dedb016a8c3e56236bc6191701cc02cd495484b3d4b6426837",
+   "arms": [
+    {
+     "i": 0,
+     "att": 0,
+     "name": "z_ctl6",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 0,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       3080
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       3080
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       1280,
+       1280,
+       1280,
+       1280,
+       1280,
+       1280
+      ],
+      "dlen": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       556,
+       556,
+       556,
+       556,
+       556,
+       556
+      ],
+      "end": [
+       704,
+       704,
+       704,
+       704,
+       704,
+       704
+      ],
+      "fl": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       1
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 5,
+      "exp": 1,
+      "ubuf": 0,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 7680,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    },
+    {
+     "i": 0,
+     "att": 1,
+     "name": "z_ctl6",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 0,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       3080
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       3080
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       1280,
+       1280,
+       1280,
+       1280,
+       1280,
+       1280
+      ],
+      "dlen": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       556,
+       556,
+       556,
+       556,
+       556,
+       556
+      ],
+      "end": [
+       704,
+       704,
+       704,
+       704,
+       704,
+       704
+      ],
+      "fl": [
+       0,
+       1,
+       1,
+       1,
+       1,
+       1
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 5,
+      "exp": 1,
+      "ubuf": 0,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 7680,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    },
+    {
+     "i": 1,
+     "att": 0,
+     "name": "z_lin6",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 6,
+      "uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ],
+      "model_packets": 6,
+      "model_uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 7,
+      "ubuf": 6,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 30336,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 1,
+     "att": 1,
+     "name": "z_lin6",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 6,
+      "uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ],
+      "model_packets": 6,
+      "model_uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 7,
+      "ubuf": 6,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 30336,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 2,
+     "att": 0,
+     "name": "z_lin6a",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 1,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 6,
+      "uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ],
+      "model_packets": 6,
+      "model_uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 7,
+      "ubuf": 6,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 30336,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 2,
+     "att": 1,
+     "name": "z_lin6a",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 1,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 6,
+      "uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ],
+      "model_packets": 6,
+      "model_uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 7,
+      "ubuf": 6,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 30336,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 3,
+     "att": 0,
+     "name": "z_lin6x",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 2,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 6,
+      "uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ],
+      "model_packets": 6,
+      "model_uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 7,
+      "ubuf": 6,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 30336,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 3,
+     "att": 1,
+     "name": "z_lin6x",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 2,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 6,
+      "uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ],
+      "model_packets": 6,
+      "model_uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 7,
+      "ubuf": 6,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 30336,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 4,
+     "att": 0,
+     "name": "z_fl6",
+     "params": {
+      "xg": "f",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       3080
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       3080
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       30336,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 1,
+      "trim": 0,
+      "clone": 0,
+      "exp": 1,
+      "ubuf": 1,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 55616,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 4,
+     "att": 1,
+     "name": "z_fl6",
+     "params": {
+      "xg": "f",
+      "skt": "p",
+      "j": 0,
+      "n": 6,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       3080
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       3080
+      ]
+     },
+     "gate": {
+      "n": "6",
+      "ts": [
+       30336,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 6,
+      "cond": 0,
+      "pull": 0,
+      "seg": 1,
+      "trim": 0,
+      "clone": 0,
+      "exp": 1,
+      "ubuf": 1,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 6,
+      "n1": 0,
+      "rmem0": 55616,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "6",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 5,
+     "att": 0,
+     "name": "z_lin1",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 1,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       520
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       520
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       5056
+      ],
+      "dlen": [
+       512
+      ],
+      "len": [
+       512
+      ],
+      "tail": [
+       44
+      ],
+      "end": [
+       384
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 2,
+      "ubuf": 1,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 1,
+      "n1": 0,
+      "rmem0": 5056,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "1",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 5,
+     "att": 1,
+     "name": "z_lin1",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 1,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       520
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       520
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       5056
+      ],
+      "dlen": [
+       512
+      ],
+      "len": [
+       512
+      ],
+      "tail": [
+       44
+      ],
+      "end": [
+       384
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 2,
+      "ubuf": 1,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 1,
+      "n1": 0,
+      "rmem0": 5056,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "1",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 6,
+     "att": 0,
+     "name": "z_lin1q",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 1,
+      "pl": 1200,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       1208
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       1208
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       5056
+      ],
+      "dlen": [
+       1200
+      ],
+      "len": [
+       1200
+      ],
+      "tail": [
+       44
+      ],
+      "end": [
+       384
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 2,
+      "ubuf": 1,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 1,
+      "n1": 0,
+      "rmem0": 5056,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "1",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 6,
+     "att": 1,
+     "name": "z_lin1q",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 1,
+      "pl": 1200,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       1208
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       1208
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       5056
+      ],
+      "dlen": [
+       1200
+      ],
+      "len": [
+       1200
+      ],
+      "tail": [
+       44
+      ],
+      "end": [
+       384
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 2,
+      "ubuf": 1,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 1,
+      "n1": 0,
+      "rmem0": 5056,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "1",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 7,
+     "att": 0,
+     "name": "z_lin1w",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 1,
+      "pl": 5000,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       5008
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       5008
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       9152
+      ],
+      "dlen": [
+       5000
+      ],
+      "len": [
+       5000
+      ],
+      "tail": [
+       44
+      ],
+      "end": [
+       384
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 1,
+      "ubuf": 1,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 1,
+      "n1": 0,
+      "rmem0": 9152,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "1",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 7,
+     "att": 1,
+     "name": "z_lin1w",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 1,
+      "pl": 5000,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 0,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       5008
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       5008
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       9152
+      ],
+      "dlen": [
+       5000
+      ],
+      "len": [
+       5000
+      ],
+      "tail": [
+       44
+      ],
+      "end": [
+       384
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 0,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 1,
+      "ubuf": 1,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 1,
+      "n1": 0,
+      "rmem0": 9152,
+      "rmem1": 0,
+      "rb0": 212992,
+      "rb1": 212992
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "1",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 8,
+     "att": 0,
+     "name": "z_lin64",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 64,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 19200,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 64,
+      "uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ],
+      "model_packets": 64,
+      "model_uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ]
+     },
+     "gate": {
+      "n": "16",
+      "ts": [
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 64,
+      "cond": 3,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 65,
+      "ubuf": 64,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 7,
+      "n1": 0,
+      "rmem0": 35392,
+      "rmem1": 0,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "64",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 8,
+     "att": 1,
+     "name": "z_lin64",
+     "params": {
+      "xg": "u",
+      "skt": "p",
+      "j": 0,
+      "n": 64,
+      "pl": 512,
+      "sh": -1,
+      "sl": 0,
+      "rcvbuf": 19200,
+      "tap": 0,
+      "zc": 1,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 64,
+      "uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ],
+      "model_packets": 64,
+      "model_uhlen": [
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520,
+       520
+      ]
+     },
+     "gate": {
+      "n": "16",
+      "ts": [
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056,
+       5056
+      ],
+      "dlen": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "len": [
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512,
+       512
+      ],
+      "tail": [
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44,
+       44
+      ],
+      "end": [
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384,
+       384
+      ],
+      "fl": [
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0,
+       0
+      ]
+     },
+     "counters": {
+      "enq": 64,
+      "cond": 3,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 65,
+      "ubuf": 64,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 7,
+      "n1": 0,
+      "rmem0": 35392,
+      "rmem1": 0,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "64",
+      "zc": "1",
+      "cplt": "0",
+      "copied": "0",
+      "other": "1",
+      "sozc": "0"
+     }
+    },
+    {
+     "i": 9,
+     "att": 0,
+     "name": "c_none",
+     "params": {
+      "xg": "u",
+      "skt": "g",
+      "j": 16,
+      "n": 2,
+      "pl": 512,
+      "sh": 1,
+      "sl": 148,
+      "rcvbuf": 19200,
+      "tap": 0,
+      "zc": 0,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       668
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       668
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       2240
+      ],
+      "dlen": [
+       148
+      ],
+      "len": [
+       660
+      ],
+      "tail": [
+       556
+      ],
+      "end": [
+       704
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 1,
+      "pull": 1,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 2,
+      "ubuf": 0,
+      "eat": 148,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 0,
+      "n1": 17,
+      "rmem0": 0,
+      "rmem1": 21760,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "2",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    },
+    {
+     "i": 9,
+     "att": 1,
+     "name": "c_none",
+     "params": {
+      "xg": "u",
+      "skt": "g",
+      "j": 16,
+      "n": 2,
+      "pl": 512,
+      "sh": 1,
+      "sl": 148,
+      "rcvbuf": 19200,
+      "tap": 0,
+      "zc": 0,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       668
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       668
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       2240
+      ],
+      "dlen": [
+       148
+      ],
+      "len": [
+       660
+      ],
+      "tail": [
+       556
+      ],
+      "end": [
+       704
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 1,
+      "pull": 1,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 2,
+      "ubuf": 0,
+      "eat": 148,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 0,
+      "n1": 17,
+      "rmem0": 0,
+      "rmem1": 21760,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "2",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    },
+    {
+     "i": 10,
+     "att": 0,
+     "name": "c_egr",
+     "params": {
+      "xg": "u",
+      "skt": "g",
+      "j": 16,
+      "n": 2,
+      "pl": 512,
+      "sh": 1,
+      "sl": 148,
+      "rcvbuf": 19200,
+      "tap": 1,
+      "zc": 0,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       668
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       668
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       2240
+      ],
+      "dlen": [
+       148
+      ],
+      "len": [
+       660
+      ],
+      "tail": [
+       556
+      ],
+      "end": [
+       704
+      ],
+      "fl": [
+       1
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 1,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 2,
+      "exp": 2,
+      "ubuf": 0,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 0,
+      "n1": 17,
+      "rmem0": 0,
+      "rmem1": 22720,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "2",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    },
+    {
+     "i": 10,
+     "att": 1,
+     "name": "c_egr",
+     "params": {
+      "xg": "u",
+      "skt": "g",
+      "j": 16,
+      "n": 2,
+      "pl": 512,
+      "sh": 1,
+      "sl": 148,
+      "rcvbuf": 19200,
+      "tap": 1,
+      "zc": 0,
+      "al": 0,
+      "dtap": 0
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       668
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       668
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       2240
+      ],
+      "dlen": [
+       148
+      ],
+      "len": [
+       660
+      ],
+      "tail": [
+       556
+      ],
+      "end": [
+       704
+      ],
+      "fl": [
+       1
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 1,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 2,
+      "exp": 2,
+      "ubuf": 0,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 0,
+      "n1": 17,
+      "rmem0": 0,
+      "rmem1": 22720,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "2",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    },
+    {
+     "i": 11,
+     "att": 0,
+     "name": "c_ing_k",
+     "params": {
+      "xg": "u",
+      "skt": "g",
+      "j": 16,
+      "n": 2,
+      "pl": 512,
+      "sh": 1,
+      "sl": 148,
+      "rcvbuf": 19200,
+      "tap": 0,
+      "zc": 0,
+      "al": 0,
+      "dtap": 1
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       668
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       668
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       2240
+      ],
+      "dlen": [
+       148
+      ],
+      "len": [
+       660
+      ],
+      "tail": [
+       556
+      ],
+      "end": [
+       704
+      ],
+      "fl": [
+       1
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 1,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 2,
+      "exp": 2,
+      "ubuf": 0,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 0,
+      "n1": 17,
+      "rmem0": 0,
+      "rmem1": 22720,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "2",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    },
+    {
+     "i": 11,
+     "att": 1,
+     "name": "c_ing_k",
+     "params": {
+      "xg": "u",
+      "skt": "g",
+      "j": 16,
+      "n": 2,
+      "pl": 512,
+      "sh": 1,
+      "sl": 148,
+      "rcvbuf": 19200,
+      "tap": 0,
+      "zc": 0,
+      "al": 0,
+      "dtap": 1
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       668
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       668
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       2240
+      ],
+      "dlen": [
+       148
+      ],
+      "len": [
+       660
+      ],
+      "tail": [
+       556
+      ],
+      "end": [
+       704
+      ],
+      "fl": [
+       1
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 1,
+      "pull": 0,
+      "seg": 0,
+      "trim": 0,
+      "clone": 2,
+      "exp": 2,
+      "ubuf": 0,
+      "eat": -1,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 0,
+      "n1": 17,
+      "rmem0": 0,
+      "rmem1": 22720,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "2",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    },
+    {
+     "i": 12,
+     "att": 0,
+     "name": "c_ing_d",
+     "params": {
+      "xg": "u",
+      "skt": "g",
+      "j": 16,
+      "n": 2,
+      "pl": 512,
+      "sh": 1,
+      "sl": 148,
+      "rcvbuf": 19200,
+      "tap": 0,
+      "zc": 0,
+      "al": 0,
+      "dtap": 2
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       668
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       668
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       2240
+      ],
+      "dlen": [
+       148
+      ],
+      "len": [
+       660
+      ],
+      "tail": [
+       556
+      ],
+      "end": [
+       704
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 1,
+      "pull": 1,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 2,
+      "ubuf": 0,
+      "eat": 148,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 0,
+      "n1": 17,
+      "rmem0": 0,
+      "rmem1": 21760,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "2",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    },
+    {
+     "i": 12,
+     "att": 1,
+     "name": "c_ing_d",
+     "params": {
+      "xg": "u",
+      "skt": "g",
+      "j": 16,
+      "n": 2,
+      "pl": 512,
+      "sh": 1,
+      "sl": 148,
+      "rcvbuf": 19200,
+      "tap": 0,
+      "zc": 0,
+      "al": 0,
+      "dtap": 2
+     },
+     "rule": {
+      "packets": 1,
+      "uhlen": [
+       668
+      ],
+      "model_packets": 1,
+      "model_uhlen": [
+       668
+      ]
+     },
+     "gate": {
+      "n": "1",
+      "ts": [
+       2240
+      ],
+      "dlen": [
+       148
+      ],
+      "len": [
+       660
+      ],
+      "tail": [
+       556
+      ],
+      "end": [
+       704
+      ],
+      "fl": [
+       0
+      ]
+     },
+     "counters": {
+      "enq": 1,
+      "cond": 1,
+      "pull": 1,
+      "seg": 0,
+      "trim": 0,
+      "clone": 0,
+      "exp": 2,
+      "ubuf": 0,
+      "eat": 148,
+      "mark": 1
+     },
+     "socket": {
+      "n0": 0,
+      "n1": 17,
+      "rmem0": 0,
+      "rmem1": 21760,
+      "rb0": 38400,
+      "rb1": 38400
+     },
+     "sender": {
+      "_kind": "ZC",
+      "sent": "2",
+      "zc": "0",
+      "cplt": "0",
+      "copied": "0",
+      "other": "0",
+      "sozc": "-1"
+     }
+    }
+   ]
+  }
+ ],
+ "verification": {
+  "verify594_checks": 2872,
+  "failures": 0,
+  "selftest": "41/41 (25 model mutations + 16 data mutations + noop)",
+  "independent": [
+   "kernel sha in the log == bzImage on disk",
+   "the differ extracted from the initramfs == vm/build/differ594",
+   "the rule-side packet count and every UDP length come from NFLOG, not from the socket"
+  ]
+ },
+ "refuted": [
+  "P5: a zerocopy datagram was predicted to cost < 1280 in the receive queue; measured 5056 = end 384 + 576 + PAGE_ALIGN(512), 3.95x a plain 1280",
+  "P7: a fraglist aggregate of zerocopy datagrams was predicted to reach the queue with 0 copies; measured 1 (the aggregate IS its first member, so its own payload is copied and the blob's ZEROCOPY flag cleared)",
+  "P8: same as P5 for the fraglist door: the charge is 55616, not below 7680",
+  "P10: the 64-datagram arm was predicted to keep more than 30; measured 7 of 64 in 38400 bytes",
+  "P1 second clause: the plain aggregate was predicted to arrive as one enqueue with dlen 2560 on the plain socket; measured 6 enqueues with dlen 0 -- a plain socket segments the aggregate before the queue",
+  "P14 first clause: an ingress packet_type that keeps nothing was predicted to set the cloned BIT; measured fl 0 -- skb_share_check() sees users == 1 because the last packet_type is called without a reference"
+ ],
+ "confirmed": [
+  "P2",
+  "P3",
+  "P4",
+  "P6",
+  "P9",
+  "P11",
+  "P12",
+  "P13",
+  "P1 (rule side: 1 packet, uh->len 3080)",
+  "P14 (charge 1280, pull 1)"
+ ]
+}

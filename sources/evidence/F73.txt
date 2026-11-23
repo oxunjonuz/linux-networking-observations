@@ -1,0 +1,5917 @@
+===== LETTER_SECTION_F73.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: UDP GRO: the receive queue's zerocopy charge is PAGE_ALIGN(payload +
+ page offset) -- the offset is invisible to every socket
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+STATUS: NOT SENT -- draft for the F28 thread; sending is the owner's call.
+
+F73 -- where the page charge comes from, and who clones on the receive path
+
+Kernel 7.3.4-T563 (`1efbc957…2033`), no new build. Same three-netns IPv4 path
+as F65-F72. Eighteen arms over two boots, two attempts each, every modelled
+field identical between the boots, plus one diagnostic boot of a second binary
+that differs by one probe.
+
+1. The charge is `PAGE_ALIGN(payload + page offset)`, and the offset decides.
+   `zerocopy_fill_skb_from_iter()` (net/core/datagram.c:662) does
+   `skb->truesize += PAGE_ALIGN(copied + start)`, where `start` is the page
+   offset `iov_iter_get_pages2()` returns. Measured at the receiving queue for
+   one zerocopy datagram, with `SKB_TRUESIZE(384) = 960`:
+
+       512 bytes at offset 0     5056 = 960 + 4096
+       512 bytes at offset 3600  9152 = 960 + 8192
+       1200 bytes at offset 3600 9152
+       4097 bytes at offset 0    9152
+       5000 bytes at offset 0    9152
+       5000 bytes at offset 3600 13248
+
+   The same 512-byte datagram costs 5056 or 9152 depending on where in its page
+   the iov begins -- a property of the sender's buffer that no socket option
+   and no receive-side counter exposes. The number is set before the frame
+   leaves the sender (`__dev_queue_xmit`), survives the ubuf copy
+   (`skb_copy_ubufs`), the router (`ip_forward`) and the receiver
+   (`ip_local_deliver`, `udp_rcv`) unchanged, and equals what `/proc/net/udp`
+   reports as `rmem` before the application reads anything.
+
+   Correction to my previous letter: I wrote that the charge is "one page per
+   payload, not one page per page touched". That was wrong. The arm that was
+   supposed to place a payload across a page boundary never received its
+   offset -- the command byte carrying it was never written by my own
+   instrument -- so the three "alignments" were one buffer measured three
+   times. With the byte written, the offset is worth a whole page.
+
+2. `skb_clone()` on this path is `skb_segment()`'s, once per `frag_list`
+   member. Six copied 512-byte datagrams merged by `rx-udp-gro-forwarding`
+   produce five `skb_clone()` calls, all from `net/core/skbuff.c:4933`
+   (`nskb = skb_clone(list_skb, GFP_ATOMIC)`), and the segments arrive with the
+   cloned bit set on the five members and clear on the fresh head. The same six
+   datagrams through `rx-gro-list` produce none: `skb_segment_list()` takes its
+   members without cloning them, and the head segment carries the whole
+   aggregate's truesize (7680). A `log` rule in the forward chain clones
+   nothing: the same six datagrams with a counter-only rule clone exactly five
+   times.
+
+3. `MSG_SPLICE_PAGES` is not a userspace flag. Passing it to `sendto()` is
+   accepted and then dropped: `__sys_sendto()` does
+   `flags &= ~MSG_INTERNAL_SENDMSG_FLAGS` (net/socket.c:2277), the mask being
+   `MSG_SPLICE_PAGES | MSG_SENDPAGE_NOPOLICY | MSG_SENDPAGE_DECRYPTED |
+   MSG_NO_SHARED_FRAGS` (include/linux/socket.h:358). Measured at
+   `__ip_append_data()` entry: `flags = 0` for the datagram that asked for it,
+   against `MSG_ZEROCOPY` intact for its twin. The datagram is then an ordinary
+   copy and the queue charges it `end + 576` (1280 for 512 bytes, 8448 for
+   5000) -- no page at all. The only userspace path into
+   `skb_splice_from_iter()` is `splice(pipe -> socket)`.
+
+Scope, as before: every rule was installed by root in the initial user
+namespace; the syscall filter of (3) is a documented guard, not a defect.
+Untouched: IPv6, TCP, tunnels, `CHECKSUM_COMPLETE`, a real NIC.
+
+
+===== SUMMARY.md =====
+# F73 — the page charge is real, the contradiction was my own dead byte, and the five clones are `skb_segment()`'s
+
+Turn 595. Kernel `7.3.4-T563` (`1efbc957…2033`), **no new build**. Instrument
+`differ595`, modes `chg` (10 arms), `cln` (4 arms), `spl` (4 arms) —
+**18 arms × 2 attempts × 2 boots = 72 measured attempts**; plus one diagnostic
+boot of `differ595b` (mode `spl`, 4 arms × 2). Predictions frozen **before**
+the first boot (`c35903d6…a026`), and never edited; two of them were refuted.
+
+## 0. The two debts, and a third that the reading found
+
+F72 §"Что не измерено":
+
+> точное место заряда `PAGE_ALIGN` (единственная такая строка предсказала бы
+> 8192 для `z_lin6x`, измерено 4096 при трёх смещениях)
+
+F72's error list: `clone=5` в `z_ctl6` не смоделирован.
+
+And the third, found by reading my own instrument before writing the
+predictions file: F72's command builder filled `m[0]..m[11]` and never wrote
+`m[12]`, the byte its sender child reads as `align`. Every F72 arm sent from
+the same static buffer. The "three alignments" of F72 §2 were one alignment
+measured three times — and F72's contradiction was manufactured by that dead
+byte, not by the kernel. §2 below *demonstrates* it rather than asserting it.
+
+## 1. The charge is `PAGE_ALIGN(payload + page offset)`, and it leaves X with the frame
+
+One datagram, one socket, one door; only the payload's place in its page
+changes (`al` 0 = the raw static buffer F72 used, 1 = page-aligned base,
+2 = base + 3600):
+
+| arm | payload | offset | gate `ts` | `end` | `dlen` | identity |
+|---|---|---|---|---|---|---|
+| `g512_a0`  | 512 | 0 | **5056** | 384 | 512 | 960 + 4096 |
+| `g512_az`  | 512 | F72's buffer | **5056** | 384 | 512 | 960 + 4096 |
+| `g512_a36` | 512 | 3600 | **9152** | 384 | 512 | 960 + 8192 |
+| `g1200_a36`| 1200 | 3600 | **9152** | 384 | 1200 | 960 + 8192 |
+| `g4097_a0` | 4097 | 0 | **9152** | 384 | 4097 | 960 + 8192 |
+| `g5000_a0` | 5000 | 0 | **9152** | 384 | 5000 | 960 + 8192 |
+| `g5000_a36`| 5000 | 3600 | **13248** | 384 | 5000 | 960 + 12288 |
+
+`ts = 960 + PAGE_ALIGN(payload + offset)`, with 960 = `SKB_TRUESIZE(384)`.
+The line is `net/core/datagram.c:662`, `zerocopy_fill_skb_from_iter()`:
+`skb->truesize += PAGE_ALIGN(copied + start)`, and `start` is the page offset
+`iov_iter_get_pages2()` returns (`lib/iov_iter.c:1080`: `*start = addr % PAGE_SIZE`).
+F72's own sentence "one page per payload, not one page per page touched" was
+**wrong**: the offset decides, and the same 512 bytes cost 5056 or 9152
+depending on nothing the socket can see.
+
+Four witnesses per attempt, all equal to the gate number:
+
+| witness | probe | what it proves |
+|---|---|---|
+| `tx` | `__dev_queue_xmit` in X | the charge is set **before** the frame leaves the sender |
+| `ub` | `skb_copy_ubufs` | the ubuf copy in S does not rewrite it |
+| `fwd` | `ip_forward` in S | the router does not rewrite it |
+| `loc`, `udp` | `ip_local_deliver`, `udp_rcv` in D | the receiver does not rewrite it |
+| `rmem` | `/proc/net/udp`, read **before** any `read()` | the queue itself holds that number |
+
+The same datagram through a forward chain that only counts (`g512_a36n`, no
+`log`, no NFLOG clone) costs the same 9152: the rule can neither see nor change
+the charge.
+
+## 2. The dead byte, demonstrated in three cells
+
+| arm | what it is | gate `ts` |
+|---|---|---|
+| `g512_az` | F72's path: `align=0`, the raw static buffer | **5056** |
+| `g512_a0` | a page-aligned buffer, offset **0** | **5056** |
+| `g512_a36` | the same buffer, offset **3600** | **9152** |
+
+`g512_az` and `g512_a0` agree to the byte and both differ from `g512_a36` by
+exactly one page. F72's file has **181** `CHILDS` lines — 18 of them the test
+commands, `cmd=sa0` — and **not one** carries an `al=` field, because the
+sender never received one; F73's sender
+prints what it received (`al=0/1/2`), and the verifier compares it with the
+table in the source. So F72's `z_lin6`, `z_lin6a` and `z_lin6x` were the same
+arm three times, and the sentence "predicted 8192, measured 4096 at three
+offsets" describes one offset, measured three times.
+
+## 3. The five clones are `skb_segment()`'s frag_list clone, named by address
+
+Six copied 512-byte datagrams, plain socket, one burst; the probe now records
+the **caller address** (`caller=$stack0:x64`, `nokaslr`):
+
+| arm | door | rule | `skb_clone` | `skb_segment` | `skb_segment_list` | gate `ts` | gate `cloned` |
+|---|---|---|---|---|---|---|---|
+| `c6_log` | linear | log + counter | **5** | 1 | 0 | 1280 × 6 | 0,1,1,1,1,1 |
+| `c6_cnt` | linear | counter only | **5** | 1 | 0 | 1280 × 6 | 0,1,1,1,1,1 |
+| `c1_log` | linear | log + counter | **0** | 0 | 0 | 1280 | 0 |
+| `c6_f`   | fraglist | log + counter | **0** | 0 | 1 | 7680, 1280 × 5 | 0,0,0,0,0,0 |
+
+All five callers in `c6_log` and in `c6_cnt` are the **same address**,
+`0xffffffff829134c4`; `objdump` of `skb_segment` shows
+`ffffffff829134bf: call ffffffff82908730 <skb_clone>` — the return address is
+exactly that. The call site is `net/core/skbuff.c:4933`, the `frag_list`
+member clone; five, because six equal datagrams are one fresh head plus five
+members. NFLOG is not the cloner (the counter-only rule clones exactly as
+much), and the other door does not clone at all: `skb_segment_list()` takes its
+members. The `cloned` bit at the gate is the fingerprint: `0,1,1,1,1,1` for
+the linear door, all-zero for the fraglist one.
+
+## 4. `MSG_SPLICE_PAGES` is not a userspace flag: the syscall clears it
+
+| arm | sender asked | `__ip_append_data` saw | `skb_splice_from_iter` | gate `ts` | gate `end`, `dlen` |
+|---|---|---|---|---|---|
+| `p512_a36` / `s512` | `MSG_SPLICE_PAGES` (0x8000000) | **flags = 0** | **0 calls** | 1280 | 704, 0 |
+| `p5000_a36` / `s5000` | `MSG_SPLICE_PAGES` | **flags = 0** | 0 calls | **8448** | 7872, 0 |
+| `z512` (control) | `MSG_ZEROCOPY` | **0x4000000** | 0 calls | 9152 | 384, 512 |
+| `z5000` (control) | `MSG_ZEROCOPY` | **0x4000000** | 0 calls | 13248 | 384, 5000 |
+
+The sender child passed the flag and `sendto()` returned 512/5000 bytes; the
+kernel's own `__ip_append_data` entry probe (diagnostic `differ595b`) shows
+`flags=0`, while the zerocopy twin shows `MSG_ZEROCOPY` intact. The reason is
+one line: `__sys_sendto()` does `flags &= ~MSG_INTERNAL_SENDMSG_FLAGS`
+(`net/socket.c:2277`), and `MSG_INTERNAL_SENDMSG_FLAGS` is
+`(MSG_SPLICE_PAGES | MSG_SENDPAGE_NOPOLICY | MSG_SENDPAGE_DECRYPTED |
+MSG_NO_SHARED_FRAGS)` (`include/linux/socket.h:358`) — "flags to be cleared on
+entry by sendmsg and sendmmsg syscalls". A datagram therefore cannot ask for
+it: the only user-reachable way into `skb_splice_from_iter()` is
+`splice(pipe → socket)`. What the arm then measures is an ordinary copy:
+512 bytes → `end` 704, `ts` 1280; 5000 bytes → `end` 7872, `ts` 8448 = `end` +
+576, no page charge at all.
+
+## 5. Predictions: 12 confirmed, 2 refuted
+
+Confirmed: **P1** (5056 at offset 0 and the same at `tx`), **P2** in full
+(`tx` 9152 *and* `gate` 9152), **P3** (13248), **P4** (9152), **P5**, **P6**
+(the three-cell demonstration), **P7** (counter-only rule unchanged), **P8**
+(`ub` and `fwd` carry 9152), **P11** (five clones, one caller, `skb_segment`),
+**P12** (`c6_f`: zero clones, `skb_segment_list`), **P13** (rule-independent),
+**P14** (one datagram: zero clones).
+
+**Refuted: P9 and P10** — both said `gate` `ts` = 960 for a spliced datagram,
+because `skb_splice_from_iter()` has no `truesize` write. The line is right and
+the prediction is void: the function is never called, because the flag does not
+survive `sendto()`. Measured instead: 1280 for 512 bytes and 8448 for 5000.
+
+## 6. Ошибки хода, все мои
+
+1. **The dead byte** (§2): F72's `m[12]` was never written, and I built a
+   whole turn on the contradiction it produced. Found by reading my own
+   instrument, not by a run.
+2. **The probe on the wrong function**: `ip_append_data()` was probed and
+   fired **zero** times in all 72 attempts — udp_sendmsg()'s fast path calls
+   `__ip_append_data()` directly through `ip_make_skb()`. The `ap=0` in every
+   `CNT` line is what said so; a second, small instrument (`differ595b`) moved
+   the probe and answered in one boot.
+3. **The marker did not carry the mode**: one process now runs two tables and
+   both number their arms from 00, so the `cln` arms of the first campaign read
+   the `chg` windows of the same `i/att` — 7 enqueues in a six-datagram arm,
+   and a `zc` fill inside a copy arm. Fixed by putting the run name into the
+   marker; the campaign was rebuilt and re-run from scratch.
+4. **`pkill -f "tools/f73_run.sh full"` killed my own shell** (exit −15): the
+   pattern matched the shell that ran it. The F57 lesson in yet another form —
+   kill a PID whose command line you have read, never a pattern.
+5. **The verifier's first model was too narrow in four places**: `end` 384 for
+   every gateway record (wrong for segments and copies), `CHILDS` lines not
+   attributed at all (they carry no `i/att`), ARP frames (70 bytes) inside the
+   `__dev_queue_xmit` determinism comparison, and a "second word" SG check on a
+   bitmap that has SG in the first.
+6. **`expected_charge()` was applied to the diagnostic arms before the mode
+   condition covered them** — the verifier said "want 960" for a 13248 arm.
+
+## 7. Что не измерено, прямо
+
+- Why a 5000-byte linear copy has `end` = 7872 and a 512-byte one 704: the
+  identity `ts = end + 576` holds for both, but where `end` comes from (the
+  allocation's bucket, not the payload) is read, not measured.
+- `splice()` into the socket — the only user-reachable path to
+  `skb_splice_from_iter()` — is not taken.
+- The `skb_clone()` count outside the markers, if any: the verifier compares
+  the caller set, not a global total.
+- IPv6, TCP, tunnels, `CHECKSUM_COMPLETE`, a real NIC: untouched.
+- **Не уязвимость**: every rule was installed by root in the initial user
+  namespace (F57); the syscall filter of §4 is a documented guard, not a bug.
+
+## 8. Чем проверено
+
+| | |
+|---|---|
+| `tools/verify595.py` | **4206 проверок, 0** on both boots (1931 on rep1 alone) — provenance (kernel, initrd, differ extracted from the initramfs, predictions unchanged), the six `pahole` offsets re-derived here, all thirteen probe definitions rebuilt from those offsets, the arm tables parsed from `vm/differ595_add.c` and compared with every printed parameter and with what the sender child reports it received (byte 12 and 13 of the command), the charge model against every gateway record, the four witnesses per attempt, the `/proc` read-back, the clone model (count, caller, `cloned` bit, door contrast), the identity `ts = end + 576` for every copy, ARP frames excluded from the determinism comparison and everything else compared between boots |
+| `tools/verify595_selftest.py` | **31/31** — 20 single-change data mutations on copies of a real log and 10 single-change model mutations on copies of the verifier, all red without a traceback; `noop` green |
+| `tools/verify595s.py` | **93 проверки, 0** — the diagnostic boot: provenance of `differ595b`, the moved probe, the two `__ip_append_data` calls per arm, `flags` = 0 for a splice arm against `MSG_ZEROCOPY` for its twin, `getfrag` = `ip_generic_getfrag` (`0xffffffff82b21bc0`, from `nm`) |
+| `tools/audit_f73_doc.py` | see VERIFY_REPORT.md |
+| collection | see VERIFY_REPORT.md |
+| regression | see VERIFY_REPORT.md |
+
+**Файлы:** `findings/F73-charge-and-clones/{SUMMARY.md, summary.json,
+VERIFY_REPORT.md, LETTER_SECTION_F73.txt}`; `vm/{differ595_add.c, differ595.c,
+build_f73_differ.sh, make_initramfs595.sh, build/differ595}` and the diagnostic
+twin `vm/{differ595b_add.c, differ595b.c, build_f73b_differ.sh,
+build/differ595b}`; `tools/{f73_run.sh, f73_spl.sh, verify595.py,
+verify595_selftest.py, verify595s.py, f73_summary.py, audit_f73_doc.py,
+f73_regress.sh}`; `research/predictions_595.md`; logs `logs/f73_{rep1,rep2,spl}.log`.
+Артефакты: `summary.json` `art_63180b861c7e`, `differ595` `art_6ab379fb341a`,
+`differ595b` `art_d1a920ec8057`, `f73_rep1.log` `art_1defc00e440b`,
+`f73_rep2.log` `art_fc5dcb7a94fb`, `f73_spl.log` `art_c00ce8b30430`.
+
+
+===== summary.json =====
+{
+ "clone_call_site": {
+  "address": "0xffffffff82912870",
+  "returns_from_call": [
+   "0xffffffff829134c4"
+  ],
+  "symbol": "skb_segment"
+ },
+ "finding": "F73-charge-and-clones",
+ "instrument": {
+  "attempts": 72,
+  "initrd": "vm/initrd595/full.cpio.gz",
+  "modes": {
+   "chg": 10,
+   "cln": 4,
+   "spl": 4
+  },
+  "sha256_binary": "784755bdf63a5668fe9b82422c18107f8951be7334230b3cf54708502286811a",
+  "sha256_initrd": "08507062e8064142341b4387e1f828ebfb4b5aa2bda710b5f204b84adf648091",
+  "sha256_source": "8f5cd7b74c112f08e11f471a6c6a6ccefc297d310f45c6834f5ac4db22a17778",
+  "source": "vm/differ595_add.c"
+ },
+ "kernel": "7.3.4-T563",
+ "kernel_sha256": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+ "predictions_sha256": "c35903d62eec3882702d525565fa0b77b68b68b26ea530c0e0071f5760f1a026",
+ "rows": [
+  {
+   "align": 1,
+   "arm": "g512_a0",
+   "att": 0,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    5056
+   ],
+   "i": 0,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    5056
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    512
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    5056,
+    960,
+    5056
+   ],
+   "zc": 1
+  },
+  {
+   "align": 1,
+   "arm": "g512_a0",
+   "att": 1,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    5056
+   ],
+   "i": 0,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 6,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    5056
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    512,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554,
+    70,
+    70
+   ],
+   "tx_ts": [
+    960,
+    5056,
+    960,
+    5056,
+    960,
+    960
+   ],
+   "zc": 1
+  },
+  {
+   "align": 0,
+   "arm": "g512_az",
+   "att": 0,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    5056
+   ],
+   "i": 1,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    5056
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    512
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    5056,
+    960,
+    5056
+   ],
+   "zc": 1
+  },
+  {
+   "align": 0,
+   "arm": "g512_az",
+   "att": 1,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    5056
+   ],
+   "i": 1,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    5056
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    512
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    5056,
+    960,
+    5056
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "g512_a36",
+   "att": 0,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 2,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 5,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    0,
+    512
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    70,
+    554
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "g512_a36",
+   "att": 1,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 2,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    512
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "g512_a36n",
+   "att": 0,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 3,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 1,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    512
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "g512_a36n",
+   "att": 1,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 3,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 1,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    512
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "g1200_a36",
+   "att": 0,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    1200
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 4,
+   "mode": "chg",
+   "n": 1,
+   "pl": 1200,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    1200,
+    0,
+    1200
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    1242,
+    106,
+    1242
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "g1200_a36",
+   "att": 1,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    1200
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 4,
+   "mode": "chg",
+   "n": 1,
+   "pl": 1200,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    1200,
+    0,
+    1200
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    1242,
+    106,
+    1242
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 1,
+   "arm": "g4097_a0",
+   "att": 0,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    4097
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 5,
+   "mode": "chg",
+   "n": 1,
+   "pl": 4097,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 5,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    4097,
+    0,
+    4097,
+    0
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    4139,
+    106,
+    4139,
+    70
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152,
+    960
+   ],
+   "zc": 1
+  },
+  {
+   "align": 1,
+   "arm": "g4097_a0",
+   "att": 1,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    4097
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 5,
+   "mode": "chg",
+   "n": 1,
+   "pl": 4097,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    4097,
+    0,
+    4097
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    4139,
+    106,
+    4139
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 1,
+   "arm": "g5000_a0",
+   "att": 0,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    5000
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 6,
+   "mode": "chg",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    5000,
+    0,
+    5000
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 1,
+   "arm": "g5000_a0",
+   "att": 1,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    5000
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 6,
+   "mode": "chg",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    5000,
+    0,
+    5000
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "g5000_a36",
+   "att": 0,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    5000
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    13248
+   ],
+   "i": 7,
+   "mode": "chg",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    13248
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    5000,
+    0,
+    5000
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    13248,
+    960,
+    13248
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "g5000_a36",
+   "att": 1,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    5000
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    13248
+   ],
+   "i": 7,
+   "mode": "chg",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    13248
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    5000,
+    0,
+    5000
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    13248,
+    960,
+    13248
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "p512_a36",
+   "att": 0,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    704
+   ],
+   "gate_ts": [
+    1280
+   ],
+   "i": 8,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    1280
+   ],
+   "rule": 0,
+   "splice": 1,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    960,
+    1280
+   ],
+   "zc": 0
+  },
+  {
+   "align": 2,
+   "arm": "p512_a36",
+   "att": 1,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    704
+   ],
+   "gate_ts": [
+    1280
+   ],
+   "i": 8,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    1280
+   ],
+   "rule": 0,
+   "splice": 1,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    960,
+    1280
+   ],
+   "zc": 0
+  },
+  {
+   "align": 2,
+   "arm": "p5000_a36",
+   "att": 0,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    7872
+   ],
+   "gate_ts": [
+    8448
+   ],
+   "i": 9,
+   "mode": "chg",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    8448
+   ],
+   "rule": 0,
+   "splice": 1,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    7872,
+    384,
+    7872
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    8448,
+    960,
+    8448
+   ],
+   "zc": 0
+  },
+  {
+   "align": 2,
+   "arm": "p5000_a36",
+   "att": 1,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    7872
+   ],
+   "gate_ts": [
+    8448
+   ],
+   "i": 9,
+   "mode": "chg",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    8448
+   ],
+   "rule": 0,
+   "splice": 1,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    7872,
+    384,
+    7872
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    8448,
+    960,
+    8448
+   ],
+   "zc": 0
+  },
+  {
+   "align": 0,
+   "arm": "c6_log",
+   "att": 0,
+   "boot": "rep1",
+   "clone_callers": [
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4"
+   ],
+   "door": "u",
+   "gate_cloned": [
+    0,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "gate_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "gate_end": [
+    704,
+    704,
+    704,
+    704,
+    704,
+    704
+   ],
+   "gate_ts": [
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280
+   ],
+   "i": 0,
+   "mode": "cln",
+   "n": 6,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 5,
+    "enq": 6,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 1,
+    "segl": 0,
+    "sp": 0,
+    "tx": 9,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    7680
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    2560
+   ],
+   "tx_end": [
+    384,
+    704,
+    704,
+    704,
+    704,
+    704,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    554,
+    554,
+    554,
+    554,
+    554,
+    106,
+    3114
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    960,
+    7680
+   ],
+   "zc": 0
+  },
+  {
+   "align": 0,
+   "arm": "c6_log",
+   "att": 1,
+   "boot": "rep1",
+   "clone_callers": [
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4"
+   ],
+   "door": "u",
+   "gate_cloned": [
+    0,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "gate_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "gate_end": [
+    704,
+    704,
+    704,
+    704,
+    704,
+    704
+   ],
+   "gate_ts": [
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280
+   ],
+   "i": 0,
+   "mode": "cln",
+   "n": 6,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 5,
+    "enq": 6,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 1,
+    "segl": 0,
+    "sp": 0,
+    "tx": 9,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    7680
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    2560
+   ],
+   "tx_end": [
+    384,
+    704,
+    704,
+    704,
+    704,
+    704,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    554,
+    554,
+    554,
+    554,
+    554,
+    106,
+    3114
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    960,
+    7680
+   ],
+   "zc": 0
+  },
+  {
+   "align": 0,
+   "arm": "c6_cnt",
+   "att": 0,
+   "boot": "rep1",
+   "clone_callers": [
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4"
+   ],
+   "door": "u",
+   "gate_cloned": [
+    0,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "gate_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "gate_end": [
+    704,
+    704,
+    704,
+    704,
+    704,
+    704
+   ],
+   "gate_ts": [
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280
+   ],
+   "i": 1,
+   "mode": "cln",
+   "n": 6,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 5,
+    "enq": 6,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 1,
+    "segl": 0,
+    "sp": 0,
+    "tx": 9,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    7680
+   ],
+   "rule": 1,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    2560
+   ],
+   "tx_end": [
+    384,
+    704,
+    704,
+    704,
+    704,
+    704,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    554,
+    554,
+    554,
+    554,
+    554,
+    106,
+    3114
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    960,
+    7680
+   ],
+   "zc": 0
+  },
+  {
+   "align": 0,
+   "arm": "c6_cnt",
+   "att": 1,
+   "boot": "rep1",
+   "clone_callers": [
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4"
+   ],
+   "door": "u",
+   "gate_cloned": [
+    0,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "gate_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "gate_end": [
+    704,
+    704,
+    704,
+    704,
+    704,
+    704
+   ],
+   "gate_ts": [
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280
+   ],
+   "i": 1,
+   "mode": "cln",
+   "n": 6,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 5,
+    "enq": 6,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 1,
+    "segl": 0,
+    "sp": 0,
+    "tx": 9,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    7680
+   ],
+   "rule": 1,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    2560
+   ],
+   "tx_end": [
+    384,
+    704,
+    704,
+    704,
+    704,
+    704,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    554,
+    554,
+    554,
+    554,
+    554,
+    106,
+    3114
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    960,
+    7680
+   ],
+   "zc": 0
+  },
+  {
+   "align": 0,
+   "arm": "c1_log",
+   "att": 0,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    704
+   ],
+   "gate_ts": [
+    1280
+   ],
+   "i": 2,
+   "mode": "cln",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    1280
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    960,
+    1280
+   ],
+   "zc": 0
+  },
+  {
+   "align": 0,
+   "arm": "c1_log",
+   "att": 1,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    704
+   ],
+   "gate_ts": [
+    1280
+   ],
+   "i": 2,
+   "mode": "cln",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    1280
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    960,
+    1280
+   ],
+   "zc": 0
+  },
+  {
+   "align": 0,
+   "arm": "c6_f",
+   "att": 0,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "f",
+   "gate_cloned": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "gate_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "gate_end": [
+    704,
+    704,
+    704,
+    704,
+    704,
+    704
+   ],
+   "gate_ts": [
+    7680,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280
+   ],
+   "i": 3,
+   "mode": "cln",
+   "n": 6,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 6,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 1,
+    "sp": 0,
+    "tx": 9,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    14080
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    2560
+   ],
+   "tx_end": [
+    384,
+    704,
+    704,
+    704,
+    704,
+    704,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    554,
+    554,
+    554,
+    554,
+    554,
+    106,
+    3114
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    960,
+    7680
+   ],
+   "zc": 0
+  },
+  {
+   "align": 0,
+   "arm": "c6_f",
+   "att": 1,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "f",
+   "gate_cloned": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "gate_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "gate_end": [
+    704,
+    704,
+    704,
+    704,
+    704,
+    704
+   ],
+   "gate_ts": [
+    7680,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280
+   ],
+   "i": 3,
+   "mode": "cln",
+   "n": 6,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 6,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 1,
+    "sp": 0,
+    "tx": 9,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    14080
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    2560
+   ],
+   "tx_end": [
+    384,
+    704,
+    704,
+    704,
+    704,
+    704,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    554,
+    554,
+    554,
+    554,
+    554,
+    106,
+    3114
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    960,
+    7680
+   ],
+   "zc": 0
+  },
+  {
+   "align": 2,
+   "arm": "s512",
+   "att": 0,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    704
+   ],
+   "gate_ts": [
+    1280
+   ],
+   "i": 0,
+   "mode": "spl",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    1280
+   ],
+   "rule": 0,
+   "splice": 1,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    960,
+    1280
+   ],
+   "zc": 0
+  },
+  {
+   "align": 2,
+   "arm": "s512",
+   "att": 1,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    704
+   ],
+   "gate_ts": [
+    1280
+   ],
+   "i": 0,
+   "mode": "spl",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    1280
+   ],
+   "rule": 0,
+   "splice": 1,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    960,
+    1280
+   ],
+   "zc": 0
+  },
+  {
+   "align": 2,
+   "arm": "s5000",
+   "att": 0,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    7872
+   ],
+   "gate_ts": [
+    8448
+   ],
+   "i": 1,
+   "mode": "spl",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    8448
+   ],
+   "rule": 0,
+   "splice": 1,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    7872,
+    384,
+    7872
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    8448,
+    960,
+    8448
+   ],
+   "zc": 0
+  },
+  {
+   "align": 2,
+   "arm": "s5000",
+   "att": 1,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    7872
+   ],
+   "gate_ts": [
+    8448
+   ],
+   "i": 1,
+   "mode": "spl",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    8448
+   ],
+   "rule": 0,
+   "splice": 1,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    7872,
+    384,
+    7872
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    8448,
+    960,
+    8448
+   ],
+   "zc": 0
+  },
+  {
+   "align": 2,
+   "arm": "z512",
+   "att": 0,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 2,
+   "mode": "spl",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    512
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "z512",
+   "att": 1,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 2,
+   "mode": "spl",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    512
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "z5000",
+   "att": 0,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    5000
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    13248
+   ],
+   "i": 3,
+   "mode": "spl",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    13248
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    5000,
+    0,
+    5000
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    13248,
+    960,
+    13248
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "z5000",
+   "att": 1,
+   "boot": "rep1",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    5000
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    13248
+   ],
+   "i": 3,
+   "mode": "spl",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    13248
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    5000,
+    0,
+    5000
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    13248,
+    960,
+    13248
+   ],
+   "zc": 1
+  },
+  {
+   "align": 1,
+   "arm": "g512_a0",
+   "att": 0,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    5056
+   ],
+   "i": 0,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    5056
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    512
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    5056,
+    960,
+    5056
+   ],
+   "zc": 1
+  },
+  {
+   "align": 1,
+   "arm": "g512_a0",
+   "att": 1,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    5056
+   ],
+   "i": 0,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 7,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    5056
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    512,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554,
+    70,
+    70,
+    70
+   ],
+   "tx_ts": [
+    960,
+    5056,
+    960,
+    5056,
+    960,
+    960,
+    960
+   ],
+   "zc": 1
+  },
+  {
+   "align": 0,
+   "arm": "g512_az",
+   "att": 0,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    5056
+   ],
+   "i": 1,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    5056
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    512
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    5056,
+    960,
+    5056
+   ],
+   "zc": 1
+  },
+  {
+   "align": 0,
+   "arm": "g512_az",
+   "att": 1,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    5056
+   ],
+   "i": 1,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    5056
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    512
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    5056,
+    960,
+    5056
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "g512_a36",
+   "att": 0,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 2,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 6,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    0,
+    512,
+    0
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    70,
+    554,
+    70
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    960,
+    9152,
+    960
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "g512_a36",
+   "att": 1,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 2,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    512
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "g512_a36n",
+   "att": 0,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 3,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 1,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    512
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "g512_a36n",
+   "att": 1,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 3,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 1,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    512
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "g1200_a36",
+   "att": 0,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    1200
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 4,
+   "mode": "chg",
+   "n": 1,
+   "pl": 1200,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    1200,
+    0,
+    1200
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    1242,
+    106,
+    1242
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "g1200_a36",
+   "att": 1,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    1200
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 4,
+   "mode": "chg",
+   "n": 1,
+   "pl": 1200,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    1200,
+    0,
+    1200
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    1242,
+    106,
+    1242
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 1,
+   "arm": "g4097_a0",
+   "att": 0,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    4097
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 5,
+   "mode": "chg",
+   "n": 1,
+   "pl": 4097,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 5,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    4097,
+    0,
+    4097,
+    0
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    4139,
+    106,
+    4139,
+    70
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152,
+    960
+   ],
+   "zc": 1
+  },
+  {
+   "align": 1,
+   "arm": "g4097_a0",
+   "att": 1,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    4097
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 5,
+   "mode": "chg",
+   "n": 1,
+   "pl": 4097,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    4097,
+    0,
+    4097
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    4139,
+    106,
+    4139
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 1,
+   "arm": "g5000_a0",
+   "att": 0,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    5000
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 6,
+   "mode": "chg",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    5000,
+    0,
+    5000
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 1,
+   "arm": "g5000_a0",
+   "att": 1,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    5000
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 6,
+   "mode": "chg",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    5000,
+    0,
+    5000
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "g5000_a36",
+   "att": 0,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    5000
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    13248
+   ],
+   "i": 7,
+   "mode": "chg",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    13248
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    5000,
+    0,
+    5000
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    13248,
+    960,
+    13248
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "g5000_a36",
+   "att": 1,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    5000
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    13248
+   ],
+   "i": 7,
+   "mode": "chg",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    13248
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    5000,
+    0,
+    5000
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    13248,
+    960,
+    13248
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "p512_a36",
+   "att": 0,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    704
+   ],
+   "gate_ts": [
+    1280
+   ],
+   "i": 8,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    1280
+   ],
+   "rule": 0,
+   "splice": 1,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    960,
+    1280
+   ],
+   "zc": 0
+  },
+  {
+   "align": 2,
+   "arm": "p512_a36",
+   "att": 1,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    704
+   ],
+   "gate_ts": [
+    1280
+   ],
+   "i": 8,
+   "mode": "chg",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    1280
+   ],
+   "rule": 0,
+   "splice": 1,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    960,
+    1280
+   ],
+   "zc": 0
+  },
+  {
+   "align": 2,
+   "arm": "p5000_a36",
+   "att": 0,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    7872
+   ],
+   "gate_ts": [
+    8448
+   ],
+   "i": 9,
+   "mode": "chg",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    8448
+   ],
+   "rule": 0,
+   "splice": 1,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    7872,
+    384,
+    7872
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    8448,
+    960,
+    8448
+   ],
+   "zc": 0
+  },
+  {
+   "align": 2,
+   "arm": "p5000_a36",
+   "att": 1,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    7872
+   ],
+   "gate_ts": [
+    8448
+   ],
+   "i": 9,
+   "mode": "chg",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    8448
+   ],
+   "rule": 0,
+   "splice": 1,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    7872,
+    384,
+    7872
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    8448,
+    960,
+    8448
+   ],
+   "zc": 0
+  },
+  {
+   "align": 0,
+   "arm": "c6_log",
+   "att": 0,
+   "boot": "rep2",
+   "clone_callers": [
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4"
+   ],
+   "door": "u",
+   "gate_cloned": [
+    0,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "gate_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "gate_end": [
+    704,
+    704,
+    704,
+    704,
+    704,
+    704
+   ],
+   "gate_ts": [
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280
+   ],
+   "i": 0,
+   "mode": "cln",
+   "n": 6,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 5,
+    "enq": 6,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 1,
+    "segl": 0,
+    "sp": 0,
+    "tx": 9,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    7680
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    2560
+   ],
+   "tx_end": [
+    384,
+    704,
+    704,
+    704,
+    704,
+    704,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    554,
+    554,
+    554,
+    554,
+    554,
+    106,
+    3114
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    960,
+    7680
+   ],
+   "zc": 0
+  },
+  {
+   "align": 0,
+   "arm": "c6_log",
+   "att": 1,
+   "boot": "rep2",
+   "clone_callers": [
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4"
+   ],
+   "door": "u",
+   "gate_cloned": [
+    0,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "gate_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "gate_end": [
+    704,
+    704,
+    704,
+    704,
+    704,
+    704
+   ],
+   "gate_ts": [
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280
+   ],
+   "i": 0,
+   "mode": "cln",
+   "n": 6,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 5,
+    "enq": 6,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 1,
+    "segl": 0,
+    "sp": 0,
+    "tx": 11,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    7680
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    2560,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    704,
+    704,
+    704,
+    704,
+    704,
+    704,
+    384,
+    704,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    554,
+    554,
+    554,
+    554,
+    554,
+    106,
+    3114,
+    70,
+    70
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    960,
+    7680,
+    960,
+    960
+   ],
+   "zc": 0
+  },
+  {
+   "align": 0,
+   "arm": "c6_cnt",
+   "att": 0,
+   "boot": "rep2",
+   "clone_callers": [
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4"
+   ],
+   "door": "u",
+   "gate_cloned": [
+    0,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "gate_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "gate_end": [
+    704,
+    704,
+    704,
+    704,
+    704,
+    704
+   ],
+   "gate_ts": [
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280
+   ],
+   "i": 1,
+   "mode": "cln",
+   "n": 6,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 5,
+    "enq": 6,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 1,
+    "segl": 0,
+    "sp": 0,
+    "tx": 9,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    7680
+   ],
+   "rule": 1,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    2560
+   ],
+   "tx_end": [
+    384,
+    704,
+    704,
+    704,
+    704,
+    704,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    554,
+    554,
+    554,
+    554,
+    554,
+    106,
+    3114
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    960,
+    7680
+   ],
+   "zc": 0
+  },
+  {
+   "align": 0,
+   "arm": "c6_cnt",
+   "att": 1,
+   "boot": "rep2",
+   "clone_callers": [
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4",
+    "0xffffffff829134c4"
+   ],
+   "door": "u",
+   "gate_cloned": [
+    0,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "gate_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "gate_end": [
+    704,
+    704,
+    704,
+    704,
+    704,
+    704
+   ],
+   "gate_ts": [
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280
+   ],
+   "i": 1,
+   "mode": "cln",
+   "n": 6,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 5,
+    "enq": 6,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 1,
+    "segl": 0,
+    "sp": 0,
+    "tx": 9,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    7680
+   ],
+   "rule": 1,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    2560
+   ],
+   "tx_end": [
+    384,
+    704,
+    704,
+    704,
+    704,
+    704,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    554,
+    554,
+    554,
+    554,
+    554,
+    106,
+    3114
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    960,
+    7680
+   ],
+   "zc": 0
+  },
+  {
+   "align": 0,
+   "arm": "c1_log",
+   "att": 0,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    704
+   ],
+   "gate_ts": [
+    1280
+   ],
+   "i": 2,
+   "mode": "cln",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    1280
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    960,
+    1280
+   ],
+   "zc": 0
+  },
+  {
+   "align": 0,
+   "arm": "c1_log",
+   "att": 1,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    704
+   ],
+   "gate_ts": [
+    1280
+   ],
+   "i": 2,
+   "mode": "cln",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    1280
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    384,
+    704,
+    704
+   ],
+   "tx_len": [
+    106,
+    106,
+    554,
+    554
+   ],
+   "tx_ts": [
+    960,
+    960,
+    1280,
+    1280
+   ],
+   "zc": 0
+  },
+  {
+   "align": 0,
+   "arm": "c6_f",
+   "att": 0,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "f",
+   "gate_cloned": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "gate_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "gate_end": [
+    704,
+    704,
+    704,
+    704,
+    704,
+    704
+   ],
+   "gate_ts": [
+    7680,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280
+   ],
+   "i": 3,
+   "mode": "cln",
+   "n": 6,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 6,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 1,
+    "sp": 0,
+    "tx": 9,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    14080
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    2560
+   ],
+   "tx_end": [
+    384,
+    704,
+    704,
+    704,
+    704,
+    704,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    554,
+    554,
+    554,
+    554,
+    554,
+    106,
+    3114
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    960,
+    7680
+   ],
+   "zc": 0
+  },
+  {
+   "align": 0,
+   "arm": "c6_f",
+   "att": 1,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "f",
+   "gate_cloned": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "gate_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "gate_end": [
+    704,
+    704,
+    704,
+    704,
+    704,
+    704
+   ],
+   "gate_ts": [
+    7680,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280
+   ],
+   "i": 3,
+   "mode": "cln",
+   "n": 6,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 6,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 1,
+    "sp": 0,
+    "tx": 9,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    14080
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    2560
+   ],
+   "tx_end": [
+    384,
+    704,
+    704,
+    704,
+    704,
+    704,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    554,
+    554,
+    554,
+    554,
+    554,
+    106,
+    3114
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    1280,
+    960,
+    7680
+   ],
+   "zc": 0
+  },
+  {
+   "align": 2,
+   "arm": "s512",
+   "att": 0,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    704
+   ],
+   "gate_ts": [
+    1280
+   ],
+   "i": 0,
+   "mode": "spl",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    1280
+   ],
+   "rule": 0,
+   "splice": 1,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    960,
+    1280
+   ],
+   "zc": 0
+  },
+  {
+   "align": 2,
+   "arm": "s512",
+   "att": 1,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    704
+   ],
+   "gate_ts": [
+    1280
+   ],
+   "i": 0,
+   "mode": "spl",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    1280
+   ],
+   "rule": 0,
+   "splice": 1,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    704,
+    384,
+    704
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    1280,
+    960,
+    1280
+   ],
+   "zc": 0
+  },
+  {
+   "align": 2,
+   "arm": "s5000",
+   "att": 0,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    7872
+   ],
+   "gate_ts": [
+    8448
+   ],
+   "i": 1,
+   "mode": "spl",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    8448
+   ],
+   "rule": 0,
+   "splice": 1,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    7872,
+    384,
+    7872
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    8448,
+    960,
+    8448
+   ],
+   "zc": 0
+  },
+  {
+   "align": 2,
+   "arm": "s5000",
+   "att": 1,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    0
+   ],
+   "gate_end": [
+    7872
+   ],
+   "gate_ts": [
+    8448
+   ],
+   "i": 1,
+   "mode": "spl",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 0,
+    "udp": 2,
+    "zc": 0,
+    "zf": 0
+   },
+   "rmem_after": [
+    0,
+    8448
+   ],
+   "rule": 0,
+   "splice": 1,
+   "tx_dlen": [
+    0,
+    0,
+    0,
+    0
+   ],
+   "tx_end": [
+    384,
+    7872,
+    384,
+    7872
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    8448,
+    960,
+    8448
+   ],
+   "zc": 0
+  },
+  {
+   "align": 2,
+   "arm": "z512",
+   "att": 0,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 2,
+   "mode": "spl",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    512
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "z512",
+   "att": 1,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    9152
+   ],
+   "i": 2,
+   "mode": "spl",
+   "n": 1,
+   "pl": 512,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    9152
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    512,
+    0,
+    512
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    554,
+    106,
+    554
+   ],
+   "tx_ts": [
+    960,
+    9152,
+    960,
+    9152
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "z5000",
+   "att": 0,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    5000
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    13248
+   ],
+   "i": 3,
+   "mode": "spl",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    13248
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    5000,
+    0,
+    5000
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    13248,
+    960,
+    13248
+   ],
+   "zc": 1
+  },
+  {
+   "align": 2,
+   "arm": "z5000",
+   "att": 1,
+   "boot": "rep2",
+   "clone_callers": [],
+   "door": "u",
+   "gate_cloned": [
+    0
+   ],
+   "gate_dlen": [
+    5000
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_ts": [
+    13248
+   ],
+   "i": 3,
+   "mode": "spl",
+   "n": 1,
+   "pl": 5000,
+   "probes": {
+    "ap": 0,
+    "clone": 0,
+    "enq": 1,
+    "fwd": 2,
+    "loc": 2,
+    "seg": 0,
+    "segl": 0,
+    "sp": 0,
+    "tx": 4,
+    "ubuf": 1,
+    "udp": 2,
+    "zc": 1,
+    "zf": 1
+   },
+   "rmem_after": [
+    0,
+    13248
+   ],
+   "rule": 0,
+   "splice": 0,
+   "tx_dlen": [
+    0,
+    5000,
+    0,
+    5000
+   ],
+   "tx_end": [
+    384,
+    384,
+    384,
+    384
+   ],
+   "tx_len": [
+    106,
+    5042,
+    106,
+    5042
+   ],
+   "tx_ts": [
+    960,
+    13248,
+    960,
+    13248
+   ],
+   "zc": 1
+  }
+ ],
+ "turn": 595
+}

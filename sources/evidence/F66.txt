@@ -1,0 +1,1439 @@
+===== LETTER_SECTION_F66.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload and an aggregate's length: the byte cap that ends UDP
+ GRO counts a header the fraglist path adds and the linear path does not, and
+ what a socket keeps is decided by its receive buffer
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+F66 -- two ceilings, one budget
+
+This follows the two debts of the previous section: what the byte cap that
+ends UDP GRO actually counts, and why a socket kept 29..64 of the 64 datagrams
+of one aggregate.
+
+THE CAP.  The two merge paths test different lengths against the same
+65536 = GRO_LEGACY_MAX_SIZE.  skb_gro_receive() tests p->len + skb_gro_len(),
+i.e. the payload; skb_gro_receive_list() tests p->len + skb->len before its
+skb_pull(), i.e. the whole arriving datagram (IPv6 header 40 + UDP 8 +
+payload).  p->len grows by the payload in both.  With H = 48:
+
+    linear   : H + k*P      < 65536   ->  P <= 1023 at 64 datagrams
+    fraglist : 2H + k*P     < 65536   ->  P <= 1022 at 64 datagrams
+
+One send of 64 datagrams of 1023 bytes, one rule, two doors: the linear shape
+reaches the forward chain as ONE packet with uh->len 0xffc8 (65480), the
+fraglist shape as TWO (0xfbc9 and 0x0407, the second one 200 ms later as its
+own flow).  A shorter tail on 63 equal datagrams walks the same inequality to
+the byte: on the fraglist the tail merges up to 990 and is refused at 991, on
+the linear path up to 975 and refused at 976.  Both give H = 48, so the
+Ethernet header is not counted; the fraglist aggregate stops 48 bytes -- one
+IPv6+UDP header -- short of what the linear aggregate may carry (L3 65487
+against 65535).
+
+There is a third 65536 that the rule cannot see.  gso_features_check() strips
+the GSO feature bits when skb->len >= dev->gso_max_size, so the aggregate
+leaves the router as one frame only while the frame is under 65536 bytes: with
+uh->len 65481 (frame 65535) the wire carried one frame, with 65482 (65536) it
+carried sixty-four segments of 1024.  Six bytes of uh->len are therefore
+writable by a rule and still in one frame, and the next byte is not.
+
+THE BUDGET.  A socket with a lazy reader keeps a number of the 64 segmented
+datagrams that is a function of SO_RCVBUF alone, and it repeats exactly:
+1 + floor((rcvbuf - A) / s) with s = 1280 the per-datagram truesize and A =
+81920 = 64 * 1280 the truesize of the whole aggregate, charged to its FIRST
+segment.  Measured at rcvbuf 98304/114688/131072/147456/262144: 13/26/39/52/64
+kept, and 64 - kept in Udp6InErrors, with the queue bytes in /proc/net/udp6
+equal to A + (kept-1)*s.  A buffer below A still accepts one datagram: the
+"accept the packet if queue is empty" clause in __udp_enqueue_schedule_skb().
+An eager reader never kept fewer and sometimes kept more (39..58 across
+eight attempts), which is the part that does not repeat.
+
+WHAT IT COSTS A READER.  Every frame of a 64-datagram aggregate carries the
+first datagram's CHECKSUM_PARTIAL seed in the checksum field (0xfcc2 =
+fold(pseudo-header(520)) here), not a checksum; a linear aggregate carries the
+seed of its whole length (0x00c3 for 1544).  A store into the payload lands at
+frame offset 62 and is visible identically at the router's egress tap and at
+the receiver's ingress tap -- two witnesses, one frame.
+
+One limit on the evidence, stated because it is a limit: an NFLOG payload
+longer than 65531 bytes does not exist (the netlink attribute length is 16
+bit), so for an aggregate of uh->len 65488 and above the log carries the
+header and the beginning of the payload and silently stops.
+
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.  Kernel
+7.3.4-T563, IPv6 only, all rules installed by root in the initial user
+namespace.
+
+
+===== SUMMARY.md =====
+# F66 — бюджет приёмной очереди и два разных 65536
+
+Ход 588. Ядро одно и то же: `7.3.4-T563` (`1efbc957…2033`), новых сборок нет.
+Прибор `vm/build/differ588` (`d697edd1…5172`), режимы `split` (20 плеч) и `cap`
+(22 плеча), по две попытки на плечо, два независимых прогона (`rep1`, `rep2`)
+плюс предыдущее поколение того же прибора (`sA`, `sB`).
+
+Три долга F65 §9 закрыты: механизм раскладки доставки, лишний байт байтового
+предела, и мёртвый тап родителя.
+
+---
+
+## 1. Что считает GRO и что считает устройство: три разных 65536
+
+Предел `GRO_LEGACY_MAX_SIZE = 65536` (`include/linux/netdevice.h:2403`) в двух
+местах слияния проверяется **разной длиной**:
+
+```
+net/core/gro.c  skb_gro_receive()        (линейный путь)
+        if (unlikely(p->len + len >= netif_get_gro_max_size(p->dev, p) …
+        len = skb_gro_len(skb)  = полезная нагрузка дейтаграммы
+
+net/core/gro.c  skb_gro_receive_list()   (фраглист)
+        if (unlikely(p->len + skb->len >= 65536 …
+        skb->len  = 48 + полезная нагрузка, ещё до skb_pull()
+```
+
+а `p->len` в обоих растёт **только на полезную нагрузку** (`p->len += len;`).
+Значит при H = 40 (IPv6) + 8 (UDP) = 48 и N дейтаграммах по P байт:
+
+| форма | слияние k-й происходит, если | при N = 64 |
+|---|---|---|
+| линейная | `H + k·P < 65536` | P ≤ **1023** |
+| фраглист | `2H + k·P < 65536` | P ≤ **1022** |
+
+Измерено той же самой отправкой через две двери (одни и те же 64 дейтаграммы,
+одна таблица, одно правило):
+
+| плечо | форма | P | пакетов у правила | `uh->len` |
+|---|---|---|---|---|
+| `ku1022_f` | фраглист | 1022 | **1** | `0xff88` = 65416 |
+| `ku1023_f` | фраглист | 1023 | **2** | `0xfbc9` = 64457 и `0x0407` = 1031 |
+| `ku1023_u` | линейная | 1023 | **1** | `0xffc8` = 65480 |
+| `ku1024_u` | линейная | 1024 | **2** | `0xfc08` = 64520 и `0x0408` = 1032 |
+
+Одна и та же отправка 64 × 1023 — один пакет на линейной двери и два на
+фраглисте. **Это и есть ответ на «лишний байт»**: лишнего байта на дейтаграмму
+нет. Фраглист платит за каждую приходящую дейтаграмму её полную длину L3
+(`skb->len`), а в счёт `p->len` кладёт только полезную нагрузку, поэтому
+агрегат останавливается **на 48 байт раньше** — на один заголовок IPv6+UDP.
+При 64 дейтаграммах эти 48 байт выглядят как «один байт на дейтаграмму»
+(96 = 2 × 48; 96 / 64 = 1,5).
+
+Хвост из одной короткой дейтаграммы доводит ту же проверку до байта. 63
+дейтаграммы по P и последняя длины sl:
+
+| форма | последняя сливается, если | граница |
+|---|---|---|
+| фраглист (63 × 1023) | `96 + 63·1023 + sl < 65536` | sl ≤ **990** |
+| линейная (63 × 1024) | `48 + 63·1024 + sl < 65536` | sl ≤ **975** |
+
+Измерено: `tf988/989/990` — один пакет, `tf991` — **два** (64457 + 1039);
+`tu973/974/975` — один пакет, `tu976` — **два** (64520 + 1024). Оба порога
+сходятся до байта, и оба дают **H = 48**: Ethernet-заголовок в счёт не входит
+(гипотеза H = 62 опровергнута клеткой `tf963`, которая слилась).
+
+Итог по длинам, которые путь разрешает агрегату: линейная — `uh->len` 65487
+(L3 65535, на байт ниже предела), фраглист — 65439 (L3 65487). Разница ровно
+48 байт — один заголовок.
+
+### 1a. Третье 65536: кадр на выходном устройстве
+
+Агрегат покидает маршрутизатор одним кадром, только если **кадр** меньше
+65536. `gso_features_check()` (`net/core/dev.c:3865`) снимает GSO-биты, когда
+`skb->len >= netif_get_gso_max_size()`, и дальше устройство режет в софте:
+
+| плечо | `uh->len` | кадр = 54 + `uh->len` | кадров на y1 |
+|---|---|---|---|
+| `tu960` | 65480 | 65534 | **1** |
+| `tu961` | 65481 | 65535 | **1** |
+| `tu962` | 65482 | **65536** | **64** |
+| `tu970…tu975` | 65488…65535* | ≥ 65536 | 64 |
+| `tu976`, `tu980` | 64520 (+ хвост) | 64574 | 2 |
+
+\* у `tu973…975` журнал обрезан на 65531 (см. §7), длина шапки взята из
+`uh->len` в кадре.
+
+То есть в одном кадре живёт `uh->len` до 65481, а GRO разрешает линейному пути
+до 65487: шесть байт, которые правило может записать в длину, а провод уже не
+понесёт одним кадром. Между правилом и проводом стоит ещё одно 65536, и оно
+считает не то же самое.
+
+---
+
+## 2. Кто решает, сколько дейтаграмм оставит сокет: бюджет, а не читатель
+
+64 дейтаграммы по 512 приходят в D одной GSO-пачкой и разрезаются на 64
+skb (`udp_rcv_segment()`). Дальше каждую принимает
+`__udp_enqueue_schedule_skb()` (`net/ipv4/udp.c:1690`):
+
+```c
+	if (rmem + size > rcvbuf) {
+		if (rcvbuf > INT_MAX >> 1) goto drop;
+		/* Accept the packet if queue is empty. */
+		if (rmem) goto drop;
+	}
+```
+
+Читатель в приборе либо читает сразу (`lazy=0`), либо спит 400 мс и только
+потом читает (`lazy=40`). Каждое плечо объявляет свой `SO_RCVBUF`; ядро его
+удваивает, и в журнал печатается **прочитанное обратно** значение.
+
+| плечо | `SO_RCVBUF` → факт. | оставлено | ошибок | байт в очереди |
+|---|---|---|---|---|
+| `q1024_lazy` | 1024 → 2304 | **1** | 63 | 81920 |
+| `q4096_lazy` | 4096 → 8192 | **1** | 63 | 81920 |
+| `q8192_lazy` | 8192 → 16384 | **1** | 63 | 81920 |
+| `q16384_lazy` | 16384 → 32768 | **1** | 63 | 81920 |
+| `q32768_lazy` | 32768 → 65536 | **1** | 63 | 81920 |
+| `q49152_lazy` | 49152 → **98304** | **13** | 51 | 97280 |
+| `q57344_lazy` | 57344 → **114688** | **26** | 38 | 113920 |
+| `q65536_lazy` | 65536 → 131072 | **39** | 25 | 130560 |
+| `q73728_lazy` | 73728 → **147456** | **52** | 12 | 147200 |
+| `q131072_lazy` | 131072 → 262144 | **64** | 0 | 162560 |
+| `q262144_lazy` | → 524288 | **64** | 0 | 162560 |
+| `q1048576_lazy` | → 2097152 | **64** | 0 | 162560 |
+| `q54x1200_lazy` | 212992 → 425984 | **54** | 0 | 246528 |
+
+Две вещи видны сразу.
+
+**Первая: первый сегмент платит за весь агрегат.** Один оставленный сегмент
+занимает 81920 байт — это truesize **всего** агрегата (64 × 1280), а не
+дейтаграммы. Каждый следующий — 1280:
+
+```
+39 оставленных: 81920 + 38 × 1280 = 130560  (измерено 130560)
+64 оставленных: 81920 + 63 × 1280 = 162560  (измерено 162560)
+```
+
+Отсюда и странная на вид ступенька: буфер до 65536 вообще не помогает —
+первый сегмент уже больше него и проходит только по праву «очередь пуста»;
+затем каждый следующий стоит 1280.
+
+**Вторая: модель предсказывает числа, на которых её не подгоняли.** Подгонка
+сделана на `q65536_lazy` (39) и `q131072_lazy` (64) — из них выводятся
+s = 1280 и A = 81920, — а три плеча `q49152/q57344/q73728` получили
+предсказания **13 / 26 / 52** и дали **13 / 26 / 52** в обоих прогонах.
+
+Сохранение счёта в каждом плече: `delivered + errors == 64`
+(`Udp6InDatagrams` + `Udp6InErrors`), а счётчик самого сокета (`sk_drops`,
+последний столбец `/proc/net/udp6`) растёт ровно на ошибки этого плеча.
+
+### 2a. Читатель может только добавить — и не воспроизводимо
+
+| плечо (буфер 131072) | sA | sB | rep1 | rep2 |
+|---|---|---|---|---|
+| `q65536_lazy` | 39, 39 | 39, 39 | 39, 39 | 39, 39 |
+| `q65536_eag` | 39, **52** | 39, 39 | 39, 39 | **58**, **56** |
+
+Ленивое чтение дало одно и то же число во всех восьми попытках четырёх
+прогонов; жадное — от 39 до 58, никогда меньше бюджета. То есть **сколько
+достанется сокету, решает буфер; сколько успеет вычитать приложение, только
+добавляет сверху, и добавка не воспроизводима.**
+
+(Плечо `q_def_*` в этой сборке просит 212992 и получает 425984 — ядро
+удваивает; настоящий `rmem_default` = 212992 измерен в предыдущем поколении
+прибора (`sA`,`sB`), где плечи буфера не просили вовсе: там 64 × 512 были
+оставлены целиком.)
+
+---
+
+## 3. Свидетель, который был мёртв, и теперь их два
+
+Тап родителя на y1/y2 не показывал ничего два хода подряд. Причин оказалось
+**две**: глобалы начинались с fd 0, а `f586_taps()` открывает только
+отрицательный дескриптор (нашёл verify587), и — вторая — эти два тапа стоят
+на **выходящих** устройствах, где каждый кадр приходит с
+`sll_pkttype == PACKET_OUTGOING`, а `f585_tap_drain()` с `only_out == 0`
+выбрасывает ровно такие. Обе исправлены.
+
+Теперь в одном прогоне два независимых свидетеля записи: кадр на y1 (перед
+отправкой в D) и тот же кадр на y3 (у получателя). Плечо `t3_store_a`
+(3 × 512, `@th,8,4 = a0a1a2a3`):
+
+| свидетель | `flen` | `uh->len` | поле суммы | байты 62..66 кадра |
+|---|---|---|---|---|
+| NFLOG (у правила) | 1584 | 1544 | `fcc2` | `a0a1a2a3` (смещение 48) |
+| тап y1 (родитель, выход) | 1598 | 1544 | `fcc2` | `a0a1a2a3` |
+| тап y3 (D, приём) | 1598 | 1544 | `fcc2` | `a0a1a2a3` |
+
+Кадр на y1 **побайтово равен** кадру на y3 (сверены все 760 сохранённых
+байт), `hop` = 63 везде (маршрутизатор уменьшил 64 до хука FORWARD),
+`tp_status` = 9 (`USER|CSUMNOTREADY`) — флаг PARTIAL доехал до приёмника.
+
+Поле суммы в агрегате — не сумма, а **засев первой дейтаграммы**:
+`fcc2 = fold(псевдозаголовок(520))`; у агрегата из 1023-байтных
+дейтаграмм — `fec1 = fold(…(1031))`; у линейного — засев всей длины
+(`00c3` для 1544). Проверено на каждом кадре каждого плеча.
+
+---
+
+## 4. 65531: свидетель, который не может не обрезать
+
+Три плеча (`tu973`, `tu974`, `tu975`) дали в журнале длину сообщения 65531,
+хотя предсказанные 65533/65534/65535. Это не ядро и не прибор: **сообщение
+NFLOG физически не может быть длиннее 65531 байта** (атрибут netlink в u16).
+Там, где агрегат подходит к самому пределу, журнал показывает шапку и первую
+часть груза, а хвост не показывает вовсе. Это тот же класс, что F40 №2 и
+F50 №5 — свидетель, который врёт о своём размере, — но теперь он врёт не по
+моей вине, и обойти его нельзя: `lgplen` в этих трёх плечах означает «65531»,
+а не длину пакета. Верификатор так и считает: `min(40 + uh->len, 65531)`.
+
+---
+
+## 5. Предсказания
+
+`research/predictions_588.md` заморожен до первого запуска
+(`77544c8c…68ac1`). Четырнадцать предсказаний.
+
+| | |
+|---|---|
+| **сошлись целиком** | P1 (`ku1022_f` = 1 пакет), P2 (`ku1023_f` = 2), **P3** (`ku1023_u` = 1, `uh->len` 65480), P4 (`ku1024_u` = 2), **P5** (порог хвоста 990/991 и клетка `tf963` = слилась, что хоронит H = 62), **P6** (порог 975/976), P7 (форма всех cap-плеч одинакова в двух прогонах), P8 (ленивое число одинаково в двух попытках), P9 (буфер 2304 → ровно 1 и 63 ошибки), P10 (1 МБ → 64 и 0), P13 (тапы видят кадры, y1 == y3), P14 (поле суммы = засев первой дейтаграммы) |
+| **опровергнуто в одной клаузе** | **P11**: я ждал единую константу T на дейтаграмму; на деле первая дейтаграмма платит за весь агрегат (81920), остальные по 1280. Форма модели угадана, константа — нет |
+| **сузилось** | **P12**: «жадный читатель может дать другое число» подтвердилось (52, 58, 56 в трёх попытках из восьми), но в двух прогонах из четырёх он дал ровно бюджет. Верное утверждение — «никогда меньше бюджета, и добавка не воспроизводима» |
+
+---
+
+## 6. Ошибки хода, все мои
+
+1. **Длина хвоста ехала в одном байте.** В протоколе F65 `sl` лежит в `c[5]`,
+   поэтому все хвостовые плечи выше 255 отправляли `sl & 0xff` — 960
+   приходило как 192, 1024 как 0. Замечено по числу: `lgplen` давал
+   8 + 63·1023 + 192 вместо 960. Лечение: старшие биты в неиспользуемых
+   битах `c[2]`, восьмой патч сборки; в документе это измеренный факт, а не
+   предположение.
+2. **`rcvbuf = 0` значило «оставить что было»**, и плечи 14–16 в первом
+   поколении пронесли буфер предыдущего плеча (262144 вместо дефолта). Лечение:
+   каждое плечо называет буфер, а верификатор сверяет напечатанное `RBUF` с
+   тем, что вернул `getsockopt` в попытке.
+3. **`SO_RCVBUF` удваивается.** Я объявил 212992 «дефолтом», а получил 425984.
+   На этом сломалось первое поколение трёх проверочных плеч (все три дали 64 —
+   то есть ничего не проверяли); заменены на 49152/57344/73728.
+4. **Верификатор читал поля UDP-заголовка не с тех смещений** (`lgudp[2:4]`
+   вместо `[4:6]`) — 30 ложных провалов, пока не посмотрел на байты.
+5. **В верификаторе было два чека, которые не могли упасть** («placeholder» и
+   `or True`). Удалены: чек, который не может покраснеть, — это ложь.
+6. **`collect()` терял тапы родителя**: они печатаются **после** строки ARM, а
+   сборщик сбрасывал корзину по этой строке.
+7. **Модель поля суммы была уже, чем измерение**: я проверял «засев первой
+   дейтаграммы» только для однoпакетных плеч, и двухпакетные (63 + хвост)
+   падали; на деле правило проще — любой кадр длиннее одной дейтаграммы несёт
+   засев первой.
+8. **Смещение записи в кадре**: я написал 70 (14+40+8+8), верное — 62
+   (14+40+8), а в сообщении 48 (40+8). Измерено по байтам.
+
+---
+
+## 7. Чем проверено
+
+| | |
+|---|---|
+| `tools/verify588.py` | **6177 проверок, 0**. Провенанс: sha ядра из шапки и из файла, initrd из шапки и с диска, differ **извлечённый из initramfs** против `vm/build/differ588`. 16 якорей исходника (оба места слияния, `p->len += len`, `gso_features_check`, `GRO_LEGACY_MAX_SIZE`, `gso_max_size`, бюджет очереди и клауза «очередь пуста», `skb_condense`, `udp_rcv_segment`, `drop_count = gso_segs`). Таблица плеч **из `vm/differ588_add.c`** против пятнадцати печатных параметров каждого плеча. Модель байтового предела для обеих форм, модель бюджета очереди (s и A выводятся из журнала, три плеча проверяются на числах, которых вывод не видел), модель кадров на проводе, засев поля суммы на каждом кадре, `flen = 54 + uh->len`, `hop = 63`, `tp_status = 9`, сохранение `delivered + errors`, равенство `RBUF` обратному чтению, побайтовое равенство кадров y1 и y3, детерминизм между прогонами |
+| `tools/verify588_selftest.py` | **26/26** — 26 односоставных подмен в копии журнала краснят без traceback, `noop` зелёный |
+| `tools/f66_summary.py` | таблицы этого документа собраны из журнала, не набраны руками |
+| `tools/audit_f66_doc.py` | сверка чисел документа с `summary.json` и с исходником прибора |
+| коллекция | см. `RESEARCH_LOG.md` этого хода |
+| форма писем | см. `LETTER_STATUS.md` |
+
+---
+
+## 8. Что не измерено, прямо
+
+* **`skb_condense()`** (линеаризация выше половины буфера) в этих плечах
+  заметно не срабатывал: s = 1280 и A = 81920 постоянны для 512-байтных
+  дейтаграмм. Для 1200 байт измерено только одно плечо (s = 2304), и его
+  буфер был 425984, а не дефолтный.
+* **Почему жадный читатель даёт от 39 до 58** — не измерено; измерено только,
+  что он никогда не даёт меньше бюджета.
+* **Точное происхождение 65531** (размер сообщения netlink) — измерено число,
+  не механизм.
+* **Снятие GSO-битов в `gso_features_check()`** я читаю, а не измеряю: измерена
+  граница кадра 65535/65536, но не сам факт снятия битов.
+* IPv4-путь, TCP, туннели, настоящий NIC — не тронуты.
+* **Не уязвимость**: все правила ставил root в начальном user ns (F57).
+
+## 9. Файлы
+
+`vm/{differ588_add.c, differ588.c, build_f66_differ.sh, make_initramfs588.sh, build/differ588}`,
+`tools/{f66_run.sh, verify588.py, verify588_selftest.py, f66_summary.py, audit_f66_doc.py}`,
+`research/predictions_588.md`, `logs/f66_{rep1,rep2,sA,sB,preg1,preg2}.log`,
+`findings/F66-gro-budget/{SUMMARY.md, summary.json, VERIFY_REPORT.md, LETTER_SECTION_F66.txt}`.
+
+
+===== summary.json =====
+{
+ "eager_vs_lazy": {
+  "q65536_lazy": {
+   "sA": [
+    39,
+    39
+   ],
+   "sB": [
+    39,
+    39
+   ],
+   "rep1": [
+    39,
+    39
+   ],
+   "rep2": [
+    39,
+    39
+   ]
+  },
+  "q65536_eag": {
+   "sA": [
+    39,
+    52
+   ],
+   "sB": [
+    39,
+    39
+   ],
+   "rep1": [
+    39,
+    39
+   ],
+   "rep2": [
+    58,
+    56
+   ]
+  }
+ },
+ "turn": 588,
+ "finding": "F66-gro-budget",
+ "kernel": "7.3.4-T563",
+ "kernel_sha256": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+ "instrument": "vm/differ588_add.c (modes split: 20 arms, cap: 22 arms), 2 boots x 2 attempts + the previous generation sA/sB",
+ "predictions": "research/predictions_588.md",
+ "predictions_sha256": "77544c8c675fea07a17a888aee5736eae9e18fff8001d8a2352a20f7a3068ac1",
+ "headline": "The byte cap that ends UDP GRO counts a header on the fraglist path and not on the linear one (2H vs H, H = 48): 64 x 1023 reaches the chain as one packet linear and two fraglist, and the tail flips at 990/991 and 975/976. A third 65536 sits on the wire: a frame of 65535 leaves as one frame, 65536 as sixty-four segments. What a socket keeps of one aggregate is 1 + floor((rcvbuf - A)/s) with s = 1280 and A = 64*s charged to its first segment: predicted 13/26/52, measured 13/26/52.",
+ "answer_short": "12 of 14 predictions held; P11 refuted in one clause (T is not one constant: the first segment pays for the whole aggregate); P12 narrowed (an eager reader never keeps less and sometimes more, 39..58 over eight attempts).",
+ "verification": {
+  "verify588": "6177 checks, 0 failures",
+  "selftest": "26/26 single-clause mutations red",
+  "audit": "200 checks, 0 failures, 3/3 document mutations caught"
+ },
+ "known_defects": [
+  "the tail length rode in one byte: every tail above 255 was sent as (sl & 0xff) -- measured, then fixed",
+  "rcvbuf 0 meant 'leave what the previous arm set', so three arms inherited 262144 instead of the default",
+  "SO_RCVBUF doubles, so the arm named 212992 ran at 425984",
+  "two verifier checks could never fail and were removed",
+  "the verifier read the UDP length and checksum at the wrong offsets (30 false failures)",
+  "collect() dropped the parent's tap lines: they print after the ARM row"
+ ],
+ "split": [
+  {
+   "name": "q_def_lazy",
+   "n": 64,
+   "pl": 512,
+   "lazy": 40,
+   "rcvbuf_request": 212992,
+   "rcvbuf_eff": 425984,
+   "kept": [
+    64,
+    64
+   ],
+   "kept_rep2": [
+    64,
+    64
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "delivered": [
+    64,
+    64
+   ],
+   "shape": [
+    2,
+    1
+   ],
+   "queue_bytes": [
+    161280,
+    162560
+   ],
+   "socket_drops": [
+    0,
+    0
+   ]
+  },
+  {
+   "name": "q_def_eager",
+   "n": 64,
+   "pl": 512,
+   "lazy": 0,
+   "rcvbuf_request": 212992,
+   "rcvbuf_eff": 425984,
+   "kept": [
+    64,
+    64
+   ],
+   "kept_rep2": [
+    64,
+    64
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "delivered": [
+    64,
+    64
+   ],
+   "shape": [
+    1,
+    1
+   ]
+  },
+  {
+   "name": "q1024_lazy",
+   "n": 64,
+   "pl": 512,
+   "lazy": 40,
+   "rcvbuf_request": 1024,
+   "rcvbuf_eff": 2304,
+   "kept": [
+    1,
+    1
+   ],
+   "kept_rep2": [
+    1,
+    1
+   ],
+   "errors": [
+    63,
+    63
+   ],
+   "delivered": [
+    1,
+    1
+   ],
+   "shape": [
+    1,
+    1
+   ],
+   "queue_bytes": [
+    81920,
+    81920
+   ],
+   "socket_drops": [
+    63,
+    126
+   ]
+  },
+  {
+   "name": "q4096_lazy",
+   "n": 64,
+   "pl": 512,
+   "lazy": 40,
+   "rcvbuf_request": 4096,
+   "rcvbuf_eff": 8192,
+   "kept": [
+    1,
+    1
+   ],
+   "kept_rep2": [
+    1,
+    1
+   ],
+   "errors": [
+    63,
+    63
+   ],
+   "delivered": [
+    1,
+    1
+   ],
+   "shape": [
+    1,
+    1
+   ],
+   "queue_bytes": [
+    81920,
+    81920
+   ],
+   "socket_drops": [
+    189,
+    252
+   ]
+  },
+  {
+   "name": "q8192_lazy",
+   "n": 64,
+   "pl": 512,
+   "lazy": 40,
+   "rcvbuf_request": 8192,
+   "rcvbuf_eff": 16384,
+   "kept": [
+    1,
+    1
+   ],
+   "kept_rep2": [
+    1,
+    1
+   ],
+   "errors": [
+    63,
+    63
+   ],
+   "delivered": [
+    1,
+    1
+   ],
+   "shape": [
+    1,
+    1
+   ],
+   "queue_bytes": [
+    81920,
+    81920
+   ],
+   "socket_drops": [
+    315,
+    378
+   ]
+  },
+  {
+   "name": "q16384_lazy",
+   "n": 64,
+   "pl": 512,
+   "lazy": 40,
+   "rcvbuf_request": 16384,
+   "rcvbuf_eff": 32768,
+   "kept": [
+    1,
+    1
+   ],
+   "kept_rep2": [
+    1,
+    1
+   ],
+   "errors": [
+    63,
+    63
+   ],
+   "delivered": [
+    1,
+    1
+   ],
+   "shape": [
+    1,
+    1
+   ],
+   "queue_bytes": [
+    81920,
+    81920
+   ],
+   "socket_drops": [
+    441,
+    504
+   ]
+  },
+  {
+   "name": "q32768_lazy",
+   "n": 64,
+   "pl": 512,
+   "lazy": 40,
+   "rcvbuf_request": 32768,
+   "rcvbuf_eff": 65536,
+   "kept": [
+    1,
+    1
+   ],
+   "kept_rep2": [
+    1,
+    1
+   ],
+   "errors": [
+    63,
+    63
+   ],
+   "delivered": [
+    1,
+    1
+   ],
+   "shape": [
+    1,
+    1
+   ],
+   "queue_bytes": [
+    81920,
+    81920
+   ],
+   "socket_drops": [
+    567,
+    630
+   ]
+  },
+  {
+   "name": "q65536_lazy",
+   "n": 64,
+   "pl": 512,
+   "lazy": 40,
+   "rcvbuf_request": 65536,
+   "rcvbuf_eff": 131072,
+   "kept": [
+    39,
+    39
+   ],
+   "kept_rep2": [
+    39,
+    39
+   ],
+   "errors": [
+    25,
+    25
+   ],
+   "delivered": [
+    39,
+    39
+   ],
+   "shape": [
+    1,
+    1
+   ],
+   "queue_bytes": [
+    130560,
+    130560
+   ],
+   "socket_drops": [
+    655,
+    680
+   ]
+  },
+  {
+   "name": "q131072_lazy",
+   "n": 64,
+   "pl": 512,
+   "lazy": 40,
+   "rcvbuf_request": 131072,
+   "rcvbuf_eff": 262144,
+   "kept": [
+    64,
+    64
+   ],
+   "kept_rep2": [
+    64,
+    64
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "delivered": [
+    64,
+    64
+   ],
+   "shape": [
+    1,
+    1
+   ],
+   "queue_bytes": [
+    162560,
+    162560
+   ],
+   "socket_drops": [
+    680,
+    680
+   ]
+  },
+  {
+   "name": "q262144_lazy",
+   "n": 64,
+   "pl": 512,
+   "lazy": 40,
+   "rcvbuf_request": 262144,
+   "rcvbuf_eff": 524288,
+   "kept": [
+    64,
+    64
+   ],
+   "kept_rep2": [
+    64,
+    64
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "delivered": [
+    64,
+    64
+   ],
+   "shape": [
+    1,
+    1
+   ],
+   "queue_bytes": [
+    162560,
+    162560
+   ],
+   "socket_drops": [
+    680,
+    680
+   ]
+  },
+  {
+   "name": "q1048576_lazy",
+   "n": 64,
+   "pl": 512,
+   "lazy": 40,
+   "rcvbuf_request": 1048576,
+   "rcvbuf_eff": 2097152,
+   "kept": [
+    64,
+    64
+   ],
+   "kept_rep2": [
+    64,
+    64
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "delivered": [
+    64,
+    64
+   ],
+   "shape": [
+    1,
+    1
+   ],
+   "queue_bytes": [
+    162560,
+    162560
+   ],
+   "socket_drops": [
+    680,
+    680
+   ]
+  },
+  {
+   "name": "q1048576_eag",
+   "n": 64,
+   "pl": 512,
+   "lazy": 0,
+   "rcvbuf_request": 1048576,
+   "rcvbuf_eff": 2097152,
+   "kept": [
+    64,
+    64
+   ],
+   "kept_rep2": [
+    64,
+    64
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "delivered": [
+    64,
+    64
+   ],
+   "shape": [
+    2,
+    1
+   ]
+  },
+  {
+   "name": "q65536_eag",
+   "n": 64,
+   "pl": 512,
+   "lazy": 0,
+   "rcvbuf_request": 65536,
+   "rcvbuf_eff": 131072,
+   "kept": [
+    39,
+    39
+   ],
+   "kept_rep2": [
+    58,
+    56
+   ],
+   "errors": [
+    25,
+    25
+   ],
+   "delivered": [
+    39,
+    39
+   ],
+   "shape": [
+    1,
+    1
+   ]
+  },
+  {
+   "name": "q131072_eag",
+   "n": 64,
+   "pl": 512,
+   "lazy": 0,
+   "rcvbuf_request": 131072,
+   "rcvbuf_eff": 262144,
+   "kept": [
+    64,
+    64
+   ],
+   "kept_rep2": [
+    64,
+    64
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "delivered": [
+    64,
+    64
+   ],
+   "shape": [
+    1,
+    1
+   ]
+  },
+  {
+   "name": "q54x1200_lazy",
+   "n": 54,
+   "pl": 1200,
+   "lazy": 40,
+   "rcvbuf_request": 212992,
+   "rcvbuf_eff": 425984,
+   "kept": [
+    54,
+    54
+   ],
+   "kept_rep2": [
+    54,
+    54
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "delivered": [
+    54,
+    54
+   ],
+   "shape": [
+    1,
+    1
+   ],
+   "queue_bytes": [
+    246528,
+    246528
+   ],
+   "socket_drops": [
+    730,
+    730
+   ]
+  },
+  {
+   "name": "q54x1200_eag",
+   "n": 54,
+   "pl": 1200,
+   "lazy": 0,
+   "rcvbuf_request": 212992,
+   "rcvbuf_eff": 425984,
+   "kept": [
+    54,
+    54
+   ],
+   "kept_rep2": [
+    54,
+    54
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "delivered": [
+    54,
+    54
+   ],
+   "shape": [
+    1,
+    1
+   ]
+  },
+  {
+   "name": "q49152_lazy",
+   "n": 64,
+   "pl": 512,
+   "lazy": 40,
+   "rcvbuf_request": 49152,
+   "rcvbuf_eff": 98304,
+   "kept": [
+    13,
+    13
+   ],
+   "kept_rep2": [
+    13,
+    13
+   ],
+   "errors": [
+    51,
+    51
+   ],
+   "delivered": [
+    13,
+    13
+   ],
+   "shape": [
+    1,
+    1
+   ],
+   "queue_bytes": [
+    97280,
+    97280
+   ],
+   "socket_drops": [
+    781,
+    832
+   ]
+  },
+  {
+   "name": "q57344_lazy",
+   "n": 64,
+   "pl": 512,
+   "lazy": 40,
+   "rcvbuf_request": 57344,
+   "rcvbuf_eff": 114688,
+   "kept": [
+    26,
+    26
+   ],
+   "kept_rep2": [
+    26,
+    26
+   ],
+   "errors": [
+    38,
+    38
+   ],
+   "delivered": [
+    26,
+    26
+   ],
+   "shape": [
+    1,
+    1
+   ],
+   "queue_bytes": [
+    113920,
+    113920
+   ],
+   "socket_drops": [
+    870,
+    908
+   ]
+  },
+  {
+   "name": "q73728_lazy",
+   "n": 64,
+   "pl": 512,
+   "lazy": 40,
+   "rcvbuf_request": 73728,
+   "rcvbuf_eff": 147456,
+   "kept": [
+    52,
+    52
+   ],
+   "kept_rep2": [
+    52,
+    52
+   ],
+   "errors": [
+    12,
+    12
+   ],
+   "delivered": [
+    52,
+    52
+   ],
+   "shape": [
+    1,
+    1
+   ],
+   "queue_bytes": [
+    147200,
+    147200
+   ],
+   "socket_drops": [
+    920,
+    932
+   ]
+  },
+  {
+   "name": "t3_store_a",
+   "n": 3,
+   "pl": 512,
+   "lazy": 0,
+   "rcvbuf_request": 0,
+   "rcvbuf_eff": 147456,
+   "kept": [
+    3,
+    3
+   ],
+   "kept_rep2": [
+    3,
+    3
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "delivered": [
+    3,
+    3
+   ],
+   "shape": [
+    1,
+    1
+   ]
+  }
+ ],
+ "cap": [
+  {
+   "name": "ku1022_f",
+   "shape": "f",
+   "n": 64,
+   "pl": 1022,
+   "tail": null,
+   "packets": 1,
+   "counter": 1,
+   "first_len": 65456,
+   "second_len": -1,
+   "ip6_len": 65416,
+   "frames_y1": 1,
+   "frames_rep2": 1,
+   "same_in_rep2": true
+  },
+  {
+   "name": "ku1023_f",
+   "shape": "f",
+   "n": 64,
+   "pl": 1023,
+   "tail": null,
+   "packets": 2,
+   "counter": 2,
+   "first_len": 64497,
+   "second_len": 1071,
+   "ip6_len": 64457,
+   "frames_y1": 2,
+   "frames_rep2": 2,
+   "same_in_rep2": true
+  },
+  {
+   "name": "ku1023_u",
+   "shape": "u",
+   "n": 64,
+   "pl": 1023,
+   "tail": null,
+   "packets": 1,
+   "counter": 1,
+   "first_len": 65520,
+   "second_len": -1,
+   "ip6_len": 65480,
+   "frames_y1": 1,
+   "frames_rep2": 1,
+   "same_in_rep2": true
+  },
+  {
+   "name": "ku1024_u",
+   "shape": "u",
+   "n": 64,
+   "pl": 1024,
+   "tail": null,
+   "packets": 2,
+   "counter": 2,
+   "first_len": 64560,
+   "second_len": 1072,
+   "ip6_len": 64520,
+   "frames_y1": 2,
+   "frames_rep2": 2,
+   "same_in_rep2": true
+  },
+  {
+   "name": "tf960",
+   "shape": "f",
+   "n": 64,
+   "pl": 1023,
+   "tail": 960,
+   "packets": 1,
+   "counter": 1,
+   "first_len": 65457,
+   "second_len": -1,
+   "ip6_len": 65417,
+   "frames_y1": 1,
+   "frames_rep2": 1,
+   "same_in_rep2": true
+  },
+  {
+   "name": "tf962",
+   "shape": "f",
+   "n": 64,
+   "pl": 1023,
+   "tail": 962,
+   "packets": 1,
+   "counter": 1,
+   "first_len": 65459,
+   "second_len": -1,
+   "ip6_len": 65419,
+   "frames_y1": 1,
+   "frames_rep2": 1,
+   "same_in_rep2": true
+  },
+  {
+   "name": "tf963",
+   "shape": "f",
+   "n": 64,
+   "pl": 1023,
+   "tail": 963,
+   "packets": 1,
+   "counter": 1,
+   "first_len": 65460,
+   "second_len": -1,
+   "ip6_len": 65420,
+   "frames_y1": 1,
+   "frames_rep2": 1,
+   "same_in_rep2": true
+  },
+  {
+   "name": "tf965",
+   "shape": "f",
+   "n": 64,
+   "pl": 1023,
+   "tail": 965,
+   "packets": 1,
+   "counter": 1,
+   "first_len": 65462,
+   "second_len": -1,
+   "ip6_len": 65422,
+   "frames_y1": 1,
+   "frames_rep2": 1,
+   "same_in_rep2": true
+  },
+  {
+   "name": "tf980",
+   "shape": "f",
+   "n": 64,
+   "pl": 1023,
+   "tail": 980,
+   "packets": 1,
+   "counter": 1,
+   "first_len": 65477,
+   "second_len": -1,
+   "ip6_len": 65437,
+   "frames_y1": 1,
+   "frames_rep2": 1,
+   "same_in_rep2": true
+  },
+  {
+   "name": "tf988",
+   "shape": "f",
+   "n": 64,
+   "pl": 1023,
+   "tail": 988,
+   "packets": 1,
+   "counter": 1,
+   "first_len": 65485,
+   "second_len": -1,
+   "ip6_len": 65445,
+   "frames_y1": 1,
+   "frames_rep2": 1,
+   "same_in_rep2": true
+  },
+  {
+   "name": "tf989",
+   "shape": "f",
+   "n": 64,
+   "pl": 1023,
+   "tail": 989,
+   "packets": 1,
+   "counter": 1,
+   "first_len": 65486,
+   "second_len": -1,
+   "ip6_len": 65446,
+   "frames_y1": 1,
+   "frames_rep2": 1,
+   "same_in_rep2": true
+  },
+  {
+   "name": "tf990",
+   "shape": "f",
+   "n": 64,
+   "pl": 1023,
+   "tail": 990,
+   "packets": 1,
+   "counter": 1,
+   "first_len": 65487,
+   "second_len": -1,
+   "ip6_len": 65447,
+   "frames_y1": 1,
+   "frames_rep2": 1,
+   "same_in_rep2": true
+  },
+  {
+   "name": "tf991",
+   "shape": "f",
+   "n": 64,
+   "pl": 1023,
+   "tail": 991,
+   "packets": 2,
+   "counter": 2,
+   "first_len": 64497,
+   "second_len": 1039,
+   "ip6_len": 64457,
+   "frames_y1": 2,
+   "frames_rep2": 2,
+   "same_in_rep2": true
+  },
+  {
+   "name": "tu960",
+   "shape": "u",
+   "n": 64,
+   "pl": 1024,
+   "tail": 960,
+   "packets": 1,
+   "counter": 1,
+   "first_len": 65520,
+   "second_len": -1,
+   "ip6_len": 65480,
+   "frames_y1": 1,
+   "frames_rep2": 1,
+   "same_in_rep2": true
+  },
+  {
+   "name": "tu961",
+   "shape": "u",
+   "n": 64,
+   "pl": 1024,
+   "tail": 961,
+   "packets": 1,
+   "counter": 1,
+   "first_len": 65521,
+   "second_len": -1,
+   "ip6_len": 65481,
+   "frames_y1": 1,
+   "frames_rep2": 1,
+   "same_in_rep2": true
+  },
+  {
+   "name": "tu962",
+   "shape": "u",
+   "n": 64,
+   "pl": 1024,
+   "tail": 962,
+   "packets": 1,
+   "counter": 1,
+   "first_len": 65522,
+   "second_len": -1,
+   "ip6_len": 65482,
+   "frames_y1": 64,
+   "frames_rep2": 64,
+   "same_in_rep2": true
+  },
+  {
+   "name": "tu970",
+   "shape": "u",
+   "n": 64,
+   "pl": 1024,
+   "tail": 970,
+   "packets": 1,
+   "counter": 1,
+   "first_len": 65530,
+   "second_len": -1,
+   "ip6_len": 65490,
+   "frames_y1": 64,
+   "frames_rep2": 64,
+   "same_in_rep2": true
+  },
+  {
+   "name": "tu973",
+   "shape": "u",
+   "n": 64,
+   "pl": 1024,
+   "tail": 973,
+   "packets": 1,
+   "counter": 1,
+   "first_len": 65531,
+   "second_len": -1,
+   "ip6_len": 65493,
+   "frames_y1": 64,
+   "frames_rep2": 64,
+   "same_in_rep2": true
+  },
+  {
+   "name": "tu974",
+   "shape": "u",
+   "n": 64,
+   "pl": 1024,
+   "tail": 974,
+   "packets": 1,
+   "counter": 1,
+   "first_len": 65531,
+   "second_len": -1,
+   "ip6_len": 65494,
+   "frames_y1": 64,
+   "frames_rep2": 64,
+   "same_in_rep2": true
+  },
+  {
+   "name": "tu975",
+   "shape": "u",
+   "n": 64,
+   "pl": 1024,
+   "tail": 975,
+   "packets": 1,
+   "counter": 1,
+   "first_len": 65531,
+   "second_len": -1,
+   "ip6_len": 65495,
+   "frames_y1": 64,
+   "frames_rep2": 64,
+   "same_in_rep2": true
+  },
+  {
+   "name": "tu976",
+   "shape": "u",
+   "n": 64,
+   "pl": 1024,
+   "tail": 976,
+   "packets": 2,
+   "counter": 2,
+   "first_len": 64560,
+   "second_len": 1024,
+   "ip6_len": 64520,
+   "frames_y1": 2,
+   "frames_rep2": 2,
+   "same_in_rep2": true
+  },
+  {
+   "name": "tu980",
+   "shape": "u",
+   "n": 64,
+   "pl": 1024,
+   "tail": 980,
+   "packets": 2,
+   "counter": 2,
+   "first_len": 64560,
+   "second_len": 1028,
+   "ip6_len": 64520,
+   "frames_y1": 2,
+   "frames_rep2": 2,
+   "same_in_rep2": true
+  }
+ ],
+ "derived": {
+  "per_datagram_truesize_512": 1280,
+  "aggregate_truesize_64x512": 81920,
+  "nfmsg_max": 65531,
+  "gro_cap": 65536,
+  "gso_cap": 65536,
+  "header_H": 48
+ }
+}

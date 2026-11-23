@@ -1,0 +1,456 @@
+===== LETTER_SECTION_F57.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload: a static transport-store check is enforced at runtime,
+ and 14 nft spellings die silently (`tcp flags set` regressed in v7.3)
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+References: <the same Message-Id>
+
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+Theme: which of these effects need an administrator, and which are decided by
+bytes that arrive with the traffic.  The answer is a pair of gates one line
+each, and an asymmetry between reading a packet and writing to it.
+
+No new claim about a defect is made here.  What is new is the boundary itself,
+measured on 7.3.4 over two boots, 19 traffic arms and four credential contexts.
+
+1. Two gates, and they are not the same gate.
+
+   net/netfilter/nfnetlink.c:659
+       if (!netlink_net_capable(skb, CAP_NET_ADMIN))   -> -EPERM
+   is CAP_NET_ADMIN in the user namespace that owns the netns: an unprivileged
+   user who unshares CLONE_NEWUSER|CLONE_NEWNET passes it.
+
+   net/netfilter/nft_payload.c:1207 (nft_payload_set_init, the store only)
+       if (ctx->net->user_ns != &init_user_ns)
+               return -EPERM;
+   is stricter: a store into a packet needs a netns owned by the initial user
+   namespace.  nft_payload_init (the read) and nft_meta_set_init have no such
+   check.
+
+   Measured, same four expressions in each context:
+
+     root in the initial netns        table 0  chain 0  read 0  store 0  meta 0
+     uid 1000 in the initial netns    -1       -1       -1      -1       -1
+     uid 1000 in its own userns+netns  0        0        0      -1        0
+
+   In the third row the same process fully owns the namespace, creates the
+   table and the chain, installs a working `@ll,12,2 = 86dd` read + drop rule
+   (counter 1, datagram never arrives) -- and is refused at the store with
+   -EPERM.  The one modifying expression available to it is meta set, i.e.
+   skb->priority / mark / pkttype.
+
+   Corollary for the record: the WARN in vlan_do_receive that F54 reached by
+   storing into skb->vlan_proto is not reachable from a non-init user
+   namespace, because the store cannot be installed there at all.
+
+2. A chain naming a device of another namespace is created WITHOUT an error,
+   and never fires.  nft_netdev_hook_alloc() walks for_each_netdev(net, dev) of
+   its own namespace and returns an empty hook list when nothing matches.  Both
+   root hooking `nosuchdev` and a namespace owner hooking `x1` get rc 0.  The
+   boundary is therefore enumeration, not an errno: with a drop rule in that
+   chain the counter stays 0 and the datagram is delivered inside the
+   namespace, while the same rule on the namespace's own device counts 1 and
+   delivers nothing.  Moving a port across the border (x0 into the child's
+   netns, rc 0) moves no authority either.
+
+3. What a sender without any capability in this namespace decides is the
+   MEANING of an offset, not the rule.  Rules below are root's; the frames come
+   from a process with no capability in the initial namespace.
+
+     rule (root, netdev ingress)             frame                    counter  delivered
+     @ll,12,2 = 8100 -> drop                 802.1Q vid 100               1        0
+     @ll,12,2 = 86dd -> drop                 802.1Q vid 100 (inner 86dd)  0        1
+     @ll,12,2 = 86dd -> drop                 untagged IPv6                1        0
+     @ll,16,2 = 0000 -> drop                 untagged, flow label 0       1        0
+     @ll,16,2 = 86dd -> drop                 untagged, flow label 0x86dd  1        0
+     @ll,16,2 = 86dd -> drop                 802.1Q vid 100               1        0
+
+   The second row is the one to read twice: the same rule that drops untagged
+   IPv6 lets a tagged IPv6 frame through to the socket, because the tag moves
+   every @ll offset by four and the sender chooses whether to put one on the
+   wire.  (The tagged frame has a destiny only because the receiving netns has
+   a VID-100 device; without one it dies as PACKET_OTHERHOST before any IPv6
+   counter, as reported earlier.)  The fifth row is the same collision one
+   field further in: bytes 16..17 are the flow label on an untagged frame and
+   the inner ethertype on a tagged one.
+
+     rule (root, ip6 prerouting)             frame                   counter  delivered
+     @nh,6,1 = 17 -> drop                    plain UDP                    1        0
+     @nh,6,1 = 17 -> drop                    UDP behind hop-by-hop        0        1
+     @nh,6,1 = 17 -> drop                    UDP behind a fragment hdr    0        1
+     @nh,6,1 = 0  -> drop                    UDP behind hop-by-hop        1        0
+     meta l4proto 17 -> drop                 plain UDP                    1        0
+     meta l4proto 17 -> drop                 UDP behind hop-by-hop        1        0
+
+   The fourth row is the control that makes the second and third real misses
+   rather than refusals, and the last two show the walker is not evaded by the
+   same frame.  This is the ordinary answer to "is this a vulnerability": no --
+   the kernel gives a correct spelling for the same intent.
+
+4. The bounds, at their exact edges, which is where a 0-day would have to be.
+   Reads: @ll,78,2 on an 80-byte frame is in bounds; @ll,79,2 is not, and the
+   failure refuses the RULE (NFT_BREAK, counter 0) while the datagram is still
+   delivered.  Writes on the netdev ingress door are bounded by nothing:
+
+       static bool nft_ll_write_ok(const struct nft_pktinfo *pkt, int offset)
+       {
+               if (nft_in_ingress(pkt->state))
+                       return true;
+               return offset <= skb_network_offset(pkt->skb);
+       }
+
+   @ll,13,2 is accepted although 13+2 > 14, and @ll,20,2 lands in the IPv6
+   header (next header 0x20) so the datagram dies with Ip6InUnknownProtos +1.
+   That door is the one gate 2 protects, which is why this is a property and not
+   a hole.
+
+Measured with 902 independent checks over two boots (every arm's counter, sent
+length, delivery, datagram length and six snmp6 deltas, each derived from the
+frame's bytes and from the door the rule sits on; determinism between the boots
+on every arm field; the census of four contexts against the two gates; the
+frames rebuilt in Python including the UDPv6 checksum and compared with what the
+child printed as it put them on the wire).  Two of my three written predictions
+did not survive (a foreign device name is not an error; the ingest write bound is
+not mac_len) and are recorded as refuted in the finding.
+
+One correction to my own earlier text: F54's WARN is administrator-only, exactly
+because of gate 2, and I had carried it as potentially unprivileged-reachable.
+
+
+===== SUMMARY.md =====
+# F57 — the privilege boundary: what needs an administrator, what comes in with the traffic
+
+Turn 579. Kernel `7.3.4-T563` (`1efbc957…2033`), no new build. Instrument
+`differ579`, mode `priv`: **19 traffic arms × 2 boots**, plus a census of the
+same four expressions in four credential contexts. The two boots agree on
+every arm field (`ch`, `rc`, `snd`, `u6n`, `u6len` and six snmp6 deltas of all
+19 arms).
+
+The question is not about a door any more. F42–F56 measured what a rule can do
+to a frame; this turn measures **who is allowed to write such a rule, and
+whose bytes decide what the rule sees**.
+
+## 1. The two gates are one line each, and they are not the same gate
+
+```
+net/netfilter/nfnetlink.c:659
+        if (!netlink_net_capable(skb, CAP_NET_ADMIN)) { ... -EPERM }
+        -> CAP_NET_ADMIN in the user namespace that OWNS the netns
+
+net/netfilter/nft_payload.c:1207   (nft_payload_set_init, the STORE only)
+        if (ctx->net->user_ns != &init_user_ns)
+                return -EPERM;
+        -> the netns must belong to the INITIAL user namespace
+```
+
+The read path (`nft_payload_init`) and `nft_meta_set_init` have no second
+gate. The census runs the same four expressions in each context:
+
+| context | table | chain | read `@ll` | **store `@ll`** | `meta priority set` |
+|---|---|---|---|---|---|
+| root, initial netns | 0 | 0 | 0 | **0** | 0 |
+| uid 1000, initial netns, no caps | -1 | -1 | -1 | **-1** | -1 |
+| uid 1000 → userns+netns, uid 0 inside | 0 | 0 | 0 | **-1** | 0 |
+| the same, device name from another netns | 0 (chain) | — | — | — | — |
+
+Everything F42–F56 did to a packet is a **store**, so all of it sits behind
+the second gate: an unprivileged user who owns a user+net namespace has
+CAP_NET_ADMIN there, passes the first gate, creates the table and the chain —
+and is refused at `@ll` with `-EPERM` while the very same context is allowed to
+install a working `@ll` **read** and drop rule:
+
+| expression | in the userns | witness |
+|---|---|---|
+| read `@ll,12,2 = 86dd` + drop | accepted | the rule counts its own frame (`fx_ch=1`) and the datagram arrives 0 times |
+| store `@ll,12,2 = 2066` | **-EPERM** | `st=-1` |
+| `meta priority set 5` | accepted | `meta=0` |
+| chain hooked on `x1`, a device of the initial netns | **accepted, and dead** | see §2 |
+
+The one *modifying* effect available below initial-ns root is `meta set`
+(`skb->priority`, `mark`, `pkttype`) — and by F55 that is exactly the channel
+that reaches the wire as PCP through the egress QoS map. Inside its own
+namespace an unprivileged user can therefore change the PCP of its own
+traffic, and nothing else.
+
+## 2. A chain naming another namespace's device is created without an error — and never fires
+
+`nft_netdev_hook_alloc()` (`nf_tables_api.c`) walks `for_each_netdev(net, dev)`
+of **this** namespace, adds an op for each match, and returns the hook — with
+an **empty ops list** if nothing matched. No match is not an error.
+
+So the first form of this question — "what errno do you get for a device you do
+not own?" — measured nothing: root hooking `nosuchdev` gets 0, and the userns
+owner hooking `x1` gets 0. The question was answered only when the *fate* was
+measured:
+
+| arm | chain | counter of the drop rule | the namespace's own socket |
+|---|---|---|---|
+| rule on its own device `w1` | live | **1** | **0** datagrams |
+| the same rule on `x1` (another netns) | created, rc 0 | **0** | **1** datagram, `Ip6InDelivers +1` |
+
+The border is enforced by enumeration, not by an error code. Moving the far end
+of the wire into the child's netns (`x0`, `MOVE rc=0`, `here=-1`) does not move
+the border either: the child may rule on what is now its own port, and on
+nothing else.
+
+## 3. What an unprivileged sender decides: one offset, two meanings
+
+The receiving netns has a VLAN device (`x1.100`, vid 100) so that a tagged
+frame has a destiny at all; without one it dies as `PACKET_OTHERHOST` (F52 §1)
+and a rule that misses it cannot be shown to matter. Rules below are installed
+by **root**; the frames come from the child of §1, which holds no capability in
+this namespace.
+
+| rule (root) | frame | counter | datagrams delivered |
+|---|---|---|---|
+| `@ll,12,2 = 8100` → drop | 802.1Q vid 100 | **1** | **0** |
+| `@ll,12,2 = 86dd` → drop | 802.1Q vid 100 (inner `86dd`) | **0** | **1** |
+| `@ll,12,2 = 86dd` → drop | untagged IPv6 | 1 | 0 |
+
+A rule meant to drop IPv6 at the ethernet door drops the untagged frame and
+**lets the tagged one through to the socket**, because the tag moves every
+`@ll` offset by four and the sender chooses whether to put a tag on the wire.
+The rule is the same rule; the meaning of "offset 12" is the sender's choice.
+
+The same collision one field further in:
+
+| rule (root) | frame | counter | why |
+|---|---|---|---|
+| `@ll,16,2 = 0000` → drop | untagged, flow label 0 | 1 | 16..17 **is** the flow label |
+| `@ll,16,2 = 86dd` → drop | untagged, flow label `0x86dd` | **1** | the sender put `86dd` where a tagged frame keeps its inner ethertype |
+| `@ll,16,2 = 86dd` → drop | tagged, inner `86dd` | 1 | the intended case |
+
+Two meanings live at one offset, and the party with no privilege picks which
+one a privileged rule reads.
+
+## 4. `@nh,6,1` is the sender's chain, not the packet's protocol
+
+| rule (root, ip6 prerouting) | frame | counter | delivered |
+|---|---|---|---|
+| `@nh,6,1 = 17` → drop | plain UDP | **1** | 0 |
+| the same rule | UDP behind hop-by-hop | **0** | **1** |
+| the same rule | UDP behind a fragment header | **0** | **1** |
+| `@nh,6,1 = 0` → drop | UDP behind hop-by-hop | 1 | 0 |
+| `meta l4proto 17` → drop | plain UDP | 1 | 0 |
+| `meta l4proto 17` → drop | UDP behind hop-by-hop | **1** | 0 |
+
+The fourth line is the control: the read *does* see `0`, so the two misses
+above are misses and not refusals. The last two lines are the same intent
+written with the walker, and the walker is not evaded by the same frame. The
+delta between the third and the sixth line is the whole of "what an ordinary
+sender controls": not the rule, but the header chain the rule's offset lands
+in.
+
+## 5. The bounds, at their exact edges — the part that decides whether this is a 0-day
+
+| arm | expression | counter | fate |
+|---|---|---|---|
+| `x_r78` | read `@ll,78,2` (the last two bytes of the 80-byte frame) | 1 | delivered |
+| `x_r79` | read `@ll,79,2` (one byte past the frame) | **0** | **delivered** |
+| `w_l12` | store `@ll,12,2` (`12+2 = 14` = the ethernet header) | 1 | delivered |
+| `w_l13` | store `@ll,13,2` (`13+2 = 15 > 14`) | **1** | delivered |
+| `w_l20` | store `@ll,20,2` (inside the IPv6 header) | **1** | **dead: `Ip6InUnknownProtos +1`** |
+
+Reads are bounded exactly (`skb_copy_bits` against the frame) and an
+out-of-bounds read **refuses the rule, not the packet** — `NFT_BREAK`, the
+counter stays 0, the datagram is delivered.
+
+Writes on the netdev ingress door are bounded by nothing:
+
+```c
+static bool nft_ll_write_ok(const struct nft_pktinfo *pkt, int offset)
+{
+        if (nft_in_ingress(pkt->state))
+                return true;
+        return offset <= skb_network_offset(pkt->skb);
+}
+```
+
+`w_l13` is the arm that matters: a `mac_len` bound would have refused it (F53
+§3 measured exactly that bound at layer-3 doors) and it was accepted; `w_l20`
+shows the store landing six bytes past the ethernet header and changing the
+IPv6 next-header to `0x20`, which kills the datagram as an unknown protocol.
+So: **the ingest door has no write bound, and that door is the one the second
+gate protects.** The two facts are what keeps this a documented property
+instead of a vulnerability.
+
+## 6. Would we know if there were a 0-day here?
+
+Four gates stand between "a party with no privilege" and "memory it does not
+own", and all four are now measured rather than assumed:
+
+1. **capability** — `netlink_net_capable(CAP_NET_ADMIN)` on the netns's own
+   user namespace: a uid-1000 process in the initial namespace is refused at
+   every expression, measured `-1` five times.
+2. **namespace ownership** — `ctx->net->user_ns != &init_user_ns` refuses
+   every store into a packet; measured `-1` in a namespace the same process
+   fully owns. **This falsifies the one 0-day-shaped hypothesis I had carried
+   since F54**: the `WARN(1, "invalid VLAN protocol")` reachable by a store
+   into `skb->vlan_proto` is *not* reachable from a non-init user namespace,
+   because that store cannot be installed there at all.
+3. **the device** — a rule can only see frames delivered to its own netns;
+   the enumeration makes a foreign device a dead chain rather than an error
+   (§2), and moving a port across the border moves no authority.
+4. **memory-safety** — the only place where a rule and a buffer meet without a
+   bound is the ingest write guard (§5), and it is behind gate 2.
+
+What an unprivileged party *does* get is the fourth thing, and it is not
+memory: **the meaning of an offset is not in the rule**. Every read whose byte
+depends on state the sender chooses — the four tag bytes (§3), the header
+chain in front of `@nh` (§4) — lets an outside party steer a privileged
+filter. That is a filter-integrity property, the kind that turns into a CVE
+only when a product ships the filter; it is not a kernel memory bug, and this
+instrument found none.
+
+What is *not* measured, and would be needed before any 0-day claim:
+a fuzzer around the ingest write guard (the guard is `true`, so the only
+remaining limit is `skb_store_bits` and the skb's own headroom/frags); the
+`@th` store bound (`nft_th_write_ok`), which F44 measured on layer-3 doors
+only; `nft_payload_set_vlan()`'s bounds when the tag is a word; and the whole
+`inet`-family ingress path. None of them is reachable below initial-ns root,
+which is why they are debts and not alarms.
+
+## 7. Predictions: 3 written down before the final run, 2 refuted
+
+| # | prediction | outcome |
+|---|---|---|
+| P1 | the store `@ll,12,2` is refused in a userns-owned netns while the read is accepted | **held** (`st=-1`, `rd=0`, `fx_ch=1`) |
+| P2 | a chain naming another namespace's device is refused (`-ENODEV`) | **refuted**: `rc=0`, and the chain never fires (`fx2_u6=1`) |
+| P3 | the `@ll` write bound on the netdev ingress door is `mac_len` | **refuted**: `@ll,13,2` accepted (`13+2 > 14`), `@ll,20,2` reaches the IPv6 header |
+
+## 8. Errors of the turn, all mine
+
+1. **The census frame was addressed to the parent's address** (`fd02::91`)
+   instead of the child's own (`fd02::99`), so the "does the rule work end to
+   end" arm measured `Ip6InAddrErrors` and looked like a namespace boundary.
+   Fixed by a settable destination; the boundary it faked was never real.
+2. I killed the smoke run's `timeout` wrapper and left its **qemu running for
+   20 minutes** (the log kept growing while I read it) — the sixth occurrence
+   of this family (F47 №6, F570 №6, F574 №1, F575 №6, F576 №5). Stopped by
+   PID, never by `pkill -f`.
+3. The census `fx2` arm was **confounded by my own earlier rule**: chain `c0`
+   still held the drop rule and sat on the same hook, so the frame died before
+   the foreign chain could be observed. Flushed first; then the fate answered.
+4. `f579_if6()` printed the flags with `%s` on a `char[16]` filled by `%x`,
+   which produced binary garbage instead of `80` — the flags were the one
+   thing that arm existed to read.
+5. `unshare(CLONE_NEWUSER)` + writing `/proc/self/uid_map` from inside returns
+   **-EACCES** (the proc inode belongs to the initial namespace): the map has
+   to be written by the parent. Measured, then moved to the parent.
+6. The child's own `Ip6InReceives` counts its own MLD reports (both ends of
+   the veth live in that netns): a per-netns counter is not a witness for a
+   single frame — 1 in one boot, 2 in the other. Recorded, not forced.
+
+## 9. What is verified
+
+| | |
+|---|---|
+| `tools/verify579.py` | **902 checks, 0 bad** — provenance (kernel sha from each boot header, initrd from the header and from the file, differ **extracted from the initramfs** and compared byte for byte with the built binary), 13 source anchors, all five frames rebuilt in Python including the UDPv6 checksum and compared with the parent's and the child's copies, the census of four contexts against the two gates, and **every arm of both boots**: counter, sent length, delivery, datagram length and six snmp6 deltas, each derived from the frame bytes and from the door the rule sits on; determinism between the boots on every arm field |
+| `tools/verify579_selftest.sh` | **25/25** — baseline green, 21 single-field mutations red without a traceback, `noop` green, a missing log is a clean red |
+| collection | see `findings/COLLECTION.md` |
+| regression | verify578 9411, verify577 2756, verify576 768, verify575 3696, verify574 2666, verify573 3186, verify572 5629, verify571 5974, verify570 753, verify569 3810 — all 0 |
+
+## 10. Not measured, plainly
+
+- a real remote sender: the "wire" here is a veth whose far end is in a
+  namespace the sender owns — the local analogue of "not this machine"; a
+  sender with no capability at all cannot open `AF_PACKET`, so a *crafted*
+  header chain needs CAP_NET_RAW either as root or inside a namespace it owns;
+- the userns test used a device *created inside* the namespace and one moved
+  into it; no test of a device that is a VLAN port, a bridge port or a macvlan
+  of another namespace;
+- `NETLINK_NETFILTER` from a namespace whose owner is not uid 0 inside;
+- the `@th`/`@nh` store bounds and `nft_payload_set_vlan()`'s bounds;
+- `panic_on_warn`: F54's `WARN` is admin-only by gate 2, so it is not a
+  DoS path from below, but that conclusion is a *measurement of the gate*, not
+  a test of the splat under pressure.
+
+**Not a vulnerability**: every rule in this instrument was installed by root in
+the initial user namespace, or by a user in a namespace it owns; the effects
+that cross a privilege line are filter semantics, not memory.
+
+
+===== summary.json =====
+{
+  "turn": 579,
+  "finding": "F57",
+  "title": "the privilege boundary: every store into a packet needs the initial user namespace, every read needs only the netns that owns it, and what an unprivileged sender controls is which byte a privileged rule reads",
+  "answer_short": "two gates, one line each: nfnetlink.c:659 needs CAP_NET_ADMIN in the user namespace that owns the netns (an unprivileged user with a userns passes it), while nft_payload_set_init refuses every payload STORE with -EPERM unless ctx->net->user_ns == &init_user_ns. Measured in four contexts: root everything 0; uid 1000 in the initial netns all -1; uid 1000 in its own userns+netns table/chain/read/meta 0 but store -1, with a read+drop rule that counts and kills its own frame; and a chain naming another namespace's device is created with rc 0 and never fires (fx2 counter 0, datagram delivered). The writes of F42..F56 are therefore init-ns-root only, and the F54 WARN is not reachable from a non-init userns. What is reachable from outside is the MEANING of an offset: with a VID-100 device on the receiving side the same root rule @ll,12,2=86dd drops an untagged IPv6 frame and lets a tagged one through (ch=0, delivered 1), the flow label at @ll,16,2 collides with an inner ethertype, and @nh,6,1=17 misses UDP behind a hop-by-hop or fragment header (delivered) while meta l4proto 17 catches both. Bounds: reads are exact and refuse the RULE not the packet (@ll,78,2 ok, 79,2 NFT_BREAK and delivered); writes on the netdev ingress door are bounded by nothing (nft_ll_write_ok returns true when nft_in_ingress), 13,2 accepted although 13+2>14 and 20,2 lands in the IPv6 header and kills the packet as an unknown protocol -- and that is the door the second gate protects",
+  "kernel": "7.3.4-T563",
+  "kernel_sha256": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+  "boots": 2,
+  "arms": {
+    "priv": 19
+  },
+  "frames_per_arm": 1,
+  "credential_contexts": [
+    "root_init: uid 0 in the initial user namespace, initial netns",
+    "uid1000_init: uid 1000, initial user namespace, initial netns, no capabilities",
+    "userns_own: uid 1000 outside, unshare(CLONE_NEWUSER|CLONE_NEWNET), uid 0 inside, device w1 created by itself",
+    "userns_foreign: the same namespace, a netdev chain naming x1 (a device of the initial netns)"
+  ],
+  "doors": [
+    "n1 netdev ingress x1 (rules installed by root)",
+    "g6 ip6 prerouting on x1",
+    "w1 netdev ingress inside the child's own netns",
+    "the child's socket on x0/x1: frames are sent by a process with no capability in the initial namespace"
+  ],
+  "facts": {
+    "gate_capability": "net/netfilter/nfnetlink.c:659 netlink_net_capable(skb, CAP_NET_ADMIN) -- CAP_NET_ADMIN in the user namespace that owns the netns; a userns owner passes it",
+    "gate_init_user_ns": "net/netfilter/nft_payload.c:1207 if (ctx->net->user_ns != &init_user_ns) return -EPERM -- stores only; nft_payload_init and nft_meta_set_init have no such check",
+    "census_root": "tbl 0, chn 0, read 0, store 0, meta 0, and a chain on a nonexistent device 0",
+    "census_uid1000_init": "tbl -1, chn -1, read -1, store -1, meta -1 (EPERM for every message of the batch)",
+    "census_userns_own": "tbl 0, chn 0, read 0, store -1, meta 0; the read+drop rule counts its frame (1) and the namespace socket receives 0 datagrams",
+    "foreign_device_chain": "nft_netdev_hook_alloc matches with for_each_netdev and returns an EMPTY hook list when nothing matches: rc 0 in every context. The rule in that chain counts 0 and the frame is delivered (Ip6InDelivers +1), so the border is enumeration, not an errno",
+    "move_across_border": "x0 moved into the child's namespace: rc 0, ifindex in the initial netns -1; the child may rule on its own port and on nothing else",
+    "map_from_outside": "unshare(CLONE_NEWUSER) then writing /proc/self/uid_map from inside is -EACCES (the proc inode belongs to the initial namespace); the parent writes /proc/<pid>/uid_map and it succeeds",
+    "tag_evasion": "a root rule @ll,12,2=86dd -> drop: untagged IPv6 counter 1 not delivered; 802.1Q vid 100 (inner 86dd) counter 0 and DELIVERED to the socket (delivery is possible only because x1.100 exists)",
+    "tag_control": "the same door with @ll,12,2=8100 -> drop: the tagged frame counter 1, not delivered",
+    "ll16_collision": "@ll,16,2 = 0000 fires on an untagged frame (16..17 is the flow label); @ll,16,2 = 86dd fires both on a tagged frame's inner ethertype and on an untagged frame whose flow label low 16 bits are 0x86dd, dropping a datagram the rule was never meant to see",
+    "nh_evasion": "@nh,6,1=17 -> drop matches plain UDP (1, not delivered) and misses UDP behind hop-by-hop (0, delivered) and behind a fragment header (0, delivered); @nh,6,1=0 fires on the hop-by-hop frame, so the miss is a miss and not a refusal",
+    "walker_not_evaded": "meta l4proto 17 -> drop fires on both the plain and the hop-by-hop frame (1/1, delivered 0/0)",
+    "read_bound": "@ll,78,2 on an 80-byte frame is exactly in bounds (counter 1); @ll,79,2 is out of bounds, the rule is ABORTED (counter 0, NFT_BREAK) and the datagram is delivered",
+    "write_bound_ingress": "nft_ll_write_ok() returns true when nft_in_ingress(pkt->state): @ll,13,2 is accepted although 13+2 > 14 = the ethernet header, and @ll,20,2 lands in the IPv6 header (next header 0x20) so the datagram dies with Ip6InUnknownProtos +1",
+    "userns_own_counters": "the child's own Ip6InReceives counts its own MLD reports (both ends of its veth are in its netns): fx2_rcv 1 in one boot and 2 in the other, so a per-netns counter cannot witness a single frame there",
+    "f54_warn_correction": "the WARN in vlan_do_receive reached by a store into skb->vlan_proto (F54) requires that store, and the store is refused in any netns not owned by the initial user namespace: the splat is administrator-only"
+  },
+  "not_measured": [
+    "a real remote sender: a process with no capability at all cannot open AF_PACKET, so a crafted header chain needs CAP_NET_RAW as root or inside a namespace it owns",
+    "a device that is a VLAN port, a bridge port or a macvlan belonging to another namespace",
+    "NETLINK_NETFILTER from a namespace whose owner is not uid 0 inside",
+    "the @th and @nh store bounds (nft_th_write_ok/nft_nh_write_ok) below initial-ns root, and nft_payload_set_vlan()'s bounds when the tag is a word",
+    "the inet-family ingress path",
+    "a fuzzer around the unbounded ingest write guard: the only remaining limit there is skb_store_bits and the skb's own headroom/frags",
+    "panic_on_warn under pressure: the F54 splat is admin-only by gate 2, but the splat itself was not re-run from below"
+  ],
+  "predictions": {
+    "held": ["P1 the store @ll,12,2 is refused in a userns-owned netns while the read is accepted"],
+    "refuted": [
+      "P2 a netdev chain naming another namespace's device is refused: rc 0 instead, and the chain never fires",
+      "P3 the @ll write bound on the netdev ingress door is mac_len: @ll,13,2 and @ll,20,2 are both accepted"
+    ]
+  },
+  "verify": {
+    "checks": 902,
+    "mismatches": 0,
+    "selftest": "25/25",
+    "mutations_caught": 21
+  },
+  "letter": {
+    "file": "LETTER_SECTION_F57.txt",
+    "status": "NOT SENT",
+    "form": "reply in the F28 thread, no [PATCH]"
+  },
+  "artifacts": {
+    "differ": "vm/build/differ579",
+    "differ_sha256": "b2b53e396ae1dda121881bfc855bc5d8bd9419cb4a53146e12ddf0f2c5a56776",
+    "initrd": "vm/initrd579/full.cpio.gz",
+    "initrd_sha256": "a3dfee120b55e499f2b0026004f1ca2d7bd184c4d3bbe1202c60ff481cd93bf5",
+    "logs": "logs/f57_rep1.log, logs/f57_rep2.log",
+    "tools": "tools/f57_run.sh, tools/verify579.py, tools/verify579_selftest.sh, tools/f579_mutate.py",
+    "source": "vm/differ579_add.c (+ vm/differ579.c generated by vm/build_f57_differ.sh)"
+  }
+}

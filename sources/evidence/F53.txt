@@ -1,0 +1,544 @@
+===== LETTER_SECTION_F53.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload: a static transport-store check is enforced at runtime,
+ and 14 nft spellings die silently (`tcp flags set` regressed in v7.3)
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+References: <the same Message-Id>
+
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+Theme: clearing VLAN_FLAG_REORDER_HDR on a VLAN sub-interface is the one
+configuration in which the kernel puts the tag back into the frame bytes before
+the hook runs.  In it, the `@ll` base at a layer-3 door stops being the
+"reordered" view and becomes the frame as it came off the wire -- and the write
+guard, which is `off + len <= mac_len`, moves four bytes with it.  So the same
+rule reads and writes different bytes depending on a per-device flag that
+appears nowhere in the rule.  The four bytes are dead for the packet's fate
+either way; while they are still metadata (netdev ingress), the same offsets
+decide everything instead, and one of them makes the kernel WARN.
+
+No diff below: this measures the LL base, the store semantics and the guard as
+they stand and proposes no change.
+
+What was measured (7.3.4-T563; one bridge, four VLAN sub-interfaces on it --
+two with the flag, two without -- and one frame seen at ip6 prerouting and at
+netdev ingress; 44 arms per boot, two boots, every derived fact identical):
+
+* Flag set (`br0.100`, default): `@ll` at ip6 prerouting is the F52 view --
+  12 = 86dd, 14 = 6000, 16 = 0000, 18 = 001a; `skb_mac_header()` sits at frame
+  4 and `mac_len` is 14.  Flag cleared (`br0.101`): the same offsets read the
+  frame itself -- 12 = 8100, 14 = 0065, 16 = 86dd, 18 = 6000, 20 = 0000;
+  `mac_header` is back at 0 and `mac_len` is 18.  A packet socket on the two
+  devices shows the same split: 80 bytes untagged against 84 bytes tagged.
+
+* The log carries two witnesses that disagree by four bytes for the same
+  message: NFULA_HWHEADER (14 bytes from `mac_header`) ends in 86dd for the
+  first and in 8100 for the second, while NFULA_PAYLOAD (from `skb->data`) is
+  identical in both, because `data` points at the IPv6 header either way.
+
+* The write guard is `nft_ll_write_ok(pkt, len + off + (mac_header - data))`
+  against `skb_network_offset()`, which is 0 at a layer-3 door: the writable
+  domain is exactly `mac_len`.  With the flag set `@ll,14,2` and `@ll,16,2` are
+  refused (16, 18 > 14) and `@ll,12,2` accepted; with the flag cleared
+  `@ll,14,2` and `@ll,16,2` are accepted (16, 18 = 18) and `@ll,18,2` refused
+  (20 > 18).  A refused store is invisible except to the rule's own counter:
+  the expression breaks before `log` and `counter`, and the packet is delivered
+  untouched.
+
+* None of the accepted stores changes the fate of the packet: TCI, TPID, inner
+  ethertype and destination MAC are all dead bytes after the hook, since
+  `skb->protocol` and `pkt_type` were decided earlier.  This is the exact
+  reverse of the tagged-frame case, where the same four bytes are skb metadata,
+  a store into them changes no frame byte, and the packet's fate turns on the
+  value (writing 0 into the TCI makes an undeliverable frame deliverable).
+
+* While the tag is still metadata -- the netdev ingress hook -- the same
+  offsets have two different targets.  Offset 12 is `skb->vlan_proto` and
+  offset 14 is `skb->vlan_tci`: storing 0x0066 into the TCI re-targets the
+  frame to vid 102, no device matches, and it dies as PACKET_OTHERHOST before
+  any IPv6 counter moves.  Storing 0x0806 into offset 12 sets `vlan_proto` to
+  0x0806, and the next `vlan_do_receive()` calls `vlan_proto_idx()`, which
+  warns:
+
+      invalid VLAN protocol: 0x0806
+      WARNING: net/8021q/vlan.h:48 at vlan_do_receive+0x282/0x9a0
+
+  That is the one splat in this campaign and it reproduces on both boots.  The
+  16-bit value written by the rule is not validated anywhere before the WARN;
+  a privileged rule can therefore produce a kernel warning from a
+  configuration the kernel otherwise supports.  Offset 16 and beyond take the
+  `vlan_hlen = 4` path instead and land in the frame, four bytes earlier than
+  named: a store at 16 writes the frame's inner ethertype, the packet is still
+  delivered (the stack already parsed it), and a packet socket that was queued
+  at that hook -- the tap is delivered *after* the ingress hooks -- shows
+  `8100 0065 0800` where the stack saw `86dd`.
+
+* Two tags (`88a8`/102 outside, `8100`/200 inside, outer flag cleared, inner
+  kept): the view at the inner device is one tag assembled from two -- TPID and
+  TCI of the outer, and the inner ethertype right behind them (12 = 88a8,
+  14 = 0066, 16 = 86dd, 18 = 6000).  The inner tag is gone from the view
+  although its device is the one being addressed.
+
+Not measured, plainly: a store into the tag that reaches a wire (the local copy
+is never transmitted, so only `HWHEADER` and the packet socket witness it); an
+802.1ad frame on a device with the flag set; three or more tags (VLAN_MAX_DEPTH
+guards only the priority-tag loop in dev.c); `inet` family chains in this
+configuration; checksum fixups on a store into the tag; GSO on real hardware;
+a VLAN device as a bridge port (`vlan_core.c:40` skips the re-insertion).
+
+Not a vulnerability: the rule needs root in the initial user namespace, and the
+VLAN device needs root to be created.
+
+
+===== SUMMARY.md =====
+# F53 — снятый `VLAN_FLAG_REORDER_HDR` возвращает тег в кадр: `@ll` снова читает физические байты, запись в них разрешена на четыре байта дальше — и ни одна из них не решает судьбу пакета
+
+Ход 575, ядро `7.3.4-T563` (`1efbc957…2033`), новый прибор `differ575`, режим `reorder`:
+**44 плеча в каждой из двух загрузок**, обе загрузки совпадают по всем производным фактам
+(расходятся только MAC, которые ядро выбирает заново при каждой загрузке).
+
+Долг был назван в конце 574-го так: *`VLAN_FLAG_REORDER_HDR`, снятый из userspace
+(`vlan_dev.c:57`), — единственная конфигурация в этой семье, где ядро кладёт тег обратно в
+кадр между `vlan_do_receive()` и хуком.* Отсюда два вопроса: что именно читает `@ll` на
+двери устройства в этой конфигурации и что делает с теми же байтами запись.
+
+Устройство прибора: мост F51 (`br0` с портами `x1/y1/z1`, IPv6 только на `br0`,
+`fd02::92/128` на `br0`, UDP6-сокет на 5000) плюс **четыре VLAN-устройства** на `br0`,
+созданные одним и тем же netlink-вызовом с разными флагами:
+
+| устройство | vid | протокол | `IFLA_VLAN_FLAGS{flags,mask}` при создании | `REORDER_HDR` |
+|---|---|---|---|---|
+| `br0.100` | 100 | `8100` | не передан (умолчание) | **включён** |
+| `br0.101` | 101 | `8100` | `{0, 1}` | **снят** |
+| `br0.102` | 102 | `88a8` | `{0, 1}` | **снят** |
+| `br0.102.200` | 200 | `8100` | не передан (умолчание) | **включён** |
+
+Две двери: `g6` — `ip6` prerouting (одна цепь на все устройства; какое устройство
+доставило кадр, видно по `NFULA_IFINDEX_INDEV` сообщения) и `n1` — netdev ingress на `x1`,
+где тег ещё метаданные. Четыре кадра, все broadcast, IPv6 `fd02::11 → fd02::92`,
+UDP 42000 → 5000 (кадр A — унаследованный голый кадр с портом 40000): **A** голый,
+**B** `8100`/100, **E** `8100`/101, **Q** `88a8`/102 + `8100`/200.
+
+## 1. Флаг живёт не в кадре, а в дампе его нет вовсе
+
+`vlan_fill_info()` кладёт `IFLA_VLAN_FLAGS` только `if (vlan->flags)`. Поэтому снятый флаг
+виден в `RTM_GETLINK` **отсутствием атрибута**, а не нулём: у `br0.100` и `br0.102.200` в
+дампе `flags=1, mask=~0`, у `br0.101` и `br0.102` — ничего. Прибор печатает это как
+`flags_present`, и разница между «включён» и «снят» — единственное, что отличает два кадра
+в §2.
+
+### T1 · the four VLAN devices as the kernel reports them back
+
+| device | vid | protocol | `IFLA_VLAN_FLAGS` in the dump | REORDER_HDR |
+|---|---|---|---|---|
+| `br0.100` | 100 | `8100` | `flags=1, mask=~0` | **on** |
+| `br0.101` | 101 | `8100` | absent | **off** |
+| `br0.102` | 102 | `88a8` | absent | **off** |
+| `br0.102.200` | 200 | `8100` | `flags=1, mask=~0` | **on** |
+
+
+## 2. Одна дверь, один флаг: `@ll` переезжает на четыре байта назад, и это всё, что он делает
+
+Кадры B и E отличаются одним байтом TCI (`0064` против `0065`) и устройством, на котором их
+доставляет мост. Правило одно и то же, дверь одна и та же (`g6`).
+
+### T2 · one door, one flag, two frames: what `@ll` reads
+
+| offset | frame B on `br0.100` (flag set) | frame E on `br0.101` (flag cleared) | the frame itself |
+|---|---|---|---|
+| `@ll,0,6` | — | ch=1 | A dst MAC |
+| `@ll,12,2` = `8100` | ch=0 | ch=1 | the tag's TPID |
+| `@ll,12,2` = `86dd` | ch=1 | ch=0 | the inner ethertype |
+| `@ll,14,2` = `6000` | ch=1 | ch=1 | the first two IPv6 bytes |
+| `@ll,14,2` = `0065` | — | ch=1 | the tag's TCI |
+| `@ll,16,2` = `0000` | ch=1 | — | IPv6 flow label |
+| `@ll,16,2` = `86dd` | — | ch=1 | the inner ethertype |
+| `@ll,18,2` = `001a` | ch=1 | — | IPv6 payload length |
+| `@ll,18,2` = `6000` | — | ch=1 | the first two IPv6 bytes |
+| `@ll,20,2` = `0000` | — | ch=1 | IPv6 flow label |
+| `@nh,7,1` = `40` | ch=1 | ch=1 | hop limit |
+
+`ch` is the counter of the arm's own rule: 1 = the read matched (the expression ran),
+0 = the comparison failed (the rule's log and counter never ran).
+
+
+Читается это так. С флагом (кадр B, `br0.100`) `@ll` — это F52-вид: маска заголовка
+начинается с `86dd`, потому что `vlan_do_receive()` ветку вставки не выполняет, а
+`skb_reorder_vlan_header()` уже сдвинул `mac_header` на четыре. Без флага (кадр E,
+`br0.101`) `vlan_do_receive()` делает `skb_push(offset)` + `vlan_insert_inner_tag(…,
+skb->mac_len)` + `skb_pull(offset + VLAN_HLEN)` + `skb_reset_mac_len()`, и кадр становится
+**побайтово тем же, что пришёл с провода**, но `mac_header` возвращается на ноль. Поэтому
+`@ll,12` — это снова `8100`, `@ll,14` — TCI, `@ll,16` — внутренний ethertype, а `@ll,18` —
+первые байты IPv6. Никакого нового «сжатия» нет: тот же байт кадра достигается как `4 + 12`
+(флаг) и как `0 + 12` (без флага).
+
+Тот же сдвиг виден в самом логе: `NFULA_HWHEADER` — это `hard_header_len` = 14 байт **от
+`mac_header`**, поэтому у контроля он кончается на `86dd` (кадр 4..17), а у кадра со снятым
+флагом — на `8100` (кадр 0..13). То есть **лог несёт два свидетеля одного сообщения, и они
+расходятся на четыре байта**: `NFULA_PAYLOAD` (от `skb->data`) у обоих начинается с IPv6.
+
+### T4 · the two witnesses inside one log message
+
+| arm | `NFULA_HWHEADER` (14 bytes from `mac_header`) | `NFULA_PAYLOAD` (from `skb->data`) | tap on the VLAN device |
+|---|---|---|---|
+| `b_ctl` | `ffffffffffff2eeb3a0ffa9786dd` | `60000000001a1140fd02` | 1 × 80 B `ffffffffffff2eeb3a0ffa9786…` |
+| `e_ctl` | `ffffffffffff2eeb3a0ffa978100` | `60000000001a1140fd02` | 1 × 84 B `ffffffffffff2eeb3a0ffa9781…` |
+| `q_ctl` | `ffffffffffff2eeb3a0ffa9788a8` | `60000000001a1140fd02` | 1 × 84 B `ffffffffffff2eeb3a0ffa9788…` |
+| `a_ctl` | `ffffffffffff2eeb3a0ffa9786dd` | `60000000001a1140fd02` | 0 × -1 B `—…` |
+
+
+И третья сторона того же факта — то, что видит пользователь. Пакетный сокет на устройстве
+показывает кадр от `mac_header`: **80 байт с `86dd` по 12** при включённом флаге и
+**84 байта с `8100 0065` по 12** при снятом. Это ровно та разница, из-за которой
+`tcpdump -i br0.101` показывает тег, а `tcpdump -i br0.100` — нет.
+
+### T7 · the taps: what a packet socket on each device holds
+
+| frame | device | packets | length | first 20 bytes |
+|---|---|---|---|---|
+| B, flag set | `br0.100` | 1 | 80 | `ffffffffffff2eeb3a0ffa9786dd60000000001a1140` |
+| E, flag cleared | `br0.101` | 1 | 84 | `ffffffffffff2eeb3a0ffa978100006586dd60000000` |
+| Q, QinQ | `br0.102.200` | 1 | 84 | `ffffffffffff2eeb3a0ffa9788a8006686dd60000000` |
+| A, untagged | `br0.100` | 0 | -1 | `—` |
+
+
+## 3. Граница записи — это `mac_len`, и тег двигает её на четыре байта
+
+`nft_payload_set_eval()` для базы `@ll` считает
+`nft_ll_write_ok(pkt, len + off + (mac_header − data) − vlan_hlen)`, а сам страж —
+`offset <= skb_network_offset(skb)`. На двери layer-3 `skb_network_offset()` равно нулю,
+поэтому **разрешено ровно `off + len <= mac_len`**.
+
+### T3 · the store boundary is `mac_len`, and the tag moves it by four
+
+| store | `br0.100` (mac_len 14) | `br0.101` (mac_len 18) | where the control's byte landed | where the cleared frame's byte landed |
+|---|---|---|---|---|
+| `@ll,0,6` (dst MAC) | — | ch=1 | frame 4..9 (in `HWHEADER`) | frame 0..5 (in `HWHEADER`) |
+| `@ll,6,6` (src MAC) | ch=1 | ch=1 | frame 10..15 (in `HWHEADER`) | frame 6..11 (in `HWHEADER`) |
+| `@ll,12,2` | ch=1 | ch=1 | frame 16..17 (**in `HWHEADER`**) | frame 12..13 (**in `HWHEADER`**) |
+| `@ll,12,2` = `1234` | ch=1 | ch=1 | frame 16..17 | frame 12..13 |
+| `@ll,14,2` | ch=0 | ch=1 | **refused** (16 > 14) | frame 14..15 (outside `HWHEADER`) |
+| `@ll,16,2` | ch=0 | ch=1 | **refused** (18 > 14) | frame 16..17 (outside `HWHEADER`) |
+| `@ll,18,2` | — | ch=0 | — | **refused** (20 > 18) |
+
+
+Три вещи здесь стоят того, чтобы их назвать.
+
+1. **Домен записи вырос на четыре байта, а домен чтения — нет.** Чтение `@ll` на этой двери
+   вообще не ограничено `mac_len` (оно ограничено только длиной кадра) — это F51/F52; а
+   запись упирается ровно в `mac_len`, и `mac_len` — это 14 у контроля и 18 у кадра со снятым
+   флагом. Одна и та же четвёрка правил, которая у контроля отказана (`@ll,14,2` и
+   `@ll,16,2`), у кадра с тегом в байтах **принимается**: `off+len` = 16 и 18 при границе 18.
+2. **Отказ виден только счётчику правила.** У отказанной записи `ch = 0` и сообщения в лог
+   нет — выражение уходит в `NFT_BREAK` до `log` и `counter`; пакет при этом доставлен.
+3. **Ни одна принятая запись не меняет судьбу пакета.** TCI, TPID, внутренний ethertype и
+   MAC назначения — все они мертвы после хука: `skb->protocol` и `pkt_type` уже решены,
+   IPv6 разбирается от `skb->data`. Все семь принятых записей в T3 доставлены.
+
+И это ровно обратный полюс F52. Там те же четыре байта были **метаданными**: запись в них
+не меняла ни одного байта кадра и убивала пакет (тег исчезал, `0000` в TCI делал кадр
+доставимым, `0806` в TPID — недоставимым). Здесь они **байты**: запись меняет кадр и не
+делает с пакетом ничего. Одно и то же смещение `@ll,14` — TCI, но в одном случае это
+`skb->vlan_tci`, а в другом — байты 14..15 в голове skb.
+
+## 4. Те же четыре байта, пока они метаданные (`n1`, netdev ingress): запись в 12 меняет протокол, запись в 16 — кадр
+
+На двери netdev ingress тег ещё метаданные, и `nft_payload_set_vlan()` разбирает смещения
+по-своему: 12 — это `skb->vlan_proto`, 14 — `skb->vlan_tci`, а **16 и дальше** — обычная
+запись в кадр, но со сдвигом на `VLAN_HLEN` (потому что тег в кадре уже снят).
+
+### T6 · the same four bytes while they are metadata (`n1`, netdev ingress)
+
+| arm | rule | `ch` | `NFULA_VLAN` in the message | delivered | the frame's own bytes |
+|---|---|---|---|---|---|
+| `m_r14` | read @14 | 1 | proto `8100`, tci `0065` | yes | 84 B `ffffffffffff2eeb3a0ffa978100006586…` |
+| `m_r16` | read @16 | 1 | proto `8100`, tci `0065` | yes | 84 B `ffffffffffff2eeb3a0ffa978100006586…` |
+| `m_w14_same` | write `0065` @14 | 1 | proto `8100`, tci `0065` | yes | 84 B `ffffffffffff2eeb3a0ffa978100006586…` |
+| `m_w14_102` | write `0066` @14 | 1 | proto `8100`, tci `0066` | **no** | no frame |
+| `m_w12` | write `0806` @12 | 1 | proto `0806`, tci `0065` | **no** | no frame |
+| `m_w16` | write `0800` @16 | 1 | proto `8100`, tci `0065` | yes | 84 B `ffffffffffff2eeb3a0ffa978100006508…` |
+
+
+* `m_w14_102` (`0066` в TCI): кадр переадресован на vid 102, устройства `8100`/102 нет →
+  `vlan_do_receive()` отказывает, `pkt_type = PACKET_OTHERHOST`, кадр умирает до IPv6
+  (`g6 = 0`, доставок 0). Байты кадра при этом не менялись вовсе.
+* `m_w12` (`0806` в TPID): `skb->vlan_proto = 0x0806`, и следующий же
+  `vlan_find_dev(br0, 0x0806, …)` идёт в `vlan_proto_idx()`, у которого на неизвестный
+  протокол стоит `WARN(1, "invalid VLAN protocol: 0x%04x")`. **Ядро предупреждает** —
+  и это единственный splat за весь прогон, воспроизводимый в обеих загрузках:
+
+  ```
+  [  163.337159] invalid VLAN protocol: 0x0806
+  [  163.337464] WARNING: net/8021q/vlan.h:48 at vlan_do_receive+0x282/0x9a0, CPU#0
+  ```
+
+  То есть значение, которое пишет правило nftables, не проверяется нигде до `WARN`.
+  Правило требует root в начальном user ns, поэтому это не уязвимость, а
+  **предупреждение ядра из привилегированной конфигурации** — то, чего в ядре быть не должно
+  (политика «no user-triggerable WARN»), и это отдельный кандидат в письмо.
+* `m_w16` (`0800` по смещению 16): путь `vlan_hlen = 4` → запись ложится в **кадр** по
+  смещению 12..13 (`mac_header + 16 − 4`), то есть во внутренний ethertype нетронутого
+  кадра. Пакет всё равно доставлен (`skb->protocol` уже `86dd`), а тап на `br0.101`
+  показывает `…8100 0065 0800 6000…` — испорченный ethertype виден **читателю, а не стеку**.
+
+Отдельно про порядок: тап на netdev-двери снимается **после** ingress-хуков (в
+`__netif_receive_skb_core` `pt_prev` отдаётся уже после `nf_ingress()`), поэтому на этой двери
+пакетный сокет — свидетель записи, а на layer-3 двери — нет.
+
+## 5. QinQ: вид — это TPID наружного тега и TCI внутреннего
+
+Кадр Q (`88a8`/102 + `8100`/200) проходит два круга: наружное устройство (`br0.102`, флаг
+снят) кладёт свой тег обратно, внутреннее (`br0.102.200`, флаг включён) свой не кладёт. На
+двери `g6` вид такой:
+
+| смещение | прочитано | что это |
+|---|---|---|
+| `@ll,12,2` | `88a8` | TPID **наружного** тега |
+| `@ll,14,2` | `0066` | TCI **наружного** тега |
+| `@ll,16,2` | `86dd` | внутренний ethertype |
+| `@ll,18,2` | `6000` | первые байты IPv6 |
+
+То есть в виде ровно один тег, собранный из двух разных: TPID и TCI — наружного, а то, что
+стоит за ними, — уже содержимое без внутреннего тега. И предсказание P11 в одной клаузуле
+опровергнуто: я ждал, что по 14 будет TCI внутреннего (`00c8`), а там TCI наружного.
+
+## 6. Судьба каждого плеча
+
+### T5 · the fate of every arm
+
+| arm | door | rule | `ch` | delivered | `Ip6InReceives` | `Ip6InDelivers` | `Ip6InDiscards` |
+|---|---|---|---|---|---|---|---|
+| `a_ctl` | - | census | -1 | yes | 3 | 1 | 2 |
+| `a_r12` | g6 | read @12 | 1 | yes | 3 | 1 | 2 |
+| `b_ctl` | - | census | -1 | yes | 1 | 1 | 0 |
+| `b_nh7` | g6 | read @7 | 1 | yes | 1 | 1 | 0 |
+| `b_r12_i` | g6 | read @12 | 1 | yes | 1 | 1 | 0 |
+| `b_r12_t` | g6 | read @12 | 0 | yes | 1 | 1 | 0 |
+| `b_r14` | g6 | read @14 | 1 | yes | 1 | 1 | 0 |
+| `b_r16` | g6 | read @16 | 1 | yes | 1 | 1 | 0 |
+| `b_r18` | g6 | read @18 | 1 | yes | 1 | 1 | 0 |
+| `b_w12` | g6 | write `8100` @12 | 1 | yes | 1 | 1 | 0 |
+| `b_w12x` | g6 | write `1234` @12 | 1 | yes | 1 | 1 | 0 |
+| `b_w14` | g6 | write `0000` @14 | 0 | yes | 1 | 1 | 0 |
+| `b_w16` | g6 | write `0000` @16 | 0 | yes | 1 | 1 | 0 |
+| `b_w6` | g6 | write `909192939495` @6 | 1 | yes | 1 | 1 | 0 |
+| `e_ctl` | - | census | -1 | yes | 1 | 1 | 0 |
+| `e_nh7` | g6 | read @7 | 1 | yes | 1 | 1 | 0 |
+| `e_r0` | g6 | read @0 | 1 | yes | 1 | 1 | 0 |
+| `e_r12_i` | g6 | read @12 | 0 | yes | 1 | 1 | 0 |
+| `e_r12_t` | g6 | read @12 | 1 | yes | 1 | 1 | 0 |
+| `e_r14` | g6 | read @14 | 1 | yes | 1 | 1 | 0 |
+| `e_r16` | g6 | read @16 | 1 | yes | 1 | 1 | 0 |
+| `e_r18` | g6 | read @18 | 1 | yes | 1 | 1 | 0 |
+| `e_r20` | g6 | read @20 | 1 | yes | 1 | 1 | 0 |
+| `e_w0` | g6 | write `909192939495` @0 | 1 | yes | 1 | 1 | 0 |
+| `e_w12` | g6 | write `0806` @12 | 1 | yes | 1 | 1 | 0 |
+| `e_w12x` | g6 | write `1234` @12 | 1 | yes | 1 | 1 | 0 |
+| `e_w14` | g6 | write `0000` @14 | 1 | yes | 1 | 1 | 0 |
+| `e_w16` | g6 | write `0806` @16 | 1 | yes | 1 | 1 | 0 |
+| `e_w18` | g6 | write `0000` @18 | 0 | yes | 1 | 1 | 0 |
+| `e_w6` | g6 | write `909192939495` @6 | 1 | yes | 1 | 1 | 0 |
+| `m_r14` | n1 | read @14 | 1 | yes | 1 | 1 | 0 |
+| `m_r16` | n1 | read @16 | 1 | yes | 1 | 1 | 0 |
+| `m_w12` | n1 | write `0806` @12 | 1 | **no** | 0 | 0 | 0 |
+| `m_w14_102` | n1 | write `0066` @14 | 1 | **no** | 0 | 0 | 0 |
+| `m_w14_same` | n1 | write `0065` @14 | 1 | yes | 1 | 1 | 0 |
+| `m_w16` | n1 | write `0800` @16 | 1 | yes | 1 | 1 | 0 |
+| `q_ctl` | - | census | -1 | yes | 1 | 1 | 0 |
+| `q_r12` | g6 | read @12 | 1 | yes | 1 | 1 | 0 |
+| `q_r12_q` | g6 | read @12 | 0 | yes | 1 | 1 | 0 |
+| `q_r14` | g6 | read @14 | 0 | yes | 1 | 1 | 0 |
+| `q_r14b` | g6 | read @14 | 1 | yes | 1 | 1 | 0 |
+| `q_r16` | g6 | read @16 | 1 | yes | 1 | 1 | 0 |
+| `q_r18` | g6 | read @18 | 1 | yes | 1 | 1 | 0 |
+| `topo` | - | census | -1 | **no** | 0 | 0 | 0 |
+
+
+## 7. Ошибки хода, все мои
+
+1. **`ip6`-цепь с `NFTA_HOOK_DEV` в этом ядре не создаётся** — первый дым вернул `rc=-95`
+   (`-EOPNOTSUPP`) на всех трёх устройство-специфичных дверях. Переделал на одну общую цепь
+   плюс `NFULA_IFINDEX_INDEV`; прибор от этого стал честнее, а не беднее.
+2. **Порядок подобранных атрибутов NFLOG**: я взял `NFULA_VLAN = 19`, `NFULA_L2HDR = 20` и
+   `TCI = 1`, `PROTO = 2`. На самом деле 19 и 20 — это `NFULA_CT_INFO` и `NFULA_CT`, а
+   `VLAN = 20`, `L2HDR = 21`; в вложении наоборот: `PROTO = 1`, `TCI = 2`. Поймал дампом
+   `(тип:длина)` всех атрибутов сообщения, который добавил именно для этого; до починки
+   «L2HDR» показывал содержимое VLAN-вложения.
+3. **Прочитал чужую строку лога и построил на ней гипотезу** — решил, что запись по 12 в
+   контроле не легла в кадр, и стал объяснять это метаданными. На самом деле я смотрел на
+   строку соседнего плеча (`b_r12_t` вместо `b_w12`); после `awk` по нужному плечу
+   аномалия исчезла. Это ровно та ошибка, которую я весь проект ловлю у других.
+4. **`f559_hexs` с буфером 80 байт** обрезал 42-байтный груз NFLOG до 39 байт — поймал
+   сравнением длин при разборе (в логе оказалось нечётное число hex-символов).
+5. **Мой питон-счётчик суммы UDP** трижды считал не то: сначала длину псевдозаголовка от
+   всего датаграма (66 вместо 26), потом сумму по всему датаграму вместо UDP-части, и
+   отдельно — запись контрольной суммы поверх source port вместо самого поля. Каждую из трёх
+   поймало сравнение с кадром из лога, а не рассуждение.
+6. **`pkill -f "tools/f53_run.sh smoke b"` совпал с командной строкой моей же оболочки** и
+   убил её — четвёртый раз в проекте (F47 №6, F570 №6, F573 №1). Останавливать надо по PID.
+7. Модель в верификаторе пришлось переписать после того, как я перепутал координаты
+   (`skb_push` двигает `data` к голове, а не наоборот): первая версия «вставки» давала сдвиг
+   на 8 байт вместо 4 и «доказывала», что QinQ-вид не сходится.
+
+## 8. Предсказания: 12 из 13, и одно опровергнуто в одной клаузуле
+
+Сошлись P1–P10, P12–P14. **P11 опровергнуто** в части «по смещению 14 будет TCI наружного
+тега»: там `0066` (TCI наружного), а не `0102`, которое я вписал в предсказание по
+невнимательности (vid 102 = `0x0066`, а не `0x0102`). Остальные клаузулы P11 верны: 12 =
+`88a8`, 16 = `86dd`, 18 = `6000`, и внутренний тег из вида исчезает.
+
+## 9. Что не измерено, прямо
+
+* запись в тег, у которой есть **провод**: локальная копия никуда не передаётся, поэтому
+  «запись в TCI ушла в сеть» в этом приборе не наблюдается — только в кадре, который держит
+  читатель (`HWHEADER`, тап);
+* 802.1ad-кадр на устройстве с **включённым** флагом (`br0.102` создан со снятым);
+* три и более тегов (`VLAN_MAX_DEPTH = 8` работает только в ветке priority-tag, `dev.c:6217`,
+  а не в стеке устройств);
+* запись на двери `@ll,16` при снятом флаге **невидима обоим свидетелям** (кадр 16..17 — вне
+  14-байтного `HWHEADER` и до `skb->data`); что она ложится именно туда, следует из модели и
+  из `m_w16`, но прямого свидетеля для кадра E нет;
+* `inet`-семейство на этой конфигурации, пересчёт контрольных сумм (`csum type inet`) при
+  записи в тег, GSO/`CHECKSUM_PARTIAL` на настоящем железе;
+* VLAN-устройство как порт моста (`!netif_is_bridge_port()` в `vlan_core.c:40` — ветка
+  вставки пропускается); macvlan-порт — то же самое.
+
+**Не уязвимость**: правило ставит root в начальном user ns. Следствия, которые стоит назвать:
+чтение `@ll` на двери layer-3 зависит от флага устройства, которого в правиле нет; граница
+записи `@ll` — это `mac_len`, поэтому одно и то же правило пишет в разные байты кадра в
+зависимости от флага; запись в 12 на ingress-двери задаёт `skb->vlan_proto` произвольным
+значением и **вызывает WARN ядра**; запись в 16 там же портит ethertype в кадре, который
+увидит любой читатель AF_PACKET, и не мешает стеку доставить датаграм.
+
+## 10. Чем проверено
+
+| | |
+|---|---|
+| `tools/verify575.py` | **3696 проверок, 0 расхождений** — провенанс (sha ядра из шапки каждой загрузки против файла, initrd из обеих шапок, differ **извлечённый из initramfs** и сверенный с собранным), четыре кадра пересобраны на Python (включая UDP-сумму), четыре устройства (rc, vid, proto, наличие `IFLA_VLAN_FLAGS`), и **каждое плечо обеих загрузок**: перепись двух дверей, счётчик самого правила, все дельты `Ip6*`/`Udp6*`, длина сокета, каждое сообщение NFLOG (префикс, indev, 14 байт `HWHEADER` от `mac_header`, `L2HDR` на netdev-двери, `NFULA_VLAN` пока тег метаданные, груз от `skb->data`), все три тапа (число, длина, байты); порт `skb_vlan_untag`/`skb_reorder_vlan_header`/`__vlan_insert_inner_tag`/`vlan_do_receive`/`nft_payload_eval`/`nft_payload_set_eval`/`nft_ll_write_ok`/`nft_payload_set_vlan` на Python; детерминизм по всем производным полям и по байтам после нормализации двух MAC; плюс отдельно — **один WARN, ровно тот и на том плече** |
+| `tools/verify575_selftest.sh` | **25/25** — базовая линия зелёная, `noop` зелёный, 23 односоставные мутации краснят верификатор без traceback |
+| `tools/f575_summary.py` | таблицы §1–§6 — вывод из `logs/f53_rep1.log`, не набор руками |
+| `tools/audit_f53_doc.py` | **94 строки таблиц, 597 клеток, 0** отсутствующих в документе; три одиночные подмены в копии документа ловятся **3/3** |
+| `tools/f575_mutate.py` | 24 именованные мутации лога (по одной правке поля) |
+| коллекция | см. `RESEARCH_LOG.md`, ход 575 |
+| регрессия | verify574 2666, verify573 3186, verify572 5629, verify571 5974, verify570 753, verify569 3810, verify568 10088, verify567/566/563 OK, verify565 884, verify564 895, verify562 все секции 0 |
+
+Файлы: `findings/F53-vlan-reorder/{SUMMARY.md, summary.json, VERIFY_REPORT.md,
+LETTER_SECTION_F53.txt}`; `vm/{differ575_add.c, build_f53_differ.sh, make_initramfs575.sh,
+build/differ575}`; `tools/{f53_run.sh, verify575.py, verify575_selftest.sh, f575_mutate.py,
+f575_summary.py}`; `research/predictions_575.md`; логи `logs/f53_{rep1,rep2}.log`.
+
+**Дальше пойду сам так:** осталась ровно одна вещь, которую я назвал, но не измерил, —
+запись в тег, у которой есть провод. Её можно получить, только если кадр уходит: значит
+нужен IPv6-форвардинг на `br0.101` с маршрутом в другой порт, и тогда видно, поедет ли
+записанный TCI в кадре дальше или `vlan_dev_hard_start_xmit()` соберёт тег заново из
+`vlan->vlan_id`. Второй долг — WARN: проверить, срабатывает ли он и от `@nh`-пути
+(`meta protocol` не читается)... точнее, воспроизвести его минимальным правилом из
+userspace и записать точную форму сообщения для письма.
+
+
+===== summary.json =====
+{
+  "finding": "F53-vlan-reorder",
+  "turn": 575,
+  "kernel": "7.3.4-T563",
+  "kernel_sha256": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+  "instrument": "vm/differ575 (mode reorder), generated from differ574 + differ575_add.c",
+  "instrument_sha256": "8556df78154a8cabfb5b2856b6451df9a3741aae4a765ddc287f275f7d14c057",
+  "boots": 2,
+  "arms_per_boot": 44,
+  "checks": 3696,
+  "mismatches": 0,
+  "selftest": "25/25",
+  "question": "VLAN_FLAG_REORDER_HDR cleared from userspace is the one configuration where the kernel puts the tag back into the frame between vlan_do_receive() and the hook: what does @ll read there, and what does a store into those bytes do?",
+  "answers": {
+    "read_domain_flag_set": {
+      "@ll,12": "86dd",
+      "@ll,14": "6000",
+      "@ll,16": "0000",
+      "@ll,18": "001a",
+      "mac_header": 4,
+      "mac_len": 14
+    },
+    "read_domain_flag_cleared": {
+      "@ll,0": "dst MAC",
+      "@ll,12": "8100",
+      "@ll,14": "0065",
+      "@ll,16": "86dd",
+      "@ll,18": "6000",
+      "@ll,20": "0000",
+      "mac_header": 0,
+      "mac_len": 18
+    },
+    "write_boundary": "off + len <= mac_len (nft_ll_write_ok against skb_network_offset, which is 0 at a layer-3 door)",
+    "write_accepted_flag_set": [
+      "@ll,0,6",
+      "@ll,6,6",
+      "@ll,12,2"
+    ],
+    "write_refused_flag_set": [
+      "@ll,14,2",
+      "@ll,16,2"
+    ],
+    "write_accepted_flag_cleared": [
+      "@ll,0,6",
+      "@ll,6,6",
+      "@ll,12,2",
+      "@ll,14,2",
+      "@ll,16,2"
+    ],
+    "write_refused_flag_cleared": [
+      "@ll,18,2"
+    ],
+    "fate": "every accepted store leaves the packet delivered; every refused store is visible only to the rule's own counter",
+    "qinq_view": {
+      "@ll,12": "88a8",
+      "@ll,14": "0066",
+      "@ll,16": "86dd",
+      "@ll,18": "6000"
+    },
+    "ingress_metadata": {
+      "offset_12": "skb->vlan_proto",
+      "offset_14": "skb->vlan_tci",
+      "offset_ge_16": "frame byte at mac_header+off-4"
+    },
+    "taps": {
+      "flag_set": "80 B, 86dd at 12",
+      "flag_cleared": "84 B, 8100 0065 at 12",
+      "qinq": "84 B, 88a8 0066 86dd at 12"
+    }
+  },
+  "splat": {
+    "count": 1,
+    "per_boot": 1,
+    "arm": "m_w12",
+    "text": "invalid VLAN protocol: 0x0806 / WARNING: net/8021q/vlan.h:48 at vlan_do_receive+0x282/0x9a0",
+    "meaning": "a store into @ll,12 at the netdev ingress hook sets skb->vlan_proto to the stored bytes, and vlan_proto_idx() warns on the next vlan_do_receive(); reachable from a root rule in the initial netns"
+  },
+  "files": [
+    "findings/F53-vlan-reorder/SUMMARY.md",
+    "findings/F53-vlan-reorder/VERIFY_REPORT.md",
+    "findings/F53-vlan-reorder/LETTER_SECTION_F53.txt",
+    "findings/F53-vlan-reorder/summary.json",
+    "vm/differ575_add.c",
+    "vm/build_f53_differ.sh",
+    "vm/make_initramfs575.sh",
+    "tools/f53_run.sh",
+    "tools/verify575.py",
+    "tools/verify575_selftest.sh",
+    "tools/f575_mutate.py",
+    "tools/f575_summary.py",
+    "research/predictions_575.md",
+    "logs/f53_rep1.log",
+    "logs/f53_rep2.log"
+  ],
+  "predictions": {
+    "total": 14,
+    "held": 13,
+    "refuted": [
+      "P11 (second clause: @ll,14 on the QinQ frame is 0066, the outer TCI, not the inner 00c8 as predicted)"
+    ]
+  },
+  "letter_status": "NOT SENT"
+}

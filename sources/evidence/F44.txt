@@ -1,0 +1,2853 @@
+===== LETTER_SECTION_F44.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload: a static transport-store check is enforced at runtime,
+ and 14 nft spellings die silently (`tcp flags set` regressed in v7.3)
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+References: <the same Message-Id>
+
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+Theme: the ingress hook has two doors and they disagree — one of them rewrites
+`pf` before the guard reads it.
+
+No diff below: this is a measurement of the guard's input, not a change to it.
+
+Four doors, one frame at a time, one rule at a time, Linux 7.3.4 with nftables
+in the initial user namespace.  The doors are the layer-3 hook of family `ip`,
+the layer-3 hook of family `inet`, family `netdev` at the ingress hook of a
+device, and family `inet` at the ingress hook of the same device.  Two base
+chains per door, at priorities 0 and 10 for family `inet` and 40 and 50 for
+family `netdev`: the first chain is `counter` + `log` + `accept` and says
+whether the hook ran at all, the second carries the `payload` statement and
+says whether the guard accepted it.  The logged payload is what
+`skb_copy_bits(skb, 0, …)` sees at the hook -- i.e. the frame starting at
+`skb->data` -- so the byte a store wrote is read back from the same skb the
+rule ran on.  The receiving side is a real PPP unit, two UDP sockets and the
+kernel's own counters.  348 arms x 2 boots, byte-identical.
+
+1. Four pktinfo constructors, one coordinate.
+
+        nft_set_pktinfo_ipv4()          pkt->thoff = ip_hdrlen(skb)
+        __nft_set_pktinfo_ipv4_validate() pkt->thoff = skb_network_offset(skb) + nhoff + ihl*4
+        nft_set_pktinfo_ipv4_ingress()  pkt->thoff = ihl*4
+        nft_set_pktinfo_bridge()        the validate one
+
+The first is relative to `skb->data`, the second absolute; both land on the same
+wire byte because `skb->data` IS the network header at every one of these hooks
+(veth calls eth_type_trans() before netif_rx(), and __netif_receive_skb_core()
+does skb_reset_network_header()).  Measured, eight `@th` cells per door and
+envelope, `@th` read and `@th` store:
+
+  door            envelope                      hook ran   store accepted
+  ip / inet L3    bare, vid 0, PPPoE            2/2/1       8/8 each
+  ip / inet L3    802.1Q vid 100                no          -
+  ip / inet L3    Q-in-Q (0x88a8+0x8100)        no          -
+  netdev ingress  bare, vid 100, vid 0          1           8/8 each
+  netdev ingress  Q-in-Q, PPPoE                 1           0/8   (flags = 0)
+  inet ingress    bare, vid 100, vid 0          1           8/8 each
+  inet ingress    Q-in-Q, PPPoE                 no          -
+
+Every accepted store landed on `data + ihl*4 + off` -- the true transport
+header.  The "not reached" rows are not guard refusals: the first chain's
+counter is zero, and the frame never appears at that hook (a vid-100 tagged
+frame without a vlan device is PACKET_OTHERHOST at ip_rcv(); a Q-in-Q frame
+never reaches the IPv4 stack; and nft_do_chain_inet_ingress() returns NF_ACCEPT
+for any skb->protocol that is not 0x0800/0x86dd without running the chain).
+`meta protocol` repairs the netdev door on Q-in-Q (nhoff 4) and PPPoE
+(nhoff 8) -- 8/8 each, at `data+24` and `data+28` -- and cannot repair the inet
+door, because the expression sits inside a chain that is never entered.
+
+2. The guard reads a field that the handler rewrites.
+
+nf_register_net_hook() registers an `inet` hook op twice, under NFPROTO_IPV4
+and NFPROTO_IPV6, leaving ops->pf as NFPROTO_INET; at packet time state->pf is
+whatever the caller of NF_HOOK passed.  At the ingress hook that caller is
+nf_ingress(), i.e. NFPROTO_NETDEV -- and nft_do_chain_inet_ingress() overwrites
+it before the rules run:
+
+        ingress_state.pf   = NFPROTO_IPV4;
+        ingress_state.hook = NF_INET_INGRESS;
+
+Both guards read that field:
+
+        nft_nh_write_ok():  case NFPROTO_NETDEV: if (hook == NF_NETDEV_INGRESS) return true;
+        nft_in_ingress():   s->pf == NFPROTO_NETDEV && s->hook == NF_NETDEV_INGRESS
+
+so the same frame at the same hook number on the same device gets two different
+answers.  Measured, bare frame, both ingress doors in one boot:
+
+        base    netdev ingress      inet ingress
+        @ll     12/12               7/12  (refused: (12,4) (14,2) (16,2) (20,4) (24,4))
+        @nh     20/20               9/20  (exactly nft_nh_write_ok_ip4(): (0,1) (0,2) (0,4)
+                                          (2,2) (4,4) (6,2) (6,4) (8,2) (18,2) (20,2)
+                                          (20,4) refused; (1,1) (4,2) (8,1) (10,2) (10,4)
+                                          (12,2) (12,4) (16,2) (16,4) accepted)
+        @th     8/8                 8/8
+
+`@ll` at the inet door degrades to `offset <= skb_network_offset()`, so exactly
+the cells whose write reaches past the link header are refused.  The "ingress
+is a constant" of the earlier analysis is a property of the netdev *branch*,
+not of the hook.
+
+3. The two ingress doors share one hook list, and the inet one can drop the
+   frame before any rule of either family runs.
+
+nft_set_pktinfo_ipv4_ingress() validates and returns -1, and
+nft_do_chain_inet_ingress() turns that into NF_DROP *before* nft_do_chain().
+Since both doors are entries of dev->nf_hooks_ingress, an inet ingress chain
+drops a malformed IPv4 frame ahead of a netdev chain on the same device:
+
+  frame (0x0800 carried, bad header)   inet ingress chain present   deleted
+  version 6                            netdev counter 0, no far     counter 1,
+                                       frame, InHdrErrors +1        forwarded,
+                                                                    InHdrErrors +2
+  ihl = 4                              same                         same
+  iph->totlen 300 > skb->len           same, but InTruncatedPkts    same
+                                       +1 (the constructor checks
+                                       length before the checksum)
+
+A tool that counts a chain's packets is therefore measuring, in part, the other
+tables on the same device.  For anyone debugging a missing packet at ingress
+this is worth knowing: the drop reason is not visible in the counted chain, and
+the only trace is an IP counter being incremented by a rule-less hook.
+
+4. The wire.
+
+A store at the layer-3 doors lands on the copy the bridge passed up to br0, not
+on the forwarded skb, so the far frame is unchanged (measured: zero changed
+bytes at the far tap for all 16 store arms there).  A store at either ingress
+door lands on the skb that is then bridged and is visible (a dport write:
+bytes 36..37 for a bare frame; the datagram arrives at the written port, 2
+copies).  And the tag path has its own edge: writing `@ll,12,2 = 0x9091` stores
+skb->vlan_proto, vlan_hw_offload_capable() does not know 0x9091, and
+validate_xmit_vlan() puts the tag back into the frame bytes on the way out --
+the frame grows from 60 to 64 bytes while nft believes it wrote a header field.
+
+Reproduction: one static C program (~1100 lines, netlink by hand), busybox
+initramfs, two boots; every byte quoted above is extracted from the log by an
+independent Python model of the four constructors and the four guards (1692
+checks), and every table in the report is generated from the log rather than
+typed.
+
+STATUS: NOT SENT -- section for the held netfilter-devel letter
+
+
+===== SUMMARY.md =====
+# F44 — у хука ingress две двери, и они расходятся: одна переписывает `pf` прежде, чем страж его прочтёт
+
+Ход 566. Ядро не собирал: всё на том же `7.3.4-T563` (`1efbc957…2033`), образ
+F41–F43. Новый прибор `differ566` — **348 плеч в каждой из двух загрузок**, обе
+совпадают побайтово (0 расходящихся строк из 348).
+
+## 0. Ответ в одном абзаце
+
+Вопрос 565-го был про «третий конструктор» `thoff`. Ответ: конструкторов
+четыре, а координата одна — `@th` попадает в настоящее поле во всех четырёх
+дверях, и там, где дверь не достигнута, это видно счётчиком, а не байтами.
+Настоящая разница между дверями — не в координате, а в **страже**: `nft_th_write_ok`,
+`nft_nh_write_ok()` и `nft_in_ingress()` читают `pkt->state->pf`, а
+`nft_do_chain_inet_ingress()` **переписывает это поле** в `NFPROTO_IPV4`
+прежде, чем хоть одно правило выполнится. Поэтому один и тот же кадр, один и
+тот же хук (`ingress` на `s1`), два семейства: `@ll` — **12/12 против 7/12**,
+`@nh` — **20/20 против 9/20**, и девять живых клеток второго — ровно белый
+список `nft_nh_write_ok_ip4()` вместе с его ограничениями на длину. И третье,
+чего я не предсказывал: обе ingress-двери живут в **одном** списке
+`dev->nf_hooks_ingress`, и inet-дверь, не разобрав заголовок, возвращает
+`NF_DROP` **до** `nft_do_chain()` — то есть роняет кадр раньше, чем цепочка
+семейства `netdev` на том же хуке успеет посчитать счётчик. Измерено A/B:
+кадр с версией IPv4 = 6 при `cntp(ndg) = 0` и пустом дальнем тапе, и
+`cntp(ndg) = 1` с форварднутым кадром, если таблицу inet-двери удалить.
+
+## 1. Четыре двери, четыре конструктора
+
+| дверь | семейство · хук | конструктор pktinfo | `pkt->thoff` |
+|---|---|---|---|
+| `ipp` | `ip` · prerouting (0) | `nft_set_pktinfo_ipv4()` | `ip_hdrlen()`, **относительно** `skb->data` |
+| `inp` | `inet` · prerouting (0) | `nft_set_pktinfo_ipv4()` (та же функция) | то же |
+| `ndg` | `netdev` · ingress (0) | `nft_set_pktinfo_ipv4_validate()` | `skb_network_offset()+nhoff+ihl*4` |
+| `ieg` | `inet` · ingress (5) | `nft_set_pktinfo_ipv4_ingress()` | `ihl*4`, **относительно**, и с валидацией |
+
+Опорные строки исходника (все проверяются `verify566.py` как якоря, а не как
+комментарии):
+
+```
+include/net/netfilter/nf_tables_ipv4.h:
+    nft_set_pktinfo_ipv4():          pkt->thoff = ip_hdrlen(pkt->skb);
+    __nft_set_pktinfo_ipv4_validate(): pkt->thoff = skb_network_offset(pkt->skb) + nhoff + thoff;
+    nft_set_pktinfo_ipv4_ingress():  pkt->thoff = thoff;   /* = iph->ihl*4 */
+net/netfilter/nft_chain_filter.c:
+    nft_do_chain_inet_ingress():     ingress_state.pf = NFPROTO_IPV4;
+                                     ingress_state.hook = NF_INET_INGRESS;
+                                     if (nft_set_pktinfo_ipv4_ingress(&pkt) < 0) return NF_DROP;
+net/netfilter/nft_payload.c:
+    nft_nh_write_ok():               switch (pkt->state->pf) { … }
+    nft_in_ingress():                s->pf == NFPROTO_NETDEV && s->hook == NF_NETDEV_INGRESS
+```
+
+Двери различаются не формулой, а тем, где стоит `skb->data`: на всех четырёх
+дверях это сетевой заголовок (veth зовёт `eth_type_trans()` до `netif_rx`, а
+`__netif_receive_skb_core()` делает `skb_reset_network_header()`), поэтому
+относительная формула и абсолютная дают одно и то же число. Исключение — Q-in-Q
+и PPPoE на ingress: там `data` стоит на внутренней метке (18) или на заголовке
+сессии (14), и это видно по длине записанного NFLOG-полезного груза (50 и 54
+байта вместо 46).
+
+## 2. Сетка `@th`: 8 клеток × 4 двери × 5 конвертов
+
+Счётчик первой цепи (`pre0`, prio 0, без записи) говорит **дверь достигнута**,
+счётчик второй (`ch`, prio 10, с записью) — **страж принял**.
+
+| дверь | конверт | проходов | записей | payload | L2HDR |
+|---|---|---|---|---|---|
+| `ipp` | `p` | 2 | **8/8** | 46 | 0 |
+| `ipp` | `w` | 0 | **0/8** | -- | -- |
+| `ipp` | `w0` | 2 | **8/8** | 46 | 0 |
+| `ipp` | `q` | 0 | **0/8** | -- | -- |
+| `ipp` | `ps` | 1 | **8/8** | 46 | 0 |
+| `inp` | `p` | 2 | **8/8** | 46 | 0 |
+| `inp` | `w` | 0 | **0/8** | -- | -- |
+| `inp` | `w0` | 2 | **8/8** | 46 | 0 |
+| `inp` | `q` | 0 | **0/8** | -- | -- |
+| `inp` | `ps` | 1 | **8/8** | 46 | 0 |
+| `ndg` | `p` | 1 | **8/8** | 46 | 14 |
+| `ndg` | `w` | 1 | **8/8** | 46 | 14 |
+| `ndg` | `w0` | 1 | **8/8** | 46 | 14 |
+| `ndg` | `q` | 1 | **0/8** | 50 | 14 |
+| `ndg` | `ps` | 1 | **0/8** | 54 | 14 |
+| `ieg` | `p` | 1 | **8/8** | 46 | 0 |
+| `ieg` | `w` | 1 | **8/8** | 46 | 0 |
+| `ieg` | `w0` | 1 | **8/8** | 46 | 0 |
+| `ieg` | `q` | 0 | **0/8** | -- | -- |
+| `ieg` | `ps` | 0 | **0/8** | -- | -- |
+
+Три разных механизма отказа, и различить их можно только счётчиком первой цепи:
+
+* проходов **0** — дверь не достигнута: `w` (vid 100) не доходит до `ip_rcv`
+  (`PACKET_OTHERHOST`, F36), `q` не доходит до IPv4-стека, а в inet ingress
+  `nft_do_chain_inet_ingress()` для `skb->protocol != 0x0800/0x86dd` возвращает
+  `NF_ACCEPT` **не запуская цепочку**;
+* проходов **1**, записей **0** — дверь достигнута, страж отказал: netdev
+  ingress на `q`/`ps`, где `nft_set_pktinfo_unspec()` оставил `flags = 0`
+  (`if (!(pkt->flags & NFT_PKTINFO_L4PROTO)) goto err`);
+* запись принята и попадает в поле, которое называет (таблица ниже).
+
+Каждая принятая запись легла ровно на `data + 20 + off` — настоящий
+транспортный заголовок; «20» здесь не константа, а `ihl*4` того кадра.
+
+| дверь | конверт | t0_2 | t2_2 | t4_2 | t6_2 | t8_2 | t0_4 | t12_4 | t16_2 |
+|---|---|---|---|---|---|---|---|---|---|
+| `ipp` | `p` | 20 | 22 | 24 | 26 | 28 | 20 | 32 | 36 |
+| `ipp` | `w` | -- | -- | -- | -- | -- | -- | -- | -- |
+| `ipp` | `w0` | 20 | 22 | 24 | 26 | 28 | 20 | 32 | 36 |
+| `ipp` | `q` | -- | -- | -- | -- | -- | -- | -- | -- |
+| `ipp` | `ps` | 20 | 22 | 24 | 26 | 28 | 20 | 32 | 36 |
+| `inp` | `p` | 20 | 22 | 24 | 26 | 28 | 20 | 32 | 36 |
+| `inp` | `w` | -- | -- | -- | -- | -- | -- | -- | -- |
+| `inp` | `w0` | 20 | 22 | 24 | 26 | 28 | 20 | 32 | 36 |
+| `inp` | `q` | -- | -- | -- | -- | -- | -- | -- | -- |
+| `inp` | `ps` | 20 | 22 | 24 | 26 | 28 | 20 | 32 | 36 |
+| `ndg` | `p` | 20 | 22 | 24 | 26 | 28 | 20 | 32 | 36 |
+| `ndg` | `w` | 20 | 22 | 24 | 26 | 28 | 20 | 32 | 36 |
+| `ndg` | `w0` | 20 | 22 | 24 | 26 | 28 | 20 | 32 | 36 |
+| `ndg` | `q` | -- | -- | -- | -- | -- | -- | -- | -- |
+| `ndg` | `ps` | -- | -- | -- | -- | -- | -- | -- | -- |
+| `ieg` | `p` | 20 | 22 | 24 | 26 | 28 | 20 | 32 | 36 |
+| `ieg` | `w` | 20 | 22 | 24 | 26 | 28 | 20 | 32 | 36 |
+| `ieg` | `w0` | 20 | 22 | 24 | 26 | 28 | 20 | 32 | 36 |
+| `ieg` | `q` | -- | -- | -- | -- | -- | -- | -- | -- |
+| `ieg` | `ps` | -- | -- | -- | -- | -- | -- | -- | -- |
+
+**Чтение = запись.** Три клетки, чьё значение в кадре известно заранее
+(sport 40000, dport 5000, csum 0), читаются и сравниваются с константой; число
+в клетке — сколько раз сработала цепь (2 у layer-3 дверей: кадр поднимается на
+`br0` и приходит на `r0`; 1 у ingress):
+
+| дверь | (0,2) | (2,2) | (6,2) |
+|---|---|---|---|
+| `ipp` | 2 | 2 | 2 |
+| `inp` | 2 | 2 | 2 |
+| `ndg` | 1 | 1 | 1 |
+| `ieg` | 1 | 1 | 1 |
+
+**Сокет-оракул.** Правило пишет `@th,2,2 = 0x1389` (dport 5001), а на
+`10.9.0.7:5001` стоит настоящий UDP-сокет:
+
+| дверь | конверт | проходов | записей | u5000 | u5001 |
+|---|---|---|---|---|---|
+| `ipp` | `p` | 2 | 2 | 0 | 2 |
+| `ipp` | `ps` | 1 | 1 | 0 | 1 |
+| `inp` | `p` | 2 | 2 | 0 | 2 |
+| `inp` | `ps` | 1 | 1 | 0 | 1 |
+| `ndg` | `p` | 1 | 1 | 0 | 2 |
+| `ndg` | `ps` | 1 | 0 | 1 | 0 |
+| `ieg` | `p` | 1 | 1 | 0 | 2 |
+| `ieg` | `ps` | 0 | 0 | 1 | 0 |
+
+(Две строки `ps` внизу — отказы: на `ndg` страж не пускает запись
+(`flags = 0`), на `ieg` цепь не запускается; в обоих случаях датаграм
+приходит на исходный 5000.)
+
+С `meta protocol` на netdev-двери (`q`, `ps`) те же восемь клеток легли на
+24, 26, 28, 30, 32, 24, 36, 40 и 28, 30, 32, 34, 36, 28, 40, 44
+соответственно.
+
+(Все числа — смещение изменённого байта внутри NFLOG-полезного груза, то есть
+`skb_copy_bits(skb, 0, …)`, начало которого и есть `skb->data`.)
+
+**Побочное, но измеримое:** NFULA_L2HDR есть ровно у netdev-двери (14 байт) и
+нет ни у одной из трёх остальных — `__build_packet_message()` кладёт его только
+для `pf == NFPROTO_NETDEV || pf == NFPROTO_BRIDGE`, а inet ingress из `pf`
+уходит. То есть переписанное поле видно даже в самом сообщении лога.
+
+## 3. `meta protocol` чинит netdev-дверь и не может починить inet-дверь
+
+| дверь | конверт | проходов | записей | первый изменённый байт |
+|---|---|---|---|---|
+| `ndg` | `q` + meta | 1 | **8/8** | 24 |
+| `ndg` | `ps` + meta | 1 | **8/8** | 28 |
+| `ieg` | `q` + meta | **0** | **0/8** | — |
+| `ieg` | `ps` + meta | **0** | **0/8** | — |
+
+На netdev-двери `nft_meta_pktinfo_may_update()` читает ethertype по `mac+16`
+(`nhoff = 4`) или `nf_flow_pppoe_proto()` (`nhoff = 8`) и пересобирает pktinfo
+через `__nft_set_pktinfo_ipv4_validate()` — ровно как в мосту (F39/F40). На
+inet-двери починить нечего: `meta protocol` стоит внутри цепочки, а цепочка для
+`0x8100`/`0x8864` не запускается вовсе.
+
+## 4. Страж: одно поле, два ответа
+
+Две ingress-цепи лежат в **одном** списке `dev->nf_hooks_ingress`; различаются
+они только полями в `nf_hook_state`, и `nft_do_chain_inet_ingress()` переписывает
+`pf` на `NFPROTO_IPV4` (и `hook` на `NF_INET_INGRESS`) до того, как построен
+pktinfo. Приоритеты выбраны заранее так, чтобы порядок был по приоритету, а не
+по порядку регистрации: inet-дверь `0/10`, netdev-дверь `40/50`.
+
+`@ll` (12 клеток, база 0):
+
+| дверь | конверт | живых | отказано |
+|---|---|---|---|
+| `ndg` | `p` | **12/12** | -- |
+| `ndg` | `w` | **11/12** | (13,1) |
+| `ieg` | `p` | **7/12** | (12,4), (14,2), (16,2), (20,4), (24,4) |
+| `ieg` | `w` | **9/12** | (13,1), (20,4), (24,4) |
+
+Ровно те клетки, у которых `off + len > 14`: при `pf = IPV4` `nft_in_ingress()`
+возвращает false, и страж деградирует до `offset <= skb_network_offset()` = 0,
+а `offset` записи равен `-14 + off` (для помеченного кадра с `vlan_hlen = 4` —
+`-18 + off`, и три клетки (12,2), (12,4), (14,2) вообще выходят из функции
+раньше стража, потому что пишут метаданные метки: `nft_payload_set_vlan()`).
+
+`@nh` (20 клеток, база 1), голый кадр:
+
+| дверь | конверт | живых | отказано |
+|---|---|---|---|
+| `ndg` | `p` | **20/20** | -- |
+| `ieg` | `p` | **9/20** | (0,1), (0,2), (0,4), (2,2), (4,4), (6,2), (6,4), (8,2), (18,2), (20,2), (20,4) |
+
+`@th` (8 клеток, база 2): **8/8 на обеих** — `nft_th_write_ok()` смотрит только
+на TCP doff, а кадр UDP.
+
+То есть «ingress — константа 40/40» из F33/F38 верно только для **семейства
+netdev**: константа — это ветка `NFPROTO_NETDEV` в `nft_nh_write_ok()`, а не
+сам хук.
+
+## 5. Дверь, которая проверяет заголовок и роняет кадр раньше чужой цепочки
+
+Три кадра с испорченным IPv4-заголовком (версия 6; `ihl = 4`; `totlen = 300`)
+на одном и том же хуке `ingress` на `s1`:
+
+| проход | кадр | проходов | записей | ipin | ihdr | itrun | дальний тап |
+|---|---|---|---|---|---|---|---|
+| обе двери | `badver` | **0** | 0 | 0 | **1** | 0 | нет кадра |
+| обе двери | `ihl4` | **0** | 0 | 0 | **1** | 0 | нет кадра |
+| обе двери | `trunc` | **0** | 0 | 0 | 0 | **1** | нет кадра |
+| только netdev | `badver` | 1 | **1** | 2 | 2 | 0 | **60 байт** |
+| только netdev | `ihl4` | 1 | **1** | 2 | 2 | 0 | **60 байт** |
+| только netdev | `trunc` | 1 | **1** | 2 | 2 | 0 | **60 байт** |
+| только inet | `badver` | **0** | 0 | 0 | 1 | 0 | нет кадра |
+| только inet | `ihl4` | **0** | 0 | 0 | 1 | 0 | нет кадра |
+| только inet | `trunc` | **0** | 0 | 0 | 0 | 1 | нет кадра |
+
+Читается так. `nft_set_pktinfo_ipv4_ingress()` при `iph->version != 4` или
+`ihl < 5` идёт в `inhdr_error` (`__IP_INC_STATS(… INHDRERRORS)`), при
+`skb->len < iph->totlen` — в `INTRUNCATEDPKTS`, и в обоих случаях возвращает
+`-1`, а вызывающий возвращает `NF_DROP` **до** `nft_do_chain()`. Поэтому
+счётчик первой цепи netdev-двери равен нулю: inet-цепь стоит раньше по
+приоритету и роняет кадр, а он один на оба семейства. Убрать таблицу
+inet-двери — и та же цепь netdev считает 1, применяет `(8,1)` и кадр уходит на
+дальнюю сторону. Побочное: у `trunc` на ingress счётчик — `InTruncatedPkts`, а
+не `InHdrErrors`; у `ip_rcv` на том же кадре — наоборот, потому что `ip_rcv`
+проверяет чек-сумму заголовка раньше длины (в обоих случаях +2 = две копии:
+подъём на `br0` и копия, пришедшая на `r0`).
+
+**Практическое следствие для прибора:** один и тот же кадр описывается
+по-разному в зависимости от того, есть ли в системе *другая* таблица другого
+семейства на том же устройстве. Счётчик цепи — не свойство цепи.
+
+## 6. Провод: что видно после коробки
+
+| плечо | изменения на дальнем тапе | длина кадра |
+|---|---|---|
+| `td/ndg/p/t2_2` (порт) | `36:13>90, 37:88>91` | 60 |
+| `td/ieg/p/t2_2` | `36:13>90, 37:88>91` | 60 |
+| `td/ipp/p/t2_2`, `td/inp/p/t2_2` | **ничего** | 60 |
+| `gd/ndg/p/l12_4` (ethertype) | `12:08>90, 13:00>91, 14:45>92, 15:00>93` | 60 |
+| `gd/ieg/w/l16_2` (метка снята) | `12:08>90, 13:00>91` | 60 |
+| `gd/ndg/w/l12_2` (vlan_proto = 0x9091) | 32 байта, всё сдвинуто | **60 → 64** |
+
+Первые три строки — это разные skb: запись на prerouting ложится на копию,
+поднятую на `br0`, а форварднутый кадр — другой (F36), поэтому на проводе
+ничего не меняется; запись на ingress — на тот самый skb, который потом
+мостуется, поэтому видна. Пятая строка — метка в метаданных: запись `(12,2)`
+ставит `skb->vlan_proto = 0x9091`, `vlan_hw_offload_capable()` такого протокола
+не знает, и `validate_xmit_vlan()` **вставляет метку в байты** на выходе — это
+механизм F37, увиденный с другой стороны (там ноль уезжал в байты, здесь —
+чужой TPID, и кадр становится на 4 байта длиннее).
+
+## 7. Что не измерено, прямо
+
+IPv6 на всех четырёх дверях (`nft_set_pktinfo_ipv6*` — три другие функции);
+`inet`-дверь с `0x86dd`; семейство `arp` и `bridge` в этом приборе (F32–F40);
+`@ih`/`@ll` на PPPoE; GSO/`CHECKSUM_PARTIAL`; несколько устройств в
+netdev-цепочке (`NFTA_HOOK_DEVS`); порядок равных приоритетов (я его обошёл,
+задав разные); `pf = NFPROTO_INET` в `state->pf` на layer-3 хуках (там `nf_hook`
+подставляет вызывающий pf, и это прочитано, а не измерено); поведение при
+`policy drop` на ingress-двери.
+
+## 8. Ошибки хода, все мои
+
+1. **`ndg` повесил на хук 1.** `NF_NETDEV_INGRESS = 0`, `NF_NETDEV_EGRESS = 1`;
+   цепь стояла на egress и не считала ничего. Поймал диагностический прогон
+   (`F566 DIAG`), до первого числа в отчёте.
+2. **P3 опровергнут:** я записал «802.1Q vid 100 на layer-3 дверях = как голый
+   кадр». Измерено: проходов 0 — кадр с ненулевым vid без vlan-устройства не
+   доходит до `ip_rcv` (это F36, и я сам его цитировал ходом раньше). Добавил
+   конверт `w0` (vid 0) — вот он доходит и ведёт себя как голый (8/8).
+3. **P17 неверен по числу:** предсказал 6/20 для `@nh` на inet-двери, измерено
+   **9/20**. Механизм тот же (`nft_nh_write_ok_ip4()`), ошибся я: в списке
+   живых клеток забыл ограничения на длину — `check` разрешает до 10 байт,
+   `saddr` до 8, `daddr` до 4, поэтому (10,4), (12,2), (16,2) тоже живы.
+4. **P20 был неверен в конфигурации «обе двери»:** «netdev-дверь применит
+   запись и кадр уйдёт» — верно только после удаления таблицы inet-двери.
+   Именно это расхождение и стало находкой §5.
+5. Верификатор читал заголовок для `meta`-модели по `ip_off + nhoff` вместо
+   `data + nhoff` — двойной сдвиг; 12 красных проверок на верных данных.
+6. Верификатор считал, что NFLOG-полезный груз начинается с кадра, а не с
+   `skb->data`: **все** `@ll`-записи «не сходились», хотя лежали там, где
+   надо (в мак-заголовке, до `data`).
+7. Модель `@ll` игнорировала запись «через границу» `data`: `(12,4)` на голом
+   кадре пишет 4 байта с `data-2`, и два из них попадают в полезный груз.
+8. Модель дальнего тапа держала метку в байтах — а её там нет (F37), и,
+   наоборот, считала метаданные невидимыми — а `vlan_proto = 0x9091` их
+   возвращает в байты.
+9. `nohup`-запуск полной батареи сначала не создал выходной файл; перезапущен.
+
+## 9. Чем проверено
+
+| | |
+|---|---|
+| `tools/verify566.py` | **1692 проверки, 0 расхождений** — провенанс (sha ядра, initrd из списка прогона, differ **извлечённый из initramfs** и сверенный побайтово с собранным), 23 якоря исходника, все 348 плеч в каждой загрузке, число проходов на каждую дверь/конверт, вердикт четырёх стражей пересчитан на Python из байтов кадра, **байт каждой принятой записи** сверен с NFLOG-грузом, отказ = «нет сообщения второго лога», дальний тап (точные смещения и значения), NFULA_L2HDR, сокет-оракул 5001, три прохода `md`, детерминизм, 0 splat |
+| `tools/verify566_selftest.sh` | **18 мутаций**, каждая краснит свою проверку; базовая линия зелёная; крэш верификатора не считается пойманной мутацией |
+| `tools/audit_f44_doc.py` | таблицы §2–§6 сверены с `summary.json`, три одиночные подмены в копии документа дают по расхождению |
+| коллекция | перегенерирована; `verify_collection` и `--exec` — 0 расхождений |
+| регрессия | verify565 884, verify564 895, verify563 1179, verify562 2332, verify561 1937, verify560 628, verify559 765, verify558 350, verify557 115 |
+
+2 засчитанные загрузки (rep1, rep2 — один initrd, 348 строк `F566 A` каждая),
+8 дымовых загрузок (diag дважды, md дважды, td, dp и полный прогон прибора) —
+дымовые в отчёт не входят и оставлены на диске как есть. Ядер не собирал. Память не затронута:
+0 строк `KASAN/BUG:/Oops/WARNING:`. **Не регрессия**: F44 ничего не меняет в
+ядре, это измерение существующего дерева. **Не уязвимость**: правило ставит
+root в начальном user ns; следствия — запись в чужое поле, отказ по причине,
+не связанной с полем, и кадр, молча потерянный чужой цепочкой другого семейства
+на том же хуке.
+
+Артефакты: `art_bed6c5fb430d` (SUMMARY), `art_874179df3ee3` (summary.json),
+`art_088ffda3b895` (verify566.py), `art_aaf2189945ca` (differ566),
+`art_d301b05bfa47` (logs/f44_rep1.log), `art_539ec541344d` (logs/f44_verify.txt).
+Файлы: `findings/F44-ingress-two-doors/{SUMMARY.md, summary.json, VERIFY_REPORT.md, LETTER_SECTION_F44.txt}`;
+`vm/{differ566_add.c, build_f44_differ.sh, make_initramfs566.sh, build/differ566}`;
+`tools/{f44_run.sh, verify566.py, verify566_selftest.sh, f566_mutate.py, f44_summary.py, audit_f44_doc.py}`;
+`research/predictions_566.md`; логи `logs/f44_{rep1,rep2}.log` и пять дымовых.
+
+Письма не тронуты: материал этого хода — отдельный `LETTER_SECTION_F44.txt`,
+**NOT SENT**, как F29+F30, F31, F32, F36–F43. Отправка твоя.
+
+**Дальше пойду сам так:** у четырёх дверей теперь измерен `@th`; следующий
+вход той же природы — транспортная база в `inet`-двери на IPv6 (`ipv6_find_hdr`
+считает `thoff` от `data`, а `nft_set_pktinfo_ipv6_ingress()` — тоже
+относительно), и это единственное место, где `thoff` строит не `ihl*4`, а
+разбор цепочки заголовков; заодно проверю, роняет ли IPv6-ingress-дверь кадр
+так же, как IPv4-дверь, — и роняет ли она кадр **чужого** семейства.
+
+
+===== summary.json =====
+{
+ "answer_short": "Four pktinfo constructors, one coordinate: every accepted @th store at all four doors (ip L3, inet L3, netdev ingress, inet ingress) lands on data+ihl*4+off, and the rows where nothing is accepted are rows where the hook never ran (counter 0), not guard refusals. The real difference between the doors is the guard: nft_in_ingress() and nft_nh_write_ok() read pkt->state->pf, and nft_do_chain_inet_ingress() rewrites it to NFPROTO_IPV4 before any rule runs, so the same frame at the same hook gets @ll 12/12 vs 7/12 and @nh 20/20 vs 9/20 (the ip4 whitelist). And the two ingress doors share one per-device hook list: the inet handler validates and returns NF_DROP before nft_do_chain(), so a malformed IPv4 frame is dropped before any netdev chain on the same device can count it (counter 0 with the inet table present, 1 with it deleted), with InHdrErrors raised by a hook that ran no rule.",
+ "arms_per_boot": 348,
+ "boots": 2,
+ "doors": {
+  "ieg": {
+   "data_offset": {
+    "p": 46,
+    "ps": 0,
+    "q": 0,
+    "w": 46,
+    "w0": 46
+   },
+   "door": "ieg",
+   "l2hdr": {
+    "p": 0,
+    "ps": 0,
+    "q": 0,
+    "w": 0,
+    "w0": 0
+   },
+   "passes": {
+    "p": 1,
+    "ps": 0,
+    "q": 0,
+    "w": 1,
+    "w0": 1
+   }
+  },
+  "inp": {
+   "data_offset": {
+    "p": 46,
+    "ps": 46,
+    "q": 0,
+    "w": 0,
+    "w0": 46
+   },
+   "door": "inp",
+   "l2hdr": {
+    "p": 0,
+    "ps": 0,
+    "q": 0,
+    "w": 0,
+    "w0": 0
+   },
+   "passes": {
+    "p": 2,
+    "ps": 1,
+    "q": 0,
+    "w": 0,
+    "w0": 2
+   }
+  },
+  "ipp": {
+   "data_offset": {
+    "p": 46,
+    "ps": 46,
+    "q": 0,
+    "w": 0,
+    "w0": 46
+   },
+   "door": "ipp",
+   "l2hdr": {
+    "p": 0,
+    "ps": 0,
+    "q": 0,
+    "w": 0,
+    "w0": 0
+   },
+   "passes": {
+    "p": 2,
+    "ps": 1,
+    "q": 0,
+    "w": 0,
+    "w0": 2
+   }
+  },
+  "ndg": {
+   "data_offset": {
+    "p": 46,
+    "ps": 54,
+    "q": 50,
+    "w": 46,
+    "w0": 46
+   },
+   "door": "ndg",
+   "l2hdr": {
+    "p": 14,
+    "ps": 14,
+    "q": 14,
+    "w": 14,
+    "w0": 14
+   },
+   "passes": {
+    "p": 1,
+    "ps": 1,
+    "q": 1,
+    "w": 1,
+    "w0": 1
+   }
+  }
+ },
+ "dp": [
+  {
+   "door": "ipp",
+   "env": "p",
+   "livep": 2,
+   "lives": 2,
+   "u5000": 0,
+   "u5001": 2
+  },
+  {
+   "door": "ipp",
+   "env": "ps",
+   "livep": 1,
+   "lives": 1,
+   "u5000": 0,
+   "u5001": 1
+  },
+  {
+   "door": "inp",
+   "env": "p",
+   "livep": 2,
+   "lives": 2,
+   "u5000": 0,
+   "u5001": 2
+  },
+  {
+   "door": "inp",
+   "env": "ps",
+   "livep": 1,
+   "lives": 1,
+   "u5000": 0,
+   "u5001": 1
+  },
+  {
+   "door": "ndg",
+   "env": "p",
+   "livep": 1,
+   "lives": 1,
+   "u5000": 0,
+   "u5001": 2
+  },
+  {
+   "door": "ndg",
+   "env": "ps",
+   "livep": 1,
+   "lives": 0,
+   "u5000": 1,
+   "u5001": 0
+  },
+  {
+   "door": "ieg",
+   "env": "p",
+   "livep": 1,
+   "lives": 1,
+   "u5000": 0,
+   "u5001": 2
+  },
+  {
+   "door": "ieg",
+   "env": "ps",
+   "livep": 0,
+   "lives": 0,
+   "u5000": 1,
+   "u5001": 0
+  }
+ ],
+ "far": [
+  {
+   "arm": "t2_2",
+   "door": "ndg",
+   "env": "p",
+   "rchg": 2,
+   "rchgs": "36:13>90,37:88>91",
+   "rhex_len": 60,
+   "sec": "td"
+  },
+  {
+   "arm": "t2_2",
+   "door": "ieg",
+   "env": "p",
+   "rchg": 2,
+   "rchgs": "36:13>90,37:88>91",
+   "rhex_len": 60,
+   "sec": "td"
+  },
+  {
+   "arm": "t2_2",
+   "door": "ipp",
+   "env": "p",
+   "rchg": 0,
+   "rchgs": "-",
+   "rhex_len": 60,
+   "sec": "td"
+  },
+  {
+   "arm": "t2_2",
+   "door": "inp",
+   "env": "p",
+   "rchg": 0,
+   "rchgs": "-",
+   "rhex_len": 60,
+   "sec": "td"
+  },
+  {
+   "arm": "l12_4",
+   "door": "ndg",
+   "env": "p",
+   "rchg": 4,
+   "rchgs": "12:08>90,13:00>91,14:45>92,15:00>93",
+   "rhex_len": 60,
+   "sec": "gd"
+  },
+  {
+   "arm": "l16_2",
+   "door": "ieg",
+   "env": "w",
+   "rchg": 2,
+   "rchgs": "12:08>90,13:00>91",
+   "rhex_len": 60,
+   "sec": "gd"
+  },
+  {
+   "arm": "l12_2",
+   "door": "ndg",
+   "env": "w",
+   "rchg": 32,
+   "rchgs": "12:08>90,13:00>91,14:45>00,15:00>64,16:00>08,17:2e>00,18:12>45,19:34>00,21:00>2e,22:40>12,23:11>34,24:54>00,25:7a>00,26:0a>40,27:01>11,28:00>54,29:01>7a,31:09>01,33:07>01,34:9c>0a,35:40>09,36:13>00,37:88>07,38:00>9c,39:1a>40,40:00>13,41:00>88,42:77>00,43:77>1a,44:77>00,45:77>00,len:60>64",
+   "rhex_len": 64,
+   "sec": "gd"
+  }
+ ],
+ "frames": {
+  "badver": {
+   "csum": 0,
+   "dport": 5000,
+   "ethtype": "0x0800",
+   "ihl": 20,
+   "ip_off": 14,
+   "l4_off": 34,
+   "len": 60,
+   "ntags": 0,
+   "pppoe": false,
+   "sport": 40000,
+   "ver_ihl": "0x65"
+  },
+  "ihl4": {
+   "csum": 5000,
+   "dport": 7,
+   "ethtype": "0x0800",
+   "ihl": 16,
+   "ip_off": 14,
+   "l4_off": 30,
+   "len": 60,
+   "ntags": 0,
+   "pppoe": false,
+   "sport": 2569,
+   "ver_ihl": "0x44"
+  },
+  "p": {
+   "csum": 0,
+   "dport": 5000,
+   "ethtype": "0x0800",
+   "ihl": 20,
+   "ip_off": 14,
+   "l4_off": 34,
+   "len": 60,
+   "ntags": 0,
+   "pppoe": false,
+   "sport": 40000,
+   "ver_ihl": "0x45"
+  },
+  "ps": {
+   "csum": 0,
+   "dport": 5000,
+   "ethtype": "0x8864",
+   "ihl": 20,
+   "ip_off": 22,
+   "l4_off": 42,
+   "len": 68,
+   "ntags": 0,
+   "pppoe": true,
+   "sport": 40000,
+   "ver_ihl": "0x45"
+  },
+  "q": {
+   "csum": 0,
+   "dport": 5000,
+   "ethtype": "0x88a8",
+   "ihl": 20,
+   "ip_off": 22,
+   "l4_off": 42,
+   "len": 68,
+   "ntags": 2,
+   "pppoe": false,
+   "sport": 40000,
+   "ver_ihl": "0x45"
+  },
+  "trunc": {
+   "csum": 0,
+   "dport": 5000,
+   "ethtype": "0x0800",
+   "ihl": 20,
+   "ip_off": 14,
+   "l4_off": 34,
+   "len": 60,
+   "ntags": 0,
+   "pppoe": false,
+   "sport": 40000,
+   "ver_ihl": "0x45"
+  },
+  "w": {
+   "csum": 0,
+   "dport": 5000,
+   "ethtype": "0x8100",
+   "ihl": 20,
+   "ip_off": 18,
+   "l4_off": 38,
+   "len": 64,
+   "ntags": 1,
+   "pppoe": false,
+   "sport": 40000,
+   "ver_ihl": "0x45"
+  },
+  "w0": {
+   "csum": 0,
+   "dport": 5000,
+   "ethtype": "0x8100",
+   "ihl": 20,
+   "ip_off": 18,
+   "l4_off": 38,
+   "len": 64,
+   "ntags": 1,
+   "pppoe": false,
+   "sport": 40000,
+   "ver_ihl": "0x45"
+  }
+ },
+ "gd": [
+  {
+   "door": "ndg",
+   "env": "p",
+   "live": [
+    [
+     0,
+     2
+    ],
+    [
+     0,
+     4
+    ],
+    [
+     6,
+     2
+    ],
+    [
+     8,
+     1
+    ],
+    [
+     10,
+     2
+    ],
+    [
+     12,
+     2
+    ],
+    [
+     12,
+     4
+    ],
+    [
+     13,
+     1
+    ],
+    [
+     14,
+     2
+    ],
+    [
+     16,
+     2
+    ],
+    [
+     20,
+     4
+    ],
+    [
+     24,
+     4
+    ]
+   ],
+   "n_live": 12,
+   "n_refused": 0,
+   "refused": []
+  },
+  {
+   "door": "ndg",
+   "env": "w",
+   "live": [
+    [
+     0,
+     2
+    ],
+    [
+     0,
+     4
+    ],
+    [
+     6,
+     2
+    ],
+    [
+     8,
+     1
+    ],
+    [
+     10,
+     2
+    ],
+    [
+     12,
+     2
+    ],
+    [
+     12,
+     4
+    ],
+    [
+     14,
+     2
+    ],
+    [
+     16,
+     2
+    ],
+    [
+     20,
+     4
+    ],
+    [
+     24,
+     4
+    ]
+   ],
+   "n_live": 11,
+   "n_refused": 1,
+   "refused": [
+    [
+     13,
+     1
+    ]
+   ]
+  },
+  {
+   "door": "ieg",
+   "env": "p",
+   "live": [
+    [
+     0,
+     2
+    ],
+    [
+     0,
+     4
+    ],
+    [
+     6,
+     2
+    ],
+    [
+     8,
+     1
+    ],
+    [
+     10,
+     2
+    ],
+    [
+     12,
+     2
+    ],
+    [
+     13,
+     1
+    ]
+   ],
+   "n_live": 7,
+   "n_refused": 5,
+   "refused": [
+    [
+     12,
+     4
+    ],
+    [
+     14,
+     2
+    ],
+    [
+     16,
+     2
+    ],
+    [
+     20,
+     4
+    ],
+    [
+     24,
+     4
+    ]
+   ]
+  },
+  {
+   "door": "ieg",
+   "env": "w",
+   "live": [
+    [
+     0,
+     2
+    ],
+    [
+     0,
+     4
+    ],
+    [
+     6,
+     2
+    ],
+    [
+     8,
+     1
+    ],
+    [
+     10,
+     2
+    ],
+    [
+     12,
+     2
+    ],
+    [
+     12,
+     4
+    ],
+    [
+     14,
+     2
+    ],
+    [
+     16,
+     2
+    ]
+   ],
+   "n_live": 9,
+   "n_refused": 3,
+   "refused": [
+    [
+     13,
+     1
+    ],
+    [
+     20,
+     4
+    ],
+    [
+     24,
+     4
+    ]
+   ]
+  }
+ ],
+ "gn": [
+  {
+   "door": "ndg",
+   "env": "p",
+   "live": [
+    [
+     0,
+     1
+    ],
+    [
+     0,
+     2
+    ],
+    [
+     0,
+     4
+    ],
+    [
+     1,
+     1
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     4,
+     2
+    ],
+    [
+     4,
+     4
+    ],
+    [
+     6,
+     2
+    ],
+    [
+     6,
+     4
+    ],
+    [
+     8,
+     1
+    ],
+    [
+     8,
+     2
+    ],
+    [
+     10,
+     2
+    ],
+    [
+     10,
+     4
+    ],
+    [
+     12,
+     2
+    ],
+    [
+     12,
+     4
+    ],
+    [
+     16,
+     2
+    ],
+    [
+     16,
+     4
+    ],
+    [
+     18,
+     2
+    ],
+    [
+     20,
+     2
+    ],
+    [
+     20,
+     4
+    ]
+   ],
+   "n_live": 20,
+   "n_refused": 0,
+   "refused": []
+  },
+  {
+   "door": "ieg",
+   "env": "p",
+   "live": [
+    [
+     1,
+     1
+    ],
+    [
+     4,
+     2
+    ],
+    [
+     8,
+     1
+    ],
+    [
+     10,
+     2
+    ],
+    [
+     10,
+     4
+    ],
+    [
+     12,
+     2
+    ],
+    [
+     12,
+     4
+    ],
+    [
+     16,
+     2
+    ],
+    [
+     16,
+     4
+    ]
+   ],
+   "n_live": 9,
+   "n_refused": 11,
+   "refused": [
+    [
+     0,
+     1
+    ],
+    [
+     0,
+     2
+    ],
+    [
+     0,
+     4
+    ],
+    [
+     2,
+     2
+    ],
+    [
+     4,
+     4
+    ],
+    [
+     6,
+     2
+    ],
+    [
+     6,
+     4
+    ],
+    [
+     8,
+     2
+    ],
+    [
+     18,
+     2
+    ],
+    [
+     20,
+     2
+    ],
+    [
+     20,
+     4
+    ]
+   ]
+  }
+ ],
+ "id": "F44",
+ "kernels": [
+  "7.3.4-T563"
+ ],
+ "md": [
+  {
+   "env": "badver",
+   "ihdr": 1,
+   "ipin": 0,
+   "itrun": 0,
+   "livep": 0,
+   "lives": 0,
+   "rn": -1,
+   "sec": "md_both"
+  },
+  {
+   "env": "ihl4",
+   "ihdr": 1,
+   "ipin": 0,
+   "itrun": 0,
+   "livep": 0,
+   "lives": 0,
+   "rn": -1,
+   "sec": "md_both"
+  },
+  {
+   "env": "trunc",
+   "ihdr": 0,
+   "ipin": 0,
+   "itrun": 1,
+   "livep": 0,
+   "lives": 0,
+   "rn": -1,
+   "sec": "md_both"
+  },
+  {
+   "env": "badver",
+   "ihdr": 2,
+   "ipin": 2,
+   "itrun": 0,
+   "livep": 1,
+   "lives": 1,
+   "rn": 60,
+   "sec": "md_ndg"
+  },
+  {
+   "env": "ihl4",
+   "ihdr": 2,
+   "ipin": 2,
+   "itrun": 0,
+   "livep": 1,
+   "lives": 1,
+   "rn": 60,
+   "sec": "md_ndg"
+  },
+  {
+   "env": "trunc",
+   "ihdr": 2,
+   "ipin": 2,
+   "itrun": 0,
+   "livep": 1,
+   "lives": 1,
+   "rn": 60,
+   "sec": "md_ndg"
+  },
+  {
+   "env": "badver",
+   "ihdr": 1,
+   "ipin": 0,
+   "itrun": 0,
+   "livep": 0,
+   "lives": 0,
+   "rn": -1,
+   "sec": "md_ieg"
+  },
+  {
+   "env": "ihl4",
+   "ihdr": 1,
+   "ipin": 0,
+   "itrun": 0,
+   "livep": 0,
+   "lives": 0,
+   "rn": -1,
+   "sec": "md_ieg"
+  },
+  {
+   "env": "trunc",
+   "ihdr": 0,
+   "ipin": 0,
+   "itrun": 1,
+   "livep": 0,
+   "lives": 0,
+   "rn": -1,
+   "sec": "md_ieg"
+  }
+ ],
+ "provenance": {
+  "arms_rep1": 348,
+  "arms_rep2": 348,
+  "deterministic": true,
+  "differ_sha256": "9e2f3042879cadccd16b382e83b557efafc944fbe37a88dae37a8d7024809828",
+  "initrd_sha256": "00a15c7d8f66d62267189292540d4eec8b4ab25f2f6295a08a3fd3b3b38847d0",
+  "kernel_line": "Linux version 7.3.4 (root@5b7045e3d7d7) (gcc (Debian 14.2.0-19) 14.2.0, GNU ld (GNU Binutils for Debian) 2.44) #7 SMP PREEMPT_DYNAMIC Sun Nov 15 20:20:28 UTC 2026",
+  "kernel_sha256": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+  "splat": false
+ },
+ "question": "@th in the two pktinfo constructors F43 never measured (inet layer-3 and the two ingress doors), and what the guard does when the handler rewrites state->pf",
+ "rf": [
+  {
+   "door": "ipp",
+   "reads": {
+    "r0_2": 2,
+    "r2_2": 2,
+    "r6_2": 2
+   }
+  },
+  {
+   "door": "inp",
+   "reads": {
+    "r0_2": 2,
+    "r2_2": 2,
+    "r6_2": 2
+   }
+  },
+  {
+   "door": "ndg",
+   "reads": {
+    "r0_2": 1,
+    "r2_2": 1,
+    "r6_2": 1
+   }
+  },
+  {
+   "door": "ieg",
+   "reads": {
+    "r0_2": 1,
+    "r2_2": 1,
+    "r6_2": 1
+   }
+  }
+ ],
+ "td": [
+  {
+   "cells": {
+    "t0_2": {
+     "at": 20,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 0
+    },
+    "t0_4": {
+     "at": 20,
+     "imm": "90919293",
+     "len": 4,
+     "live": 2,
+     "off": 0
+    },
+    "t12_4": {
+     "at": 32,
+     "imm": "90919293",
+     "len": 4,
+     "live": 2,
+     "off": 12
+    },
+    "t16_2": {
+     "at": 36,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 16
+    },
+    "t2_2": {
+     "at": 22,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 2
+    },
+    "t4_2": {
+     "at": 24,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 4
+    },
+    "t6_2": {
+     "at": 26,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 6
+    },
+    "t8_2": {
+     "at": 28,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 8
+    }
+   },
+   "door": "ipp",
+   "env": "p",
+   "ipin": 2,
+   "l2": 0,
+   "log_post": 2,
+   "log_pre": 2,
+   "passes": 2,
+   "payload_len": 46,
+   "rn": 60,
+   "store_live": 8,
+   "store_refused": 0,
+   "u5000": 2
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 0
+    },
+    "t0_4": {
+     "at": -1,
+     "imm": "90919293",
+     "len": 4,
+     "live": 0,
+     "off": 0
+    },
+    "t12_4": {
+     "at": -1,
+     "imm": "90919293",
+     "len": 4,
+     "live": 0,
+     "off": 12
+    },
+    "t16_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 16
+    },
+    "t2_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 2
+    },
+    "t4_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 4
+    },
+    "t6_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 6
+    },
+    "t8_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 8
+    }
+   },
+   "door": "ipp",
+   "env": "w",
+   "ipin": 0,
+   "l2": 0,
+   "log_post": 0,
+   "log_pre": 0,
+   "passes": 0,
+   "payload_len": 0,
+   "rn": 60,
+   "store_live": 0,
+   "store_refused": 8,
+   "u5000": 0
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": 20,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 0
+    },
+    "t0_4": {
+     "at": 20,
+     "imm": "90919293",
+     "len": 4,
+     "live": 2,
+     "off": 0
+    },
+    "t12_4": {
+     "at": 32,
+     "imm": "90919293",
+     "len": 4,
+     "live": 2,
+     "off": 12
+    },
+    "t16_2": {
+     "at": 36,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 16
+    },
+    "t2_2": {
+     "at": 22,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 2
+    },
+    "t4_2": {
+     "at": 24,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 4
+    },
+    "t6_2": {
+     "at": 26,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 6
+    },
+    "t8_2": {
+     "at": 28,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 8
+    }
+   },
+   "door": "ipp",
+   "env": "w0",
+   "ipin": 2,
+   "l2": 0,
+   "log_post": 2,
+   "log_pre": 2,
+   "passes": 2,
+   "payload_len": 46,
+   "rn": 60,
+   "store_live": 8,
+   "store_refused": 0,
+   "u5000": 2
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 0
+    },
+    "t0_4": {
+     "at": -1,
+     "imm": "90919293",
+     "len": 4,
+     "live": 0,
+     "off": 0
+    },
+    "t12_4": {
+     "at": -1,
+     "imm": "90919293",
+     "len": 4,
+     "live": 0,
+     "off": 12
+    },
+    "t16_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 16
+    },
+    "t2_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 2
+    },
+    "t4_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 4
+    },
+    "t6_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 6
+    },
+    "t8_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 8
+    }
+   },
+   "door": "ipp",
+   "env": "q",
+   "ipin": 0,
+   "l2": 0,
+   "log_post": 0,
+   "log_pre": 0,
+   "passes": 0,
+   "payload_len": 0,
+   "rn": 64,
+   "store_live": 0,
+   "store_refused": 8,
+   "u5000": 0
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": 20,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 0
+    },
+    "t0_4": {
+     "at": 20,
+     "imm": "90919293",
+     "len": 4,
+     "live": 1,
+     "off": 0
+    },
+    "t12_4": {
+     "at": 32,
+     "imm": "90919293",
+     "len": 4,
+     "live": 1,
+     "off": 12
+    },
+    "t16_2": {
+     "at": 36,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 16
+    },
+    "t2_2": {
+     "at": 22,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 2
+    },
+    "t4_2": {
+     "at": 24,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 4
+    },
+    "t6_2": {
+     "at": 26,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 6
+    },
+    "t8_2": {
+     "at": 28,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 8
+    }
+   },
+   "door": "ipp",
+   "env": "ps",
+   "ipin": 1,
+   "l2": 0,
+   "log_post": 1,
+   "log_pre": 1,
+   "passes": 1,
+   "payload_len": 46,
+   "rn": 68,
+   "store_live": 8,
+   "store_refused": 0,
+   "u5000": 1
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": 20,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 0
+    },
+    "t0_4": {
+     "at": 20,
+     "imm": "90919293",
+     "len": 4,
+     "live": 2,
+     "off": 0
+    },
+    "t12_4": {
+     "at": 32,
+     "imm": "90919293",
+     "len": 4,
+     "live": 2,
+     "off": 12
+    },
+    "t16_2": {
+     "at": 36,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 16
+    },
+    "t2_2": {
+     "at": 22,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 2
+    },
+    "t4_2": {
+     "at": 24,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 4
+    },
+    "t6_2": {
+     "at": 26,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 6
+    },
+    "t8_2": {
+     "at": 28,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 8
+    }
+   },
+   "door": "inp",
+   "env": "p",
+   "ipin": 2,
+   "l2": 0,
+   "log_post": 2,
+   "log_pre": 2,
+   "passes": 2,
+   "payload_len": 46,
+   "rn": 60,
+   "store_live": 8,
+   "store_refused": 0,
+   "u5000": 2
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 0
+    },
+    "t0_4": {
+     "at": -1,
+     "imm": "90919293",
+     "len": 4,
+     "live": 0,
+     "off": 0
+    },
+    "t12_4": {
+     "at": -1,
+     "imm": "90919293",
+     "len": 4,
+     "live": 0,
+     "off": 12
+    },
+    "t16_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 16
+    },
+    "t2_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 2
+    },
+    "t4_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 4
+    },
+    "t6_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 6
+    },
+    "t8_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 8
+    }
+   },
+   "door": "inp",
+   "env": "w",
+   "ipin": 0,
+   "l2": 0,
+   "log_post": 0,
+   "log_pre": 0,
+   "passes": 0,
+   "payload_len": 0,
+   "rn": 60,
+   "store_live": 0,
+   "store_refused": 8,
+   "u5000": 0
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": 20,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 0
+    },
+    "t0_4": {
+     "at": 20,
+     "imm": "90919293",
+     "len": 4,
+     "live": 2,
+     "off": 0
+    },
+    "t12_4": {
+     "at": 32,
+     "imm": "90919293",
+     "len": 4,
+     "live": 2,
+     "off": 12
+    },
+    "t16_2": {
+     "at": 36,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 16
+    },
+    "t2_2": {
+     "at": 22,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 2
+    },
+    "t4_2": {
+     "at": 24,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 4
+    },
+    "t6_2": {
+     "at": 26,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 6
+    },
+    "t8_2": {
+     "at": 28,
+     "imm": "9091",
+     "len": 2,
+     "live": 2,
+     "off": 8
+    }
+   },
+   "door": "inp",
+   "env": "w0",
+   "ipin": 2,
+   "l2": 0,
+   "log_post": 2,
+   "log_pre": 2,
+   "passes": 2,
+   "payload_len": 46,
+   "rn": 60,
+   "store_live": 8,
+   "store_refused": 0,
+   "u5000": 2
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 0
+    },
+    "t0_4": {
+     "at": -1,
+     "imm": "90919293",
+     "len": 4,
+     "live": 0,
+     "off": 0
+    },
+    "t12_4": {
+     "at": -1,
+     "imm": "90919293",
+     "len": 4,
+     "live": 0,
+     "off": 12
+    },
+    "t16_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 16
+    },
+    "t2_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 2
+    },
+    "t4_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 4
+    },
+    "t6_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 6
+    },
+    "t8_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 8
+    }
+   },
+   "door": "inp",
+   "env": "q",
+   "ipin": 0,
+   "l2": 0,
+   "log_post": 0,
+   "log_pre": 0,
+   "passes": 0,
+   "payload_len": 0,
+   "rn": 64,
+   "store_live": 0,
+   "store_refused": 8,
+   "u5000": 0
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": 20,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 0
+    },
+    "t0_4": {
+     "at": 20,
+     "imm": "90919293",
+     "len": 4,
+     "live": 1,
+     "off": 0
+    },
+    "t12_4": {
+     "at": 32,
+     "imm": "90919293",
+     "len": 4,
+     "live": 1,
+     "off": 12
+    },
+    "t16_2": {
+     "at": 36,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 16
+    },
+    "t2_2": {
+     "at": 22,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 2
+    },
+    "t4_2": {
+     "at": 24,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 4
+    },
+    "t6_2": {
+     "at": 26,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 6
+    },
+    "t8_2": {
+     "at": 28,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 8
+    }
+   },
+   "door": "inp",
+   "env": "ps",
+   "ipin": 1,
+   "l2": 0,
+   "log_post": 1,
+   "log_pre": 1,
+   "passes": 1,
+   "payload_len": 46,
+   "rn": 68,
+   "store_live": 8,
+   "store_refused": 0,
+   "u5000": 1
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": 20,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 0
+    },
+    "t0_4": {
+     "at": 20,
+     "imm": "90919293",
+     "len": 4,
+     "live": 1,
+     "off": 0
+    },
+    "t12_4": {
+     "at": 32,
+     "imm": "90919293",
+     "len": 4,
+     "live": 1,
+     "off": 12
+    },
+    "t16_2": {
+     "at": 36,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 16
+    },
+    "t2_2": {
+     "at": 22,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 2
+    },
+    "t4_2": {
+     "at": 24,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 4
+    },
+    "t6_2": {
+     "at": 26,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 6
+    },
+    "t8_2": {
+     "at": 28,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 8
+    }
+   },
+   "door": "ndg",
+   "env": "p",
+   "ipin": 2,
+   "l2": 14,
+   "log_post": 1,
+   "log_pre": 1,
+   "passes": 1,
+   "payload_len": 46,
+   "rn": 60,
+   "store_live": 8,
+   "store_refused": 0,
+   "u5000": 2
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": 20,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 0
+    },
+    "t0_4": {
+     "at": 20,
+     "imm": "90919293",
+     "len": 4,
+     "live": 1,
+     "off": 0
+    },
+    "t12_4": {
+     "at": 32,
+     "imm": "90919293",
+     "len": 4,
+     "live": 1,
+     "off": 12
+    },
+    "t16_2": {
+     "at": 36,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 16
+    },
+    "t2_2": {
+     "at": 22,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 2
+    },
+    "t4_2": {
+     "at": 24,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 4
+    },
+    "t6_2": {
+     "at": 26,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 6
+    },
+    "t8_2": {
+     "at": 28,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 8
+    }
+   },
+   "door": "ndg",
+   "env": "w",
+   "ipin": 0,
+   "l2": 14,
+   "log_post": 1,
+   "log_pre": 1,
+   "passes": 1,
+   "payload_len": 46,
+   "rn": 60,
+   "store_live": 8,
+   "store_refused": 0,
+   "u5000": 0
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": 20,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 0
+    },
+    "t0_4": {
+     "at": 20,
+     "imm": "90919293",
+     "len": 4,
+     "live": 1,
+     "off": 0
+    },
+    "t12_4": {
+     "at": 32,
+     "imm": "90919293",
+     "len": 4,
+     "live": 1,
+     "off": 12
+    },
+    "t16_2": {
+     "at": 36,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 16
+    },
+    "t2_2": {
+     "at": 22,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 2
+    },
+    "t4_2": {
+     "at": 24,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 4
+    },
+    "t6_2": {
+     "at": 26,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 6
+    },
+    "t8_2": {
+     "at": 28,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 8
+    }
+   },
+   "door": "ndg",
+   "env": "w0",
+   "ipin": 2,
+   "l2": 14,
+   "log_post": 1,
+   "log_pre": 1,
+   "passes": 1,
+   "payload_len": 46,
+   "rn": 60,
+   "store_live": 8,
+   "store_refused": 0,
+   "u5000": 2
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 0
+    },
+    "t0_4": {
+     "at": -1,
+     "imm": "90919293",
+     "len": 4,
+     "live": 0,
+     "off": 0
+    },
+    "t12_4": {
+     "at": -1,
+     "imm": "90919293",
+     "len": 4,
+     "live": 0,
+     "off": 12
+    },
+    "t16_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 16
+    },
+    "t2_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 2
+    },
+    "t4_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 4
+    },
+    "t6_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 6
+    },
+    "t8_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 8
+    }
+   },
+   "door": "ndg",
+   "env": "q",
+   "ipin": 0,
+   "l2": 14,
+   "log_post": 1,
+   "log_pre": 1,
+   "passes": 1,
+   "payload_len": 50,
+   "rn": 64,
+   "store_live": 0,
+   "store_refused": 8,
+   "u5000": 0
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 0
+    },
+    "t0_4": {
+     "at": -1,
+     "imm": "90919293",
+     "len": 4,
+     "live": 0,
+     "off": 0
+    },
+    "t12_4": {
+     "at": -1,
+     "imm": "90919293",
+     "len": 4,
+     "live": 0,
+     "off": 12
+    },
+    "t16_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 16
+    },
+    "t2_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 2
+    },
+    "t4_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 4
+    },
+    "t6_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 6
+    },
+    "t8_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 8
+    }
+   },
+   "door": "ndg",
+   "env": "ps",
+   "ipin": 1,
+   "l2": 14,
+   "log_post": 1,
+   "log_pre": 1,
+   "passes": 1,
+   "payload_len": 54,
+   "rn": 68,
+   "store_live": 0,
+   "store_refused": 8,
+   "u5000": 1
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": 20,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 0
+    },
+    "t0_4": {
+     "at": 20,
+     "imm": "90919293",
+     "len": 4,
+     "live": 1,
+     "off": 0
+    },
+    "t12_4": {
+     "at": 32,
+     "imm": "90919293",
+     "len": 4,
+     "live": 1,
+     "off": 12
+    },
+    "t16_2": {
+     "at": 36,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 16
+    },
+    "t2_2": {
+     "at": 22,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 2
+    },
+    "t4_2": {
+     "at": 24,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 4
+    },
+    "t6_2": {
+     "at": 26,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 6
+    },
+    "t8_2": {
+     "at": 28,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 8
+    }
+   },
+   "door": "ieg",
+   "env": "p",
+   "ipin": 2,
+   "l2": 0,
+   "log_post": 1,
+   "log_pre": 1,
+   "passes": 1,
+   "payload_len": 46,
+   "rn": 60,
+   "store_live": 8,
+   "store_refused": 0,
+   "u5000": 2
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": 20,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 0
+    },
+    "t0_4": {
+     "at": 20,
+     "imm": "90919293",
+     "len": 4,
+     "live": 1,
+     "off": 0
+    },
+    "t12_4": {
+     "at": 32,
+     "imm": "90919293",
+     "len": 4,
+     "live": 1,
+     "off": 12
+    },
+    "t16_2": {
+     "at": 36,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 16
+    },
+    "t2_2": {
+     "at": 22,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 2
+    },
+    "t4_2": {
+     "at": 24,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 4
+    },
+    "t6_2": {
+     "at": 26,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 6
+    },
+    "t8_2": {
+     "at": 28,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 8
+    }
+   },
+   "door": "ieg",
+   "env": "w",
+   "ipin": 0,
+   "l2": 0,
+   "log_post": 1,
+   "log_pre": 1,
+   "passes": 1,
+   "payload_len": 46,
+   "rn": 60,
+   "store_live": 8,
+   "store_refused": 0,
+   "u5000": 0
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": 20,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 0
+    },
+    "t0_4": {
+     "at": 20,
+     "imm": "90919293",
+     "len": 4,
+     "live": 1,
+     "off": 0
+    },
+    "t12_4": {
+     "at": 32,
+     "imm": "90919293",
+     "len": 4,
+     "live": 1,
+     "off": 12
+    },
+    "t16_2": {
+     "at": 36,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 16
+    },
+    "t2_2": {
+     "at": 22,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 2
+    },
+    "t4_2": {
+     "at": 24,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 4
+    },
+    "t6_2": {
+     "at": 26,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 6
+    },
+    "t8_2": {
+     "at": 28,
+     "imm": "9091",
+     "len": 2,
+     "live": 1,
+     "off": 8
+    }
+   },
+   "door": "ieg",
+   "env": "w0",
+   "ipin": 2,
+   "l2": 0,
+   "log_post": 1,
+   "log_pre": 1,
+   "passes": 1,
+   "payload_len": 46,
+   "rn": 60,
+   "store_live": 8,
+   "store_refused": 0,
+   "u5000": 2
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 0
+    },
+    "t0_4": {
+     "at": -1,
+     "imm": "90919293",
+     "len": 4,
+     "live": 0,
+     "off": 0
+    },
+    "t12_4": {
+     "at": -1,
+     "imm": "90919293",
+     "len": 4,
+     "live": 0,
+     "off": 12
+    },
+    "t16_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 16
+    },
+    "t2_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 2
+    },
+    "t4_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 4
+    },
+    "t6_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 6
+    },
+    "t8_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 8
+    }
+   },
+   "door": "ieg",
+   "env": "q",
+   "ipin": 0,
+   "l2": 0,
+   "log_post": 0,
+   "log_pre": 0,
+   "passes": 0,
+   "payload_len": 0,
+   "rn": 64,
+   "store_live": 0,
+   "store_refused": 8,
+   "u5000": 0
+  },
+  {
+   "cells": {
+    "t0_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 0
+    },
+    "t0_4": {
+     "at": -1,
+     "imm": "90919293",
+     "len": 4,
+     "live": 0,
+     "off": 0
+    },
+    "t12_4": {
+     "at": -1,
+     "imm": "90919293",
+     "len": 4,
+     "live": 0,
+     "off": 12
+    },
+    "t16_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 16
+    },
+    "t2_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 2
+    },
+    "t4_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 4
+    },
+    "t6_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 6
+    },
+    "t8_2": {
+     "at": -1,
+     "imm": "9091",
+     "len": 2,
+     "live": 0,
+     "off": 8
+    }
+   },
+   "door": "ieg",
+   "env": "ps",
+   "ipin": 1,
+   "l2": 0,
+   "log_post": 0,
+   "log_pre": 0,
+   "passes": 0,
+   "payload_len": 0,
+   "rn": 68,
+   "store_live": 0,
+   "store_refused": 8,
+   "u5000": 1
+  }
+ ],
+ "tm": [
+  {
+   "at": 24,
+   "door": "ndg",
+   "env": "q",
+   "passes": 1,
+   "store_live": 8
+  },
+  {
+   "at": 28,
+   "door": "ndg",
+   "env": "ps",
+   "passes": 1,
+   "store_live": 8
+  },
+  {
+   "at": -1,
+   "door": "ieg",
+   "env": "q",
+   "passes": 0,
+   "store_live": 0
+  },
+  {
+   "at": -1,
+   "door": "ieg",
+   "env": "ps",
+   "passes": 0,
+   "store_live": 0
+  }
+ ],
+ "turn": 566
+}

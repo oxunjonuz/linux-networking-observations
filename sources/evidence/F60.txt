@@ -1,0 +1,521 @@
+===== LETTER_SECTION_F60.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload: a static transport-store check is enforced at runtime,
+ and 14 nft spellings die silently (`tcp flags set` regressed in v7.3)
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+References: <the same Message-Id>
+
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+Theme: on a packet whose L4 checksum the stack has left for the device to
+compute, the checksum field is not a checksum, and the fixup that a payload rule
+asks for is skipped -- by the same clause that makes the receiver skip
+verification.  All numbers below are measured on 7.3.4 over two boots, 54 arms,
+one rule per arm, in one topology with two provenances of the same frame: a real
+UDP datagram from a socket in a second netns (CHECKSUM_PARTIAL) and the same 18
+bytes thrown in with AF_PACKET (CHECKSUM_NONE).  The receiving tap's auxdata
+(`tp_status` 9 = USER|CSUMNOTREADY against 1 = USER) is the flag's witness on
+all 54 arms; the frame's bytes are read back after the store through the rule's
+own NFLOG message and through a witness chain at layer 3; the datagrams are
+counted at a bound socket.
+
+1. The checksum field of a CHECKSUM_PARTIAL datagram is the pseudo header.
+
+   udp6_hwcsum_outgoing() and udp4_hwcsum() write
+
+       uh->check = ~csum_ipv6_magic(saddr, daddr, len, IPPROTO_UDP, 0);
+
+   i.e. the pseudo-header sum with a zero payload contribution.  Measured:
+   fad2 for IPv6/UDP and 14ad for IPv4/UDP, where the same datagrams' real
+   checksums are 7a78 and 609e.  Nothing on the wire distinguishes the two
+   meanings; the device that was supposed to add the payload and complement is
+   the only thing that does.
+
+2. A transport-base store pays nothing on such a packet.
+
+   The whole fixup block of nft_payload_set_eval() is guarded by
+
+       (csum_type == INET || csum_flags) &&
+       ((base != TRANSPORT_HEADER && base != INNER_HEADER) ||
+        skb->ip_summed != CHECKSUM_PARTIAL)
+
+   so at @th on CHECKSUM_PARTIAL neither `csum type inet` nor `csum flags` runs,
+   and the bounds check `offset + len > skb->len` that lives inside the block is
+   skipped with them.  `@th,8,4 = a0a1a2a3` on a socket datagram: the field
+   stays fad2, the datagram is delivered, and the field is not a checksum of
+   what arrived.  The identical rule on the identical frame with CHECKSUM_NONE:
+   the field stays 7a78, the receiver verifies, the datagram dies
+   (Udp6InErrors 1).  With `csum type inet` and CHECKSUM_NONE the field becomes
+   3a38 -- the correct checksum of the modified datagram -- and it is delivered;
+   with `csum type inet` and CHECKSUM_PARTIAL it stays fad2.
+
+   The receiver's half of the same story is skb_csum_unnecessary():
+
+       skb->ip_summed == CHECKSUM_PARTIAL && skb_checksum_start_offset(skb) >= 0
+
+   -- no verification.  One flag, two readers, opposite conclusions, and on a
+   veth the "somebody else" both of them rely on does not exist: veth advertises
+   NETIF_F_HW_CSUM and dev_forward_skb() -> skb_scrub_packet() does not touch
+   ip_summed or csum_start, so the flag crosses the wire with the frame.
+
+3. One rule, one frame, two fates -- IPv4 source address.
+
+   `@nh,12,4 = 10.59.0.99` at the netdev ingress door breaks the IPv4 header
+   checksum before ip_rcv_core() runs (IpInHdrErrors 1, both provenances).  With
+   `csum type inet` the header checksum is repaired (IpInHdrErrors 0) and then:
+
+       CHECKSUM_PARTIAL:  delivered, UDP field 14ad (the old pseudo-header seed)
+       CHECKSUM_NONE:     dropped,  UdpInErrors 1 (UDP field 609e is stale)
+
+   Adding `csum flags` makes both deliverable, and the two fields are different
+   numbers by design: 1505 is the adjusted seed, 6046 the real checksum of the
+   modified datagram.  1505 - 14ad = 0x58, exactly the pseudo-header delta.
+
+4. On IPv6 the source address is not fixed at all.
+
+   nft_payload_csum_nh_write_ok() returns false for NFPROTO_IPV6, and a false
+   guard there is not a refusal -- the fixup is skipped and the store is made.
+   The CHECKSUM_NONE datagram then dies (7a78 is not 3a47, Udp6InErrors 1); the
+   CHECKSUM_PARTIAL one is delivered with a field that no one will ever check.
+   `csum flags` walks the same field and keeps it consistent in both worlds.
+
+5. A store into the checksum field itself is applied after the fixup, so the
+   fixup cannot save it: with `@th,6,2 = dead` the field is dead and the
+   CHECKSUM_NONE datagram dies in both cases; the CHECKSUM_PARTIAL one is
+   delivered.
+
+6. IPv4 with options: the @nh guard is a 20-byte template.
+
+   nft_nh_write_ok_ip4() is a switch over offsetof(struct iphdr, ...): 0, 1, 4,
+   8, 10, 12, 16.  On a legal 60-byte header (ihl 15) every offset in 17..59 is
+   refused (counter 1, no log message, datagram delivered), while (0,2) with the
+   same first octet, (8,2) with the same protocol, (12,4) and (16,4) are
+   accepted -- the guard never reads ihl.  The delta fixup keeps a 60-byte
+   header checksum valid (IpInHdrErrors 0), and its absence is invisible at the
+   prerouting door because ip_rcv_core() is already behind it: without the
+   fixup IpInHdrErrors is 0 and the datagram dies at the UDP checksum instead.
+   @th does follow ihl -- @th,0,2 = 1234 rewrites the source port of an ihl-6
+   datagram (recvfrom reports 4660), and @th,20,2 lands at payload offset 12 at
+   both ihl because the offset is relative to thoff.
+
+   A frame with ihl 4, and a frame whose total length is below ihl*4, never
+   reach the hook (counter 0, IpInHdrErrors 1): ip_rcv_core() refuses them
+   first, so the 20-byte template cannot be confused by a lying ihl.  A
+   non-first fragment refuses @th (pkt->fragoff); a first fragment accepts it.
+
+7. Not measured, and not claimed: a real device that computes the checksum
+   (CHECKSUM_UNNECESSARY/CHECKSUM_COMPLETE), GSO, `csum` for TCP/ICMP/SCTP on
+   these two provenances, the forwarded path, bridge/inet-ingress/arp doors in
+   this configuration.  All rules were installed by root in the initial user
+   namespace, which by F57 is the only context where a packet store is
+   installable at all, so none of this is offered as a vulnerability.
+
+Instrument note for anyone repeating this: the AF_PACKET tap is not a witness of
+a rule's write.  In both boots all 28 tap records carried the frame before the
+store, while the rule's own NFLOG payload carried it after; one earlier build of
+the same code showed the opposite for one arm, and I have no mechanism for the
+difference.  The NFLOG copy is the witness.
+
+
+===== SUMMARY.md =====
+# F60 — на CHECKSUM_PARTIAL правило не платит, и поле суммы там не сумма
+
+Два долга, названные в F59 §10: ветка `skb->ip_summed == CHECKSUM_PARTIAL`, где
+поправка суммы по коду **не делается**, и IPv4 с опциями (`ihl > 5`), где белый
+список `@nh` — шаблон в 20 байт. Ядер не собирал: всё на том же `7.3.4-T563`
+(`1efbc957…2033`). Новый прибор `differ582`, два режима, **54 плеча в каждой из
+двух загрузок** (28 `part` + 26 `opt`), одно правило на плечо. После нормализации
+того, что ядро выбирает само (два MAC, метка потока IPv6, id IPv4), загрузки
+совпадают по всем производным полям.
+
+Ответ на оба долга — в одном предложении: **на пакете с `CHECKSUM_PARTIAL` поле
+UDP-суммы содержит не сумму датаграммы, а засев (сумму псевдозаголовка с нулевым
+вкладом груза), и правило, которое «платит» за запись через `csum type inet`,
+на таком пакете молча не платит — ровно там, где получатель тоже не смотрит.**
+
+## 1. Прибор: два netns, и «провенанса» кадра — единственная разница
+
+Одна топология, две провенансы одного и того же кадра.
+
+* **Родительский netns — это мы.** Устройство `x0` с `fd02::91/64` и
+  `10.59.0.1/24`, приёмные сокеты на порту 5000, все таблицы nft, один
+  AF_PACKET-тап с auxdata.
+* **Дочерний netns (`unshare(CLONE_NEWNET)` в форкнутом процессе) — это провод.**
+  Устройство `x1` с `fd02::11/64` и `10.59.0.11/24`, пара veth создаётся
+  родителем с `IFLA_NET_NS_PID` дочернего процесса.
+* На каждое плечо ребёнок либо делает `sendto()` из сокета, привязанного к порту
+  43580 (провенанса `s`, настоящая датаграмма, `CHECKSUM_PARTIAL`), либо вбрасывает
+  `AF_PACKET` те же 18 байт в кадре, собранном руками (провенанса `p`,
+  `CHECKSUM_NONE`). Байты кадра, правило и приёмный сокет — одни и те же.
+
+Двери: `n0` — netdev ingress на `x0` (prio 0), `g6` — ip6 prerouting, `g4` — ip4
+prerouting. Плюс по одной цепи-свидетелю на layer-3 двери (prio 20), которая
+логирует каждый **UDP**-пакет (фильтр `meta l4proto 17`, см. §12.8).
+
+Правило на плечо: `meta l4proto 17`, `counter`, `[запись]`, `log(82, "60:NN")`,
+`accept`. Счётчик стоит до записи, поэтому отказанная запись всё равно считается,
+а сообщение в лог — нет.
+
+## 2. Флаг, которого правило не видит: две провенансы, ни одного разного байта
+
+Один и тот же кадр (80 байт: Ethernet + IPv6 + UDP + 18 байт груза `80 81 … 91`),
+две провенансы, правило без записи:
+
+| плечо | `tp_status` тапа | что это | поле суммы в кадре |
+|---|---|---|---|
+| `c_n0_s6` (сокет) | **9** = `USER\|CSUMNOTREADY` | `skb->ip_summed == CHECKSUM_PARTIAL` | `fad2` |
+| `c_n0_p6` (AF_PACKET) | **1** = `USER` | `CHECKSUM_NONE` | `7a78` |
+| `c_n0_s4` (сокет) | **9** | `CHECKSUM_PARTIAL` | `14ad` |
+| `c_n0_p4` (AF_PACKET) | **1** | `CHECKSUM_NONE` | `609e` |
+
+`packet_rcv()` ставит `TP_STATUS_CSUMNOTREADY`, если `skb->ip_summed ==
+CHECKSUM_PARTIAL`, — это единственный прямой свидетель флага, и он читается на
+**всех 54 плечах**: 9 у каждого плеча провенансы `s`, 1 у каждого плеча `p`.
+
+Кадры при этом не совпадают побайтово — и это первое опровергнутое предсказание
+(P2): ядро само выбирает **метку потока** IPv6 (в двух загрузках `6006 80a6` и
+`600e 1983`) и **id** IPv4. Груз, порты, адреса, длины и поле суммы от провенансы
+не зависят; всё остальное — да.
+
+## 3. Поле суммы на `CHECKSUM_PARTIAL` — не сумма, а засев
+
+`udp6_hwcsum_outgoing()` (и `udp4_hwcsum()` для IPv4) при `CHECKSUM_PARTIAL`
+пишут в поле не сумму датаграммы:
+
+```
+uh->check = ~csum_ipv6_magic(saddr, daddr, len, IPPROTO_UDP, 0);
+```
+
+— псевдозаголовок с **нулевым** вкладом груза. Настоящее число должен получить
+тот, кому флаг это поручает: драйвер или `skb_checksum_help()`. Измерено:
+
+| кадр | поле на проводе | что это по арифметике | настоящая сумма той же датаграммы |
+|---|---|---|---|
+| IPv6/UDP | `fad2` | `fold16(псевдозаголовок)` | `7a78` |
+| IPv4/UDP | `14ad` | `fold16(псевдозаголовок)` | `609e` |
+
+Обе клетки воспроизводятся в верификаторе независимо — из байтов кадра, а не из
+модели (§13, «засев»). То есть две байтовые клетки, которые весь проект называл
+«поле суммы», на `CHECKSUM_PARTIAL` означают другое число. Второй раз за проект
+оказывается, что имя поля не описывает его содержимое (ср. F47: `NFULA_HWHEADER`
+на `ppp0`).
+
+## 4. Одна запись, два мира: где правило платит, а где его платёж пропускается
+
+Плечи `@th,8,4 = a0a1a2a3` на двери `n0`, кадр один и тот же, отличается только
+провенанса:
+
+| плечо | сумма в правиле | поле после двери | доставлено | `Udp6InErrors` |
+|---|---|---|---|---|
+| `s_th8_n0` | нет | `fad2` (засев, не тронут) | **да** | 0 |
+| `p_th8_n0` | нет | `7a78` (старая сумма) | **нет** | 1 |
+| `s_th8_n0_cs` | `csum type inet` | `fad2` (**то же**) | **да** | 0 |
+| `p_th8_n0_cs` | `csum type inet` | `3a38` (настоящая сумма изменённой датаграммы) | да | 0 |
+| `s_th8_n0_fl` | `csum flags` | `fad2` (**то же**) | **да** | 0 |
+| `p_th8_n0_fl` | `csum flags` | `3a38` | да | 0 |
+| `s_th8_g6` | нет | `fad2` | да | 0 |
+| `s_th8_g6_cs` | `csum type inet` | `fad2` | да | 0 |
+
+Причина — не в двери и не в базе, а в одном условии `nft_payload_set_eval()`:
+
+```
+if ((priv->csum_type == NFT_PAYLOAD_CSUM_INET || priv->csum_flags) &&
+    ((priv->base != NFT_PAYLOAD_TRANSPORT_HEADER &&
+      priv->base != NFT_PAYLOAD_INNER_HEADER) ||
+     skb->ip_summed != CHECKSUM_PARTIAL))
+```
+
+Для `@th` на `CHECKSUM_PARTIAL` блок **пропускается целиком** — и `csum type
+inet`, и `csum flags`. Внутри него лежит и проверка `offset + len > skb->len`.
+Провенанса `p` проходит внутрь и платит; провенанса `s` не платит ничего — и
+получает датаграмму, потому что `skb_csum_unnecessary()` для этого же флага
+говорит «сумму уже проверили»:
+
+```
+skb->ip_summed == CHECKSUM_PARTIAL && skb_checksum_start_offset(skb) >= 0
+```
+
+**Один флаг, два читателя, противоположные выводы.** Правило считает, что за
+сумму заплатит «кто-то другой»; получатель считает, что уже заплатили. На veth
+«другого» нет: `veth` объявляет `NETIF_F_HW_CSUM`, `dev_forward_skb()` →
+`skb_scrub_packet()` не трогает `ip_summed`/`csum_start`, и флаг пересекает
+провод вместе с кадром (§13, провенанс).
+
+## 5. `csum type inet` пропускается ровно там, где перестаёт быть нужен
+
+Из таблицы §4 видно две вещи, и вторая важнее первой.
+
+1. На провенансе `s` строка `p_th8_n0_cs` (платит) и `s_th8_n0_cs` (не платит)
+   отличаются **только байтом провенансы**: `3a38` против `fad2`, обе доставлены.
+2. Сумма `3a38` в провенансе `p` — это ровно та сумма, которую получатель
+   проверяет и находит верной (`Udp6InErrors` 0, сокет получил датаграмму).
+   Сумма `fad2` в провенансе `s` не проверяется никем: `Udp6InErrors` 0 при том,
+   что поле заведомо не сумма.
+
+То есть правило, у которого есть единственный способ заплатить за изменение
+груза, не платит на тех пакетах, где платёж по коду не нужен, — и не платит на
+тех, где он **не нужен только потому, что получатель не смотрит**. Обе половины
+этого предложения измерены в одной таблице.
+
+## 6. IPv4: одно правило, один кадр, две судьбы
+
+`@nh,12,4 = 10.59.0.99` (адрес источника) на двери `n0`. Здесь поле суммы
+IPv4-заголовка — настоящая сумма всегда (её считает софт), а UDP-сумму покрывает
+псевдозаголовок, в который входит адрес источника.
+
+| плечо | `csum` | `IpInHdrErrors` | `UdpInErrors` | доставлено | поле UDP после двери |
+|---|---|---|---|---|---|
+| `s4_sr_no` | нет | **1** | 0 | нет | — (умер до layer 3) |
+| `p4_sr_no` | нет | **1** | 0 | нет | — |
+| `s4_sr_cs` | `inet`, `co=10` | 0 | **0** | **да** | `14ad` (засев, старый) |
+| `p4_sr_cs` | `inet`, `co=10` | 0 | **1** | **нет** | `609e` (старая сумма) |
+| `s4_sr_csfl` | `inet` + `flags` | 0 | 0 | да | `1505` (= засев новых адресов) |
+| `p4_sr_csfl` | `inet` + `flags` | 0 | 0 | да | `6046` (= настоящая сумма) |
+
+Две строки — `s4_sr_cs` и `p4_sr_cs` — это **одно правило на одном и том же
+кадре, с противоположным исходом**, и разница между ними ровно в флаге §2.
+Запись в заголовок ломает сумму заголовка, и на двери `n0` это видно
+(`IpInHdrErrors` 1): дверь стоит **до** `ip_rcv_core()`. На двери `g4` та же
+запись суммы заголовка уже никого не волнует — см. §9.
+
+И отдельно про арифметику §4: `1505 − 14ad = 0x58` — ровно дельта псевдозаголовка
+при замене `10.59.0.11` на `10.59.0.99`. Засев поправляется, но остаётся засевом.
+
+## 7. Запись в само поле суммы: порядок решает
+
+`@th,6,2 = dead` — запись в поле суммы, а не в груз:
+
+| плечо | `csum` | поле после | доставлено |
+|---|---|---|---|
+| `s_th6_n0` | нет | `dead` | **да** |
+| `s_th6_n0_cs` | `inet` | `dead` | **да** |
+| `p_th6_n0` | нет | `dead` | нет (`Udp6InErrors` 1) |
+| `p_th6_n0_cs` | `inet` | `dead` | нет (`Udp6InErrors` 1) |
+
+`nft_payload_csum_inet()` вызывается **до** `skb_store_bits()`, поэтому поправка
+считается от старого поля и тут же затирается записью. В мире `CHECKSUM_NONE`
+это не спасает (сумма заведомо чужая), в мире `CHECKSUM_PARTIAL` — не нужно.
+
+## 8. IPv6 и адрес источника: страж суммы говорит «нет», и это молчание
+
+`@nh,8,16` (адрес источника) — поле, которого нет ни в одной сумме заголовка, но
+которое есть в псевдозаголовке:
+
+| плечо | `csum` | поле после | доставлено | `Udp6InErrors` |
+|---|---|---|---|---|
+| `s6_sr_cs` | `inet` | `fad2` (не тронут) | да | 0 |
+| `p6_sr_cs` | `inet` | `7a78` (не тронут) | **нет** | 1 |
+| `s6_sr_fl` | `flags` | `3b04` (= засев новых адресов) | да | 0 |
+| `p6_sr_fl` | `flags` | `3a47` (= настоящая сумма) | да | 0 |
+
+`nft_payload_csum_nh_write_ok()` для `NFPROTO_IPV6` возвращает **false** — и это
+не отказ: поправка просто не делается, а запись делается. F59 видел эту клетку
+на вброшенном кадре; здесь видно, что на настоящей датаграмме она невидима: у
+`p6_sr_cs` сумма остаётся старой (7a78 ≠ 3a47), и датаграмма умирает на
+проверке; у `s6_sr_cs` та же старая сумма не проверяется никому.
+
+## 9. IPv4 с опциями: шаблон в 20 байт и заголовок в 60
+
+`nft_nh_write_ok_ip4()` — это `switch` по `offsetof(struct iphdr, …)`, то есть по
+константам 0,1,4,8,10,12,16. Заголовок IPv4 при `ihl = 15` — 60 байт. Сетка на
+кадре в 100 байт (`ihl = 15`, 40 байт опций `01…01 00`), дверь `g4`:
+
+| `@nh,off,len` | плечо | принято | сообщение в лог | доставлено |
+|---|---|---|---|---|
+| 17,2 | `q_o17_2` | **нет** | нет | да |
+| 18,2 | `q_o18_2` | **нет** | нет | да |
+| 20,4 | `q_o20_4` | **нет** | нет | да |
+| 24,2 | `q_o24_2` | **нет** | нет | да |
+| 40,2 | `q_o40_2` | **нет** | нет | да |
+| 56,4 | `q_o56_4` | **нет** | нет | да |
+| 16,4 (`daddr`) | `q_o16_4` | да | есть | нет (адрес больше не наш) |
+| 12,4 (`saddr`) | `q_o12_4` | да | есть | нет (`UdpInErrors` 1) |
+| 0,2 = `4f00` (первый октет тот же) | `q_o0_2` | да | есть | да |
+| 0,2 = `4600` (ihl 6) | `q_o0_2s` | **нет** | нет | да |
+| 8,2 = `3f11` (протокол тот же) | `q_o8_2s` | да | есть | да |
+| 8,2 = `3f06` (протокол чужой) | `q_o8_2c` | **нет** | нет | да |
+
+То есть **40 из 60 законных байт заголовка вне словаря стража при любом `ihl`** —
+и это не ошибка, а шаблон: страж не читает `ihl` вовсе. Что при этом работает:
+
+* `@nh,12,4` + `csum type inet` на 60-байтном заголовке: **`IpInHdrErrors` 0** —
+  дельта-поправка не знает про `ihl` и чинит сумму заголовка любой длины.
+  Без поправки — `IpInHdrErrors`… **0**: на двери `g4` сумма заголовка уже
+  проверена в `ip_rcv_core()`, и её поломка не видна никому (датаграмма умирает
+  на UDP-сумме, `UdpInErrors` 1). Это опровергнутая вторая клауза P17.
+* `@th` идёт за `ihl`: `@th,0,2 = 1234` на кадре с `ihl = 6` переписывает
+  **порт источника** — `recvfrom` на приёмной стороне отдаёт `4660`; при
+  `thoff = 20` запись легла бы в байты опций и порт остался бы 43580.
+  А `@th,20,2` кладёт байты в груз по смещению 12 при **обоих** `ihl` —
+  потому что смещение `@th` отсчитывается от `thoff` (P18 опровергнуто, §11).
+* Кадр с `ihl = 4` и кадр с `ihl = 15`, у которого `tot_len < ihl*4`, до двери
+  не доходят вовсе: счётчик 0, сообщения нет, `IpInHdrErrors` 1 — отказывает
+  `ip_rcv_core()`, а не страж.
+* Фрагменты: у первого (`fragoff = 0`, MF=1) `@th,0,2` принят и ложится по
+  `thoff = 20`; у второго (`fragoff = 1480`) — **отказан** (`pkt->fragoff`), и
+  свидетель-цепь его не видит.
+
+## 10. Тап — свидетель, который видит запись не всегда
+
+Во всех 28 плечах режима `part` в **обеих** загрузках тап показал кадр **до**
+записи: 16 плеч провенансы `s` и 12 провенансы `p`, все `pre`. При этом
+собственное сообщение правила (`log` в той же цепи, после записи) показывает
+запись **всегда** — и именно оно, а не тап, сверяется с моделью в §13.
+
+Это поправка к F56 §4, где тап на netdev-двери показал записанный байт. Механизм
+разницы я не измерял; измерено только, что тап не является свидетелем записи и
+что в ранней сборке этого же прибора одно плечо показало `post`. Поэтому ни одно
+утверждение этого хода на байты тапа не опирается: свидетель записи — NFLOG.
+
+## 11. Предсказания: 16 из 20 целиком, одно с оговоркой, три опровергнуты
+
+Со шлись P1, P3, P4, P5, P6, P7, P8, P9, P10, P11, P12, P13, P14, P15, P19, P20.
+**P16 с оговоркой**: из перечисленного набора на этом кадре измерены (0,2),
+(0,2) с чужим октетом, (8,2) с тем же и с чужим протоколом, (12,4), (16,4) и
+весь отрезок 17..56; (1,1), (4,2), (10,10), (12,8) — это F59.
+
+**P2 опровергнуто** в первой клаузе: «побайтово идентичны» неверно, ядро само
+пишет метку потока IPv6 (и id в IPv4). **P17 опровергнуто** во второй клаузе:
+без поправки суммы заголовка `IpInHdrErrors` не растёт — на двери `g4`
+`ip_rcv_core()` уже позади. **P18 опровергнуто** целиком: я перепутал
+относительное смещение `@th` с абсолютным и ждал разные смещения в грузе;
+измерено одно и то же смещение при обоих `ihl`, а `thoff = ihl*4` доказывается
+не им, а `@th,0,2`.
+
+## 12. Ошибки хода, все мои
+
+1. Прибор для кадра `ihl = 4` писал `daddr` за пределы 16-байтного заголовка
+   (в то, что станет UDP-заголовком), а сумму считал по 16 байтам; на исход это
+   не влияет (кадр умирает по `ihl`), но в верификаторе этот layout пришлось
+   воспроизводить буквально.
+2. `pseudo6_full()` в верификаторе потеряла младший байт длины: все суммы IPv6
+   расходились на `0x1a`, и «контрольный кадр не доставлен» выглядело дырой.
+3. `csum16()` возвращает **0** у верной датаграммы (сумма == 0xffff), а модель
+   ждала `0xffff` — модель объявила невинную датаграмму битой.
+4. Маску «того, что ядро выбирает само» я применил по смещениям **кадра** к
+   буферу, который начинается с сетевого заголовка: получились три «нулевых
+   байта в логе ядра» (смещения 19, 24, 25), которых в ядре нет. Это моя маска,
+   а не наблюдение.
+5. Счётчик правила считал весь трафик двери, включая neighbour discovery: три
+   плеча дали `ch=2`. Вылечено матчем `meta l4proto 17`; до этого счётчик был
+   свидетелем не того.
+6. Цепь-свидетель в rep2 записала ICMPv6 neighbour solicitation вместо нашей
+   датаграммы (плечо `c_n0_p4`), потому что свидетель не фильтровал по
+   протоколу. Тот же матч, что в п.5.
+7. Ветку `CHECKSUM_PARTIAL` в `nft_payload_l4csum_update()` я сперва смоделировал
+   формулой мира `CHECKSUM_NONE` (`~fold(~old + delta)`) — четыре плеча
+   разошлись; измеренное значение показало, что там **другая** формула
+   (`fold(old + delta)`): одна поддерживает сумму, другая — засев.
+8. `f559_hexs()` режет hex на 96 байтах, поэтому кадр в 100 байт в логе
+   обрезан; сверка идёт по префиксу, и это сказано.
+9. Гипотеза «тап показывает запись» из дымовой сборки не подтвердилась на
+   полном прогоне (§10) — и я не стал подгонять под неё ни одного утверждения.
+
+## 13. Чем проверено
+
+| | |
+|---|---|
+| `tools/verify582.py` | **6213 проверок, 0 расхождений** — провенанс (sha ядра из шапки каждой загрузки, initrd из шапки и из файла, differ **извлечённый из initramfs** и сверенный с собранным), кадры пересобраны в Python (IPv6/UDP и пять вариантов IPv4, включая фрагменты) и сверены с кадрами самого прибора, таблица плеч разобрана **из исходника прибора** и сверена с напечатанными параметрами каждого плеча, и **каждое плечо обеих загрузок**: счётчик, наличие сообщения, все байты сообщения правила и свидетеля, поле суммы по модели, длина и порт приёмного сокета, его груз, одиннадцать счётчиков, `tp_status` тапа, байты тапа против pre- и post-кадра (с маской на метку потока и id), `ppre` свидетеля по семье, длины, отправка ребёнка; отдельный блок «засев»: у каждого плеча провенансы `s` поле равно `fold16(псевдозаголовок)` и **не** является суммой датаграммы; детерминизм по 37 полям |
+| `tools/verify582_selftest.sh` | **36 раундов**: базовая линия зелёная, 35 односоставных мутаций краснят верификатор без traceback, `noop` зелёный, отсутствующий лог — exit 1, пустой — exit 1 без крэша |
+| `tools/audit_f60_doc.py` | 4 таблицы и 8 чисел этого документа против лога rep1/rep2 |
+| коллекция | см. `LETTER_STATUS.md` и `RESEARCH_LOG.md` |
+| регрессия | verify581 3695, verify580 5703, verify579 902, verify578 9411, verify577 2756, verify576 768, verify575 3696, verify574 2666, verify573 3186, verify572 5629, verify571 5974, verify570 753, verify569 3810 — все 0 |
+
+## 14. Что не измерено, прямо
+
+* **Настоящего сетевого устройства нет:** «железо», которое считает сумму,
+  заменено на veth, который её не считает. Ветка «драйвер посчитал и поставил
+  `CHECKSUM_UNNECESSARY`» не тронута; `CHECKSUM_COMPLETE` тоже.
+* GSO (`skb_is_gso`, `CHECKSUM_PARTIAL` на сегментированном UDP) не тронут:
+  все датаграммы 18 байт и уходят одним сегментом.
+* `csum` для TCP/ICMP/SCTP на этих двух провенансах; `csum_flags` на базе `@th`
+  в мире `CHECKSUM_NONE` (тут он отработал, но TCP-путь не тронут);
+  `nft_payload_csum_sctp()`.
+* Двери `bridge`, `inet`-ingress и `arp` в этом ходу не тронуты — они измерены
+  в F56/F59, и ветка `CHECKSUM_PARTIAL` на них не проверялась.
+* Более одного тега, QinQ, PPPoE на этих провенансах; `inet`-семья на двух
+  провенансах; IPv6 с расширенными заголовками.
+* `@nh` с `csum` на ingress-двери (ветка `pkt->skb->protocol == ETH_P_IP`) в
+  паре провенанс/`CHECKSUM_PARTIAL`.
+* Приёмная сторона — сокет в том же netns, что и правила; forwarded-путь
+  (`CHECKSUM_PARTIAL` до выходной двери) не тронут.
+* **Не уязвимость**: все правила ставил root в начальном user ns; по F57 запись
+  в пакет вообще возможна только там.
+
+## 15. Файлы
+
+`findings/F60-checksum-partial/{SUMMARY.md, summary.json, VERIFY_REPORT.md,
+LETTER_SECTION_F60.txt}` · `vm/{differ582_add.c, differ582.c, build_f60_differ.sh,
+make_initramfs582.sh, build/differ582}` · `tools/{f60_run.sh, verify582.py,
+verify582_selftest.sh, f582_mutate.py, audit_f60_doc.py}` ·
+`research/predictions_582.md` · логи `logs/f60_{rep1,rep2}.log`.
+
+
+===== summary.json =====
+{
+ "log": "f60_rep1.log",
+ "arms": 54,
+ "turn": 582,
+ "finding": "F60",
+ "question": "the two debts of F59: the skb->ip_summed == CHECKSUM_PARTIAL branch, in which nft_payload_set_eval() skips the whole checksum fixup, and IPv4 with options (ihl > 5), where the @nh whitelist is a 20-byte template",
+ "title": "on a CHECKSUM_PARTIAL datagram the UDP checksum field is not a checksum but the pseudo-header seed, and a payload store at the transport base pays nothing there: csum type inet and csum flags are both skipped by one condition, while the same flag makes the receiver skip verification too -- one flag, two readers, opposite conclusions, and on a veth the 'somebody else' who was supposed to compute the checksum does not exist",
+ "answer_short": "54 arms x 2 boots on 7.3.4-T563 in one topology with two provenances of the same frame: a real UDP datagram from a socket in a second netns (CHECKSUM_PARTIAL, the receiving tap's tp_status 9 = USER|CSUMNOTREADY) and the same 18 bytes injected with AF_PACKET (CHECKSUM_NONE, tp_status 1). udp6_hwcsum_outgoing()/udp4_hwcsum() leave ~csum_ipv6_magic(saddr,daddr,len,proto,0) in the field: measured fad2 (v6) and 14ad (v4), where the datagrams' real checksums are 7a78 and 609e -- the field is the one's-complement sum of the pseudo header with a zero payload contribution, not a checksum. The whole fixup block of nft_payload_set_eval() is guarded by ((csum_type == INET || csum_flags) && ((base != TH && base != INNER) || ip_summed != CHECKSUM_PARTIAL)), so at the transport base on a CHECKSUM_PARTIAL packet neither mechanism runs and the bounds check offset+len > skb->len is skipped with it: @th,8,4 on a socket datagram keeps the field fad2, the datagram is delivered, and the field is not a checksum of what arrived; the identical rule on the identical frame with CHECKSUM_NONE leaves 7a78, the receiver verifies and drops it (Udp6InErrors 1); with csum type inet and CHECKSUM_NONE the field becomes 3a38 -- the correct checksum of the modified datagram -- and it is delivered; with csum type inet and CHECKSUM_PARTIAL the field is still fad2. csum_flags at the transport base is skipped by the same clause (s_th8_n0_fl: fad2). In IPv4, writing the source address at the netdev ingress door breaks the header checksum before ip_rcv_core() (IpInHdrErrors 1 both provenances); with csum type inet the header checksum is repaired (IpInHdrErrors 0) and then one rule on one frame has two fates: the CHECKSUM_PARTIAL datagram is delivered with a stale UDP checksum (14ad), the CHECKSUM_NONE one dies at UDP (UdpInErrors 1); adding csum_flags makes both deliverable and the fields differ by design -- 1505 is the adjusted seed, 6046 the real checksum, and 1505 - 14ad = 0x58 is exactly the pseudo-header delta. A store into the checksum field itself is applied after the fixup, so csum type inet cannot save it (dead survives in both worlds, the CHECKSUM_NONE datagram dies). On IPv6 the source address with csum type inet is not fixed at all -- nft_payload_csum_nh_write_ok() returns false for NFPROTO_IPV6 and the fixup is skipped silently (p6_sr_cs: 7a78, Udp6InErrors 1; s6_sr_cs: 7a78, delivered), while csum_flags walks the same field and keeps it consistent (3b04 vs the real 3a47). nft_nh_write_ok_ip4() is a switch over offsetof(struct iphdr, ...) -- a 20-byte template -- so on a legal 60-byte header (ihl 15) every offset in 17..59 is refused while (0,2) with the same first octet, (8,2) with the same protocol, (12,4) and (16,4) are accepted; the delta fixup keeps a 60-byte header checksum valid (IpInHdrErrors 0) and its absence is invisible at the prerouting door because ip_rcv_core() is already behind it (IpInHdrErrors 0, the datagram dies at the UDP checksum instead); @th follows ihl -- @th,0,2 rewrites the source port of an ihl-6 datagram (recvfrom 4660), and @th,20,2 lands at payload offset 12 at both ihl because the offset is relative to thoff. A frame with ihl 4 and a frame whose total length is below ihl*4 never reach the hook (counter 0, IpInHdrErrors 1); a non-first fragment refuses @th (pkt->fragoff) and a first fragment accepts it. In these two boots all 28 part-mode tap records carried the frame before the store (16 socket, 12 packet): the tap is not a witness of a rule's write, the rule's own NFLOG payload is.",
+ "numbers": {
+  "arms": 54,
+  "arms_part": 28,
+  "arms_opt": 26,
+  "boots": 2,
+  "provenances": 2,
+  "socket_arms": 16,
+  "packet_arms": 12,
+  "socket_delivered": 15,
+  "socket_with_verifying_checksum": 0,
+  "tap_csumnotready_iff_partial": 54,
+  "tap_pre_store_of_28": 28,
+  "checks": 6213,
+  "checks_fails": 0,
+  "selftest": "36/36",
+  "audit": "169 checks, 0"
+ },
+ "prediction_score": {
+  "held": ["P1", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11",
+           "P12", "P13", "P14", "P15", "P19", "P20"],
+  "with_reservation": ["P16"],
+  "refuted": ["P2", "P17 (second clause)", "P18"]
+ },
+ "seeds": {
+  "v6_pseudo_seed": "fad2",
+  "v6_real_checksum": "7a78",
+  "v6_real_checksum_after_store": "3a38",
+  "v6_seed_after_saddr": "3b04",
+  "v6_real_after_saddr": "3a47",
+  "v4_pseudo_seed": "14ad",
+  "v4_real_checksum": "609e",
+  "v4_seed_after_saddr": "1505",
+  "v4_real_after_saddr": "6046"
+ },
+ "sources": {
+  "skip_condition": "net/netfilter/nft_payload.c:1164-1171",
+  "udp4_hwcsum": "net/ipv4/udp.c:1048",
+  "udp6_hwcsum_outgoing": "net/ipv6/udp.c:1328",
+  "skb_csum_unnecessary": "include/linux/skbuff.h:4781",
+  "tp_status_csumnotready": "net/packet/af_packet.c:3596",
+  "nh_write_ok_ip4": "net/netfilter/nft_payload.c:837",
+  "csum_nh_write_ok": "net/netfilter/nft_payload.c:1033",
+  "l4csum_update": "net/netfilter/nft_payload.c:715",
+  "ip_rcv_core_ihl": "net/ipv4/ip_input.c:541",
+  "skb_scrub_packet": "net/core/skbuff.c (does not touch ip_summed)"
+ },
+ "files": {
+  "summary": "findings/F60-checksum-partial/SUMMARY.md",
+  "verify": "tools/verify582.py",
+  "selftest": "tools/verify582_selftest.sh",
+  "mutator": "tools/f582_mutate.py",
+  "audit": "tools/audit_f60_doc.py",
+  "instrument": "vm/differ582_add.c",
+  "predictions": "research/predictions_582.md",
+  "logs": ["logs/f60_rep1.log", "logs/f60_rep2.log"]
+ }
+}

@@ -1,0 +1,827 @@
+===== LETTER_SECTION_F40.txt =====
+# F40 — candidate section for netfilter-devel, turn 562
+
+STATUS: NOT SENT. Not appended to the held letter (F29+F30), not sent anywhere.
+The owner decides when and whether any of these go out.
+
+Subject line candidate: `nft: payload set at @nh writes four bytes before the
+offset the read of the same cell uses (Q-in-Q)`
+
+---
+
+`nft_payload_eval()` and `nft_payload_set_eval()` do not agree on the reference
+point of an `@nh` offset:
+
+    nft_payload_eval:      offset = skb_network_offset(skb) + pkt->nhoff;
+    nft_payload_set_eval:  offset = skb_network_offset(skb);
+
+and `nft_nh_write_ok_ip4()` uses `priv->offset + skb_network_offset()`.
+
+`pkt->nhoff` is 0 for every envelope except one: `nft_meta_pktinfo_may_update()`
+(entered from `meta protocol`) sets `nhoff = VLAN_HLEN` when `skb->protocol`
+is `0x8100` and the encapsulated protocol is IP or IPv6. That is a Q-in-Q frame
+after the receive path popped exactly one tag: the inner tag is still in the
+bytes, so `skb->data` begins four bytes before the IP header.
+
+Measured on 7.3.4 with 657 arms in each of two boots, bridge prerouting:
+
+1. The read is unguarded and envelope-correct after the repair. A 40-cell grid
+   of `(offset,len)` read+compare arms is 40/40 live in every envelope, and it
+   lands at `data + nhoff + off`: on a Q-in-Q frame with `meta protocol` in
+   front, every cell reads exactly the byte a plain frame reads at the same
+   cell. Without `meta protocol` the same cells are refused by the guard
+   (12/40), so the read grid is strictly wider than the store grid.
+
+2. The store is not repaired. On the same frame and in the same rule, the cell
+   `(8,1)` compares the **ttl** and writes the **IP id**; `(16,4)` compares the
+   **daddr** and writes the **saddr**. A rule that stores first and reads the
+   same cell afterwards is dead on a plain frame (the store rewrote the byte the
+   read returns) and live on Q-in-Q (the store wrote the byte four earlier and
+   the read still returns the original). On the wire the frame leaves with a
+   rewritten id instead of a rewritten ttl.
+
+3. `@ih` is repaired completely, because both sides use `nft_thoff(pkt)`, which
+   is computed from the repaired `nhoff`. So the split is specific to `@nh`.
+
+4. ARP over Q-in-Q is the other failure mode: `nft_meta_pktinfo_may_update()`
+   validates only IP and IPv6, so for `0x0806` it assigns `pkt->ethertype` and
+   leaves `nhoff = 0`. The guard then dispatches to `nft_nh_write_ok_arp()`,
+   whose coordinates are `priv->offset` alone — also relative to `skb->data`,
+   i.e. four bytes before the ARP header. Measured on `88a8:100/8100:200/ARP`:
+
+   - `@nh,6,2` — the cell whose whitelist entry is `offsetof(struct arphdr,
+     ar_op)` — writes `ar_pro` (capture 20..21: `08 00 → 90 91`);
+   - `@nh,8,2` writes `ar_hln/ar_pln`, after which `arp_rcv()` refuses the frame;
+   - the real `ar_op` is writable through the `offset >= 8 && len <= 20`
+     branch, which is the same door F32 described for the arp family.
+
+5. The two ip4 cells that read the packet read the wrong bytes too: `case 0`
+   compares the new first byte against `data[0]`, which on Q-in-Q is the high
+   byte of the inner tag's TCI. A store whose whitelist entry exists to keep the
+   IPv4 version/ihl intact therefore becomes live exactly when it carries that
+   TCI byte, and then rewrites the inner VLAN id (measured: vid 200 → 145), and
+   `case 8` compares against the low byte of the IP id.
+
+Not a vulnerability: the rule is installed by root in the initial user ns. The
+consequences are stores that silently land on a different field than the one
+they name, a store refused for a reason unrelated to the field, and an ARP frame
+made invalid by a guard-approved store. The asymmetry is either a bug in the
+guard's coordinate or an argument that `@nh` stores should add `pkt->nhoff` the
+way reads do; it cannot be both.
+
+Reproduce: 657-armed instrument (`differ562`), kernel 7.3.4, one veth pair in a
+bridge, `meta protocol` + `payload @nh` rules, the rule's own counter read
+before and after one send as the oracle, captures on both bridge ports.
+
+
+===== SUMMARY.md =====
+# F40 — the read side of `@nh`: the repair moves one of the two coordinates
+
+Turn 562. Kernel unchanged: `7.3.4-T558` (`459f02a5…`), the same image F36–F39
+measured. Nothing was rebuilt; the whole finding is one new instrument
+(`differ562`) and 657 arms in each of two boots.
+
+## 1. The answer in one paragraph
+
+F39 measured the store and left the read in code: `nft_payload_eval()` uses
+`skb_network_offset(skb) + pkt->nhoff`, `nft_payload_set_eval()` uses
+`skb_network_offset(skb)`. `pkt->nhoff` is zero everywhere except one place —
+`nft_meta_pktinfo_may_update()`, reached by `meta protocol`, which on an skb
+whose `skb->protocol` is `0x8100` (a Q-in-Q frame after the receive path popped
+exactly one tag) validates IPv4 at `skb_network_offset + VLAN_HLEN` and stores
+`pkt->nhoff = 4`. Measured: on that one envelope **the same `(offset,len)` cell
+reads one byte and writes another, four bytes earlier**, and the read is exactly
+what the same cell reads on a plain frame. The repair therefore makes the read
+envelope-independent and leaves the store where it was. And for ARP the repair
+never runs at all: `meta protocol` sets `pkt->ethertype = 0x0806` and validates
+nothing, so on Q-in-Q **the guard's `ar_op` cell writes `ar_pro`** — the
+whitelist is not shifted, the packet is.
+
+## 2. The five lines this stands on
+
+| file | function | what it says |
+|---|---|---|
+| `nft_payload.c` | `nft_payload_eval` | `offset = skb_network_offset(skb) + pkt->nhoff;` |
+| `nft_payload.c` | `nft_payload_set_eval` | `offset = skb_network_offset(skb);` |
+| `nft_payload.c` | `nft_nh_write_ok_ip4` | `offset = priv->offset + skb_network_offset(pkt->skb);` |
+| `nft_payload.c` | `nft_nh_write_ok_arp` | `return offset >= sizeof(struct arphdr) && priv->len <= eth_ip;` |
+| `nft_meta.c` | `nft_meta_pktinfo_may_update` | `nhoff = VLAN_HLEN; … nhoff += skb_network_offset(skb);` |
+
+`nft_do_chain_bridge()` builds the pktinfo from `eth_hdr(skb)->h_proto` — for a
+Q-in-Q frame that halfword is the inner TPID `0x8100`, so the chain starts from
+`nft_set_pktinfo_unspec()`: `flags = 0`, `nhoff = 0`, `ethertype = 0x8100`.
+`meta protocol` is the expression that changes that, and only for a frame whose
+receive path left a tag in the bytes.
+
+## 3. The read grid: 480 arms, two candidates per cell
+
+Bridge prerouting, one base chain, one rule per arm: `[meta protocol]` +
+`payload @nh off len` → register + `cmp` → counter. **No store**, so neither the
+guard nor `skb_ensure_writable()` stands between the read and the counter.
+Candidate **A** = `cap[14+off]` (the byte the *store* of that cell writes),
+candidate **B** = `cap[18+off]` (where a read lands if `pkt->nhoff == 4`). `cap`
+is the frame as captured; it starts at `mac_header`, so `skb->data` is 14 bytes
+further.
+
+| представление | gate | живых A | живых B | различающих клеток |
+|---|---|---|---|---|
+| `p` | bare | **40/40** | **3/40** | 37 |
+| `p` | meta protocol | **40/40** | **3/40** | 37 |
+| `w` | bare | **40/40** | **3/40** | 37 |
+| `w` | meta protocol | **40/40** | **3/40** | 37 |
+| `q` | bare | **40/40** | **2/40** | 38 |
+| `q` | meta protocol | **2/40** | **40/40** | 38 |
+
+The live B cells on `p`, `w` and the live A cells on `q`+meta are the cells
+where the two candidates are the same bytes — `(2,1) (12,1) (14,1)` on `p` and
+`w`, `(6,1) (16,1)` on `q`. The verifier names them and requires the pair to be
+discriminating on at least 36 of 40 cells. On every discriminating cell exactly
+one candidate is live, and it is the one at `data + nhoff + off`. A read is
+never refused by the guard: **the grid is 40/40 in every envelope**, including
+the 28 cells whose store `q`+meta refuses.
+
+`meta protocol` on a plain or single-tag frame changes nothing: `p` and `w` are
+cell-for-cell identical with and without it, because `nft_do_chain_bridge()`
+already validated IPv4 (`eth_hdr()->h_proto == 0x0800`) and
+`nft_meta_pktinfo_may_update()` returns on its first line (`if (pkt->flags)`).
+
+## 4. One rule, one packet, two places
+
+`(8,1)` is IPv4 byte 8 — the ttl — to a read, and byte 8 of the skb — the high
+byte of the id on `q` — to a store. `(16,4)` is daddr to a read and, on `q`,
+**saddr** to a store. Three arm kinds per cell: `wr` (store only), `rdwr` (read,
+cmp, store), `wrrd` (store, **then** read the same cell).
+
+| правило | жив | байты, которые изменились (смещение в кадре) |
+|---|---|---|
+| `p` bare `wr` (8,1) | 1 | 22:40>90 |
+| `p` bare `rdwr` (8,1) | 1 | 22:40>90 |
+| `p` bare `wrrd` (8,1) | 0 | 22:40>90 |
+| `p` bare `wr` (16,4) | 1 | 30:0a>90,31:09>91,32:00>92,33:07>93 |
+| `p` bare `rdwr` (16,4) | 1 | 30:0a>90,31:09>91,32:00>92,33:07>93 |
+| `p` bare `wrrd` (16,4) | 0 | 30:0a>90,31:09>91,32:00>92,33:07>93 |
+| `p` meta protocol `wr` (8,1) | 1 | 22:40>90 |
+| `p` meta protocol `rdwr` (8,1) | 1 | 22:40>90 |
+| `p` meta protocol `wrrd` (8,1) | 0 | 22:40>90 |
+| `p` meta protocol `wr` (16,4) | 1 | 30:0a>90,31:09>91,32:00>92,33:07>93 |
+| `p` meta protocol `rdwr` (16,4) | 1 | 30:0a>90,31:09>91,32:00>92,33:07>93 |
+| `p` meta protocol `wrrd` (16,4) | 0 | 30:0a>90,31:09>91,32:00>92,33:07>93 |
+| `q` bare `wr` (8,1) | 0 | - |
+| `q` bare `rdwr` (8,1) | 0 | - |
+| `q` bare `wrrd` (8,1) | 0 | - |
+| `q` bare `wr` (16,4) | 0 | - |
+| `q` bare `rdwr` (16,4) | 0 | - |
+| `q` bare `wrrd` (16,4) | 0 | - |
+| `q` meta protocol `wr` (8,1) | 1 | 22:12>90 |
+| `q` meta protocol `rdwr` (8,1) | 1 | 22:12>90 |
+| `q` meta protocol `wrrd` (8,1) | 1 | 22:12>90 |
+| `q` meta protocol `wr` (16,4) | 1 | 30:0a>90,31:01>91,32:00>92,33:01>93 |
+| `q` meta protocol `rdwr` (16,4) | 1 | 30:0a>90,31:01>91,32:00>92,33:01>93 |
+| `q` meta protocol `wrrd` (16,4) | 1 | 30:0a>90,31:01>91,32:00>92,33:01>93 |
+
+The column that matters is `wrrd` — store first, read the same cell afterwards:
+**dead on `p`, live on `q`+meta**, for both cells. On a plain frame the store
+rewrites the very byte the read then returns; on Q-in-Q the store writes the
+byte four before it and the read still returns the original. One rule, one
+packet, two different bytes, decided only by the envelope.
+
+**What the store names versus what it hits**, on `q`+meta (capture offsets):
+
+| cell | what the guard calls it | where the read lands | where the store lands |
+|---|---|---|---|
+| (8,1) | ttl | 26 = IP byte 8 = ttl | 22 = IP byte 4 = id high |
+| (16,4) | daddr | 34..37 = IP byte 16..19 = daddr | 30..33 = IP byte 12..15 = saddr |
+
+## 5. The transport base is repaired completely — `@ih` agrees with itself
+
+`pkt->thoff` is computed from the repaired `nhoff`
+(`thoff = skb_network_offset + nhoff + ihl*4`), and **both** the `@ih` read
+(`nft_thoff(pkt)`) and the `@ih` store (`offset = nft_thoff(pkt)`) use it. Five
+cells × {read against the true transport header, read at data+0, store}:
+
+| представление | gate | живых readT | живых readW | store | байты |
+|---|---|---|---|---|---|
+| `p` | bare | **5/5** | 0/5 | **5/5** | 34:9c>90,35:40>91 |
+| `p` | meta protocol | **5/5** | 0/5 | **5/5** | 34:9c>90,35:40>91 |
+| `q` | bare | **0/5** | 0/5 | **0/5** | - |
+| `q` | meta protocol | **5/5** | 0/5 | **5/5** | 38:9c>90,39:40>91 |
+
+On `q` bare the `NFT_PKTINFO_L4PROTO` flag is not set, so both the read and the
+store `goto err`; with `meta protocol` in front both work and land on the same
+byte — the true UDP header, four bytes further out on `q` than on `p`. So the
+split is a property of the **`@nh` base only**: the repair gives `@nh` a new
+*read* coordinate while `@ih` gets a whole new base.
+
+## 6. ARP in Q-in-Q: the repair never happens, so guard and read agree — on the wrong bytes
+
+`nft_meta_pktinfo_may_update()` validates IP and IPv6; for `0x0806` it only
+assigns `pkt->ethertype` and leaves `nhoff = 0`. The guard then dispatches to
+`nft_nh_write_ok_arp()`, whose coordinates are `priv->offset` alone — also
+relative to `skb->data`, which on `q` starts four bytes before the ARP header.
+The ARP header sits at `data+4` (capture 18): `htype` 18..19, `ptype` 20..21,
+`hlen/plen` 22..23, `op` 24..25.
+
+| представление | gate | cell | guard | байты, которые изменились |
+|---|---|---|---|---|
+| `pa` | bare | (0,2) | мёртв | - |
+| `pa` | bare | (2,2) | мёртв | - |
+| `pa` | bare | (4,2) | мёртв | - |
+| `pa` | bare | (6,2) | **жив** | 20:00>90,21:01>91 |
+| `pa` | bare | (8,2) | **жив** | 22:aa>90,23:bb>91 |
+| `pa` | bare | (10,2) | **жив** | 24:cc>90,25:00>91 |
+| `pa` | meta protocol | (0,2) | мёртв | - |
+| `pa` | meta protocol | (2,2) | мёртв | - |
+| `pa` | meta protocol | (4,2) | мёртв | - |
+| `pa` | meta protocol | (6,2) | **жив** | 20:00>90,21:01>91 |
+| `pa` | meta protocol | (8,2) | **жив** | 22:aa>90,23:bb>91 |
+| `pa` | meta protocol | (10,2) | **жив** | 24:cc>90,25:00>91 |
+| `qa` | bare | (0,2) | мёртв | - |
+| `qa` | bare | (2,2) | мёртв | - |
+| `qa` | bare | (4,2) | мёртв | - |
+| `qa` | bare | (6,2) | мёртв | - |
+| `qa` | bare | (8,2) | мёртв | - |
+| `qa` | bare | (10,2) | мёртв | - |
+| `qa` | meta protocol | (0,2) | мёртв | - |
+| `qa` | meta protocol | (2,2) | мёртв | - |
+| `qa` | meta protocol | (4,2) | мёртв | - |
+| `qa` | meta protocol | (6,2) | **жив** | 20:08>90,21:00>91 |
+| `qa` | meta protocol | (8,2) | **жив** | 22:06>90,23:04>91 |
+| `qa` | meta protocol | (10,2) | **жив** | 24:00>90,25:01>91 |
+
+Read as pairs of columns. On `pa` — a bare ARP frame — the cell the whitelist
+calls `ar_op` (offset 6) writes capture 20..21, which is `ar_op`, and the two
+"payload ≥ 8" cells write `sha[0..1]` and `sha[2..3]`: every coordinate names
+the field it writes. On `qa`+meta the same whitelist writes `ar_pro` at offset 6
+(capture 20..21: `08 00 → 90 91`), `ar_hln/ar_pln` at offset 8 (capture 22..23:
+`06 04 → 90 91`), and the **real** `ar_op` at offset 10 (capture 24..25). Three
+consequences, all measured in bytes:
+
+1. A rule that says `@nh,6,2` — the cell whose whitelist entry exists to let a
+   rule write the ARP operation — writes the **protocol type** on Q-in-Q.
+2. A rule that says `@nh,8,2` writes `ar_hln/ar_pln`, and `arp_rcv()` refuses a
+   frame whose `ar_hln` is not the device's — the guard approves a store that
+   makes the frame invalid on the receiving side.
+3. The real `ar_op` is reachable through the catch-all `offset >= 8 && len <= 20`
+   branch: F32's hole and this one are the same branch seen from two envelopes.
+
+The ARP read is not repaired either (candidate A live, B dead, both gates, both
+reps), so on `q`+meta the read and the store **agree with each other** and both
+are four bytes early — the opposite of the IP case, where they disagree by four.
+
+## 7. The two cells whose verdict reads the packet
+
+`nft_nh_write_ok_ip4()` has exactly two cells that read the frame: `case 0`
+requires `src[0]` to equal the byte at `data+0`, and `case 8, len 2` requires
+`src[1]` to equal the byte at `data+9`. On `p` those are the version/ihl and the
+protocol number, so the value the guard compares with is the field itself. On
+`q`+meta they are the high byte of the inner tag's TCI and the low byte of the
+id. Two arms per cell: the standard value, and the value equal to the byte the
+guard actually reads.
+
+| представление | gate | cell | значение | вердикт | байты |
+|---|---|---|---|---|---|
+| `p` | bare | (0,2) | — | **жив** | 15:00>91 |
+| `p` | bare | (0,2) | — | **жив** | 15:00>91 |
+| `p` | bare | (8,2) | — | **жив** | 22:40>90 |
+| `p` | bare | (8,2) | — | **жив** | 22:40>90 |
+| `p` | meta protocol | (0,2) | — | **жив** | 15:00>91 |
+| `p` | meta protocol | (0,2) | — | **жив** | 15:00>91 |
+| `p` | meta protocol | (8,2) | — | **жив** | 22:40>90 |
+| `p` | meta protocol | (8,2) | — | **жив** | 22:40>90 |
+| `q` | bare | (0,2) | — | мёртв | - |
+| `q` | bare | (0,2) | — | мёртв | - |
+| `q` | bare | (8,2) | — | мёртв | - |
+| `q` | bare | (8,2) | — | мёртв | - |
+| `q` | meta protocol | (0,2) | — | мёртв | - |
+| `q` | meta protocol | (0,2) | — | **жив** | 15:c8>91 |
+| `q` | meta protocol | (8,2) | — | мёртв | - |
+| `q` | meta protocol | (8,2) | — | **жив** | 22:12>90 |
+
+The last four rows are the sharpest thing in the turn. On `q`+meta the guard's
+"the IPv4 version/ihl must not change" cell is dead with the ordinary value and
+**live** when its first byte equals the **VLAN TCI high byte** — and then it
+rewrites the TCI: the frame leaves with vid 145 instead of 200 while the rule
+insists it is writing the IPv4 header. And the "do not change the protocol
+number" cell is dead with `0x11` and live when its second byte equals the **IP
+id low byte**, after which it writes the id.
+
+## 8. What the repair buys, in one identity
+
+For all 40 cells the value the `q`+meta arm compares against (candidate B,
+`cap[18+off]`) is byte-for-byte the value the plain-frame arm compares against
+(candidate A, `cap[14+off]`), and both arms are live — 80 checks. So:
+**`meta protocol` makes the `@nh` read on a Q-in-Q frame equal to the read on a
+plain frame, cell for cell. It does not make the store equal to anything.**
+
+## 9. What this adds to the four-branch table of F33
+
+F33 named four types of guard body: a list of coordinates (IPv4/IPv6), a
+half-plane (ARP), a boundary (link layer), a constant (netdev ingress). F40 adds
+what the table was missing: **the coordinates have a reference point, and the
+reference point is not the header's.** The read and the guard both start at
+`skb_network_offset()`, but only the read adds `pkt->nhoff`; the ARP branch uses
+neither. So "the guard checks the field it names" holds in one envelope of the
+ones measured, and the two ways it fails are different: **shifted** (IP over
+Q-in-Q, because the repair moves the read only) and **blind** (ARP over Q-in-Q,
+because there is no repair at all).
+
+## 10. What this does not change
+
+**Not a regression.** No kernel was built; the four source files that decide the
+behaviour are the ones F36–F39 measured (`nft_payload.c`, `nft_meta.c`,
+`nf_tables_core.c`, `nft_chain_filter.c` — anchors in the verifier).
+**Not a vulnerability.** The rule is installed by root in the initial user ns;
+the consequences are a store that silently lands on another field (id instead of
+ttl, saddr instead of daddr, `ar_pro` instead of `ar_op`, the inner VLAN id
+instead of the IPv4 header), a store the guard refuses for a reason unrelated to
+the field, and an ARP frame made invalid by a guard-approved store.
+**Not new behaviour.** F39 measured the same store table (12/40 on `q`+meta),
+F32 the same ARP hole, F38 the same receive path. What is new is the read side
+and the reason the two sides disagree.
+
+## 11. Errors of the turn, all mine
+
+1. **`env` lost its gate suffix.** `f562_arm(env, …)` was called with
+   `F[r].tag` in place of `env` in all five sections, so every line read
+   `env=rd.p` instead of `env=rd.p.meta`. Found by reading the first 300 lines
+   of the first full boot; fixed, battery restarted. `rep` and `gate` were
+   printed as their own fields, so no number depended on it — but a wrong label
+   is a defect.
+2. **`cv` and `whex` shared one hex buffer.** `f559_hexs(hw, …)` was called
+   twice inside one `printf`, once for the candidate and once for the capture; C
+   does not order arguments, so on every read arm `whex` held the candidate and
+   the capture was lost from that column. Caught by the verifier as 480 red
+   checks on *correct* data ("a read changes nothing"); fixed with a second
+   buffer, battery restarted.
+3. **The `wr` arm of the `pair` section did not store.** The kind table passed
+   `do_wr = kind != 0`, so the store-only arm was a counter-only control while
+   claiming to be a store. Caught by the verifier as `wr arm` missing on all
+   eight groups — the check exists exactly for this — fixed, battery restarted.
+4. **No capture for ARP, twice.** The capture is matched by content and the
+   needle was the IPv4 payload `0x77…`; the ARP frame has no such bytes, so both
+   taps returned `-1` and the ARP store arms had no byte evidence. The needle is
+   now per representation (the ARP sender protocol address).
+5. **Three full batteries thrown away** (~50 minutes of QEMU) for 1., 2., 3.
+   The F39 lesson repeated: the instrument is wrong before it is useful, and a
+   verifier that models the *source* is what tells you so.
+6. `pkill -f "f40_run.sh full"` killed my own shell a second time (the pattern
+   matched the invoking command line); the processes had to be killed by pid.
+7. `f40_summary.py` built the env key from the *display* label
+   (`"meta protocol"`) instead of the token (`"meta"`), so five tables printed
+   `0/40` and `MISSING` on correct logs. The verifier was green throughout: the
+   summary script was the thing that lied, which is why the tables are checked
+   by a separate auditor and not by the code that prints them.
+
+## 12. How it was checked
+
+| | |
+|---|---|
+| `tools/verify562.py` | **2332 проверки, 0 расхождений** — provenance (kernel sha out of the log header against the file, initrd against the hash list, differ **extracted from the initramfs** against the built binary), seven source anchors (read adds `nhoff`, store does not, the guard uses `skb_network_offset` only, the ARP whitelist is offset-only, `meta` sets `nhoff = VLAN_HLEN + skb_network_offset`, `meta` validates only IP and IPv6, bridge pktinfo comes from `eth_hdr()->h_proto`), 657 arms in each boot, **all 480 read arms** against a Python model of the two coordinates, all 24 pair arms including the store-then-read order, all 60 transport arms, all 72 ARP arms, all 16 value arms, the 80 identity checks, determinism between the two boots, 0 splat |
+| `tools/verify562_selftest.sh` | 18 мутаций по одному полю на копиях логов, каждая краснит **свою** проверку; базовая линия зелёная; крэш и «мутация мимо поля» не считаются пойманной мутацией |
+| `tools/audit_f40_doc.py` | каждая таблица этого документа сверена с логами |
+| `tools/f40_summary.py` | таблицы §3–§7 **выведены** из лога, а не набраны; `summary.json` — тот же вывод в машинной форме |
+| коллекция | перегенерирована |
+
+## 13. What is not measured, plainly
+
+- One hook (bridge prerouting), one veth pair in a bridge, one sender, one
+  kernel (`7.3.4-T558`).
+- Two carriers can make `pkt->nhoff` non-zero: 802.1Q and PPPoE
+  (`nhoff = PPPOE_SES_HLEN = 6`). **PPPoE is not measured** — the symbol is not
+  in this image; the prediction is the same shift by six and stays a reading of
+  the source.
+- A second `meta protocol` in the same chain, or one after a `jump`:
+  `nft_meta_pktinfo_may_update()` is called on every evaluation but
+  `pkt->flags` is already set after the first, so the second should be a no-op —
+  not measured.
+- IPv6 over Q-in-Q: `__nft_set_pktinfo_ipv6_validate` has the same shape and the
+  IPv6 `@nh` branch is a different list; the shift should be identical, not
+  measured.
+- The `@ll` base under the same repair: `nhoff` does not enter `nft_payload_eval`'s
+  `ll` branch, so nothing should move — not measured.
+- GSO/`CHECKSUM_PARTIAL`, stores with checksum fixup, QinQ with `0x88a8`
+  inside, vlan devices, tunnels.
+- `IpInReceives` is used only as an envelope control: `p` gives 2 (the bridge
+  floods a copy up to `br0`), everything tagged gives 0 because the vid is 100
+  and there is no vlan device (F38).
+
+## 14. Files
+
+`findings/F40-nh-read-side/{SUMMARY.md, summary.json, VERIFY_REPORT.md, LETTER_SECTION_F40.txt}`
+· `vm/{differ562_add.c, build_f40_differ.sh, make_initramfs562.sh, build/differ562}`
+· `tools/{f40_run.sh, verify562.py, verify562_selftest.sh, f40_mutate.py, f40_summary.py, audit_f40_doc.py}`
+· kernel `src/linux-7.3.4-T558` (`459f02a5…`, the same one as F36–F39)
+· `research/predictions_562.md`
+· logs `logs/f40_{rep1,rep2}.log`
+
+
+===== summary.json =====
+{
+ "arp": {
+  "pa.bare.0": {
+   "chg": "-",
+   "live": 0
+  },
+  "pa.bare.10": {
+   "chg": "24:cc>90,25:00>91",
+   "live": 1
+  },
+  "pa.bare.2": {
+   "chg": "-",
+   "live": 0
+  },
+  "pa.bare.4": {
+   "chg": "-",
+   "live": 0
+  },
+  "pa.bare.6": {
+   "chg": "20:00>90,21:01>91",
+   "live": 1
+  },
+  "pa.bare.8": {
+   "chg": "22:aa>90,23:bb>91",
+   "live": 1
+  },
+  "pa.meta.0": {
+   "chg": "-",
+   "live": 0
+  },
+  "pa.meta.10": {
+   "chg": "24:cc>90,25:00>91",
+   "live": 1
+  },
+  "pa.meta.2": {
+   "chg": "-",
+   "live": 0
+  },
+  "pa.meta.4": {
+   "chg": "-",
+   "live": 0
+  },
+  "pa.meta.6": {
+   "chg": "20:00>90,21:01>91",
+   "live": 1
+  },
+  "pa.meta.8": {
+   "chg": "22:aa>90,23:bb>91",
+   "live": 1
+  },
+  "qa.bare.0": {
+   "chg": "-",
+   "live": 0
+  },
+  "qa.bare.10": {
+   "chg": "-",
+   "live": 0
+  },
+  "qa.bare.2": {
+   "chg": "-",
+   "live": 0
+  },
+  "qa.bare.4": {
+   "chg": "-",
+   "live": 0
+  },
+  "qa.bare.6": {
+   "chg": "-",
+   "live": 0
+  },
+  "qa.bare.8": {
+   "chg": "-",
+   "live": 0
+  },
+  "qa.meta.0": {
+   "chg": "-",
+   "live": 0
+  },
+  "qa.meta.10": {
+   "chg": "24:00>90,25:01>91",
+   "live": 1
+  },
+  "qa.meta.2": {
+   "chg": "-",
+   "live": 0
+  },
+  "qa.meta.4": {
+   "chg": "-",
+   "live": 0
+  },
+  "qa.meta.6": {
+   "chg": "20:08>90,21:00>91",
+   "live": 1
+  },
+  "qa.meta.8": {
+   "chg": "22:06>90,23:04>91",
+   "live": 1
+  }
+ },
+ "ctl": {
+  "p": {
+   "ipin": 2,
+   "live": 1,
+   "wn": 60
+  },
+  "pa": {
+   "ipin": 0,
+   "live": 1,
+   "wn": 60
+  },
+  "q": {
+   "ipin": 0,
+   "live": 1,
+   "wn": 64
+  },
+  "qa": {
+   "ipin": 0,
+   "live": 1,
+   "wn": 64
+  },
+  "w": {
+   "ipin": 0,
+   "live": 1,
+   "wn": 60
+  }
+ },
+ "finding": "F40",
+ "ih": {
+  "p.bare": {
+   "chg": "34:9c>90,35:40>91",
+   "readT": 5,
+   "readW": 0,
+   "store": 5
+  },
+  "p.meta": {
+   "chg": "34:9c>90,35:40>91",
+   "readT": 5,
+   "readW": 0,
+   "store": 5
+  },
+  "q.bare": {
+   "chg": "-",
+   "readT": 0,
+   "readW": 0,
+   "store": 0
+  },
+  "q.meta": {
+   "chg": "38:9c>90,39:40>91",
+   "readT": 5,
+   "readW": 0,
+   "store": 5
+  }
+ },
+ "indistinguishable": {
+  "p": [
+   [
+    2,
+    1
+   ],
+   [
+    12,
+    1
+   ],
+   [
+    14,
+    1
+   ]
+  ],
+  "q": [
+   [
+    6,
+    1
+   ],
+   [
+    16,
+    1
+   ]
+  ],
+  "w": [
+   [
+    2,
+    1
+   ],
+   [
+    12,
+    1
+   ],
+   [
+    14,
+    1
+   ]
+  ]
+ },
+ "kernel": "7.3.4-T558",
+ "pair": {
+  "p.bare.rdwr.16_4": {
+   "chg": "30:0a>90,31:09>91,32:00>92,33:07>93",
+   "live": 1
+  },
+  "p.bare.rdwr.8_1": {
+   "chg": "22:40>90",
+   "live": 1
+  },
+  "p.bare.wr.16_4": {
+   "chg": "30:0a>90,31:09>91,32:00>92,33:07>93",
+   "live": 1
+  },
+  "p.bare.wr.8_1": {
+   "chg": "22:40>90",
+   "live": 1
+  },
+  "p.bare.wrrd.16_4": {
+   "chg": "30:0a>90,31:09>91,32:00>92,33:07>93",
+   "live": 0
+  },
+  "p.bare.wrrd.8_1": {
+   "chg": "22:40>90",
+   "live": 0
+  },
+  "p.meta.rdwr.16_4": {
+   "chg": "30:0a>90,31:09>91,32:00>92,33:07>93",
+   "live": 1
+  },
+  "p.meta.rdwr.8_1": {
+   "chg": "22:40>90",
+   "live": 1
+  },
+  "p.meta.wr.16_4": {
+   "chg": "30:0a>90,31:09>91,32:00>92,33:07>93",
+   "live": 1
+  },
+  "p.meta.wr.8_1": {
+   "chg": "22:40>90",
+   "live": 1
+  },
+  "p.meta.wrrd.16_4": {
+   "chg": "30:0a>90,31:09>91,32:00>92,33:07>93",
+   "live": 0
+  },
+  "p.meta.wrrd.8_1": {
+   "chg": "22:40>90",
+   "live": 0
+  },
+  "q.bare.rdwr.16_4": {
+   "chg": "-",
+   "live": 0
+  },
+  "q.bare.rdwr.8_1": {
+   "chg": "-",
+   "live": 0
+  },
+  "q.bare.wr.16_4": {
+   "chg": "-",
+   "live": 0
+  },
+  "q.bare.wr.8_1": {
+   "chg": "-",
+   "live": 0
+  },
+  "q.bare.wrrd.16_4": {
+   "chg": "-",
+   "live": 0
+  },
+  "q.bare.wrrd.8_1": {
+   "chg": "-",
+   "live": 0
+  },
+  "q.meta.rdwr.16_4": {
+   "chg": "30:0a>90,31:01>91,32:00>92,33:01>93",
+   "live": 1
+  },
+  "q.meta.rdwr.8_1": {
+   "chg": "22:12>90",
+   "live": 1
+  },
+  "q.meta.wr.16_4": {
+   "chg": "30:0a>90,31:01>91,32:00>92,33:01>93",
+   "live": 1
+  },
+  "q.meta.wr.8_1": {
+   "chg": "22:12>90",
+   "live": 1
+  },
+  "q.meta.wrrd.16_4": {
+   "chg": "30:0a>90,31:01>91,32:00>92,33:01>93",
+   "live": 1
+  },
+  "q.meta.wrrd.8_1": {
+   "chg": "22:12>90",
+   "live": 1
+  }
+ },
+ "read_grid": {
+  "p.bare": {
+   "discriminating": 37,
+   "liveA": 40,
+   "liveB": 3
+  },
+  "p.meta": {
+   "discriminating": 37,
+   "liveA": 40,
+   "liveB": 3
+  },
+  "q.bare": {
+   "discriminating": 38,
+   "liveA": 40,
+   "liveB": 2
+  },
+  "q.meta": {
+   "discriminating": 38,
+   "liveA": 2,
+   "liveB": 40
+  },
+  "w.bare": {
+   "discriminating": 37,
+   "liveA": 40,
+   "liveB": 3
+  },
+  "w.meta": {
+   "discriminating": 37,
+   "liveA": 40,
+   "liveB": 3
+  }
+ },
+ "title": "the read side of @nh: the repair of pktinfo moves the read and leaves the store",
+ "turn": 562,
+ "val": {
+  "p.bare.0": [
+   {
+    "chg": "15:00>91",
+    "live": 1
+   },
+   {
+    "chg": "15:00>91",
+    "live": 1
+   }
+  ],
+  "p.bare.8": [
+   {
+    "chg": "22:40>90",
+    "live": 1
+   },
+   {
+    "chg": "22:40>90",
+    "live": 1
+   }
+  ],
+  "p.meta.0": [
+   {
+    "chg": "15:00>91",
+    "live": 1
+   },
+   {
+    "chg": "15:00>91",
+    "live": 1
+   }
+  ],
+  "p.meta.8": [
+   {
+    "chg": "22:40>90",
+    "live": 1
+   },
+   {
+    "chg": "22:40>90",
+    "live": 1
+   }
+  ],
+  "q.bare.0": [
+   {
+    "chg": "-",
+    "live": 0
+   },
+   {
+    "chg": "-",
+    "live": 0
+   }
+  ],
+  "q.bare.8": [
+   {
+    "chg": "-",
+    "live": 0
+   },
+   {
+    "chg": "-",
+    "live": 0
+   }
+  ],
+  "q.meta.0": [
+   {
+    "chg": "-",
+    "live": 0
+   },
+   {
+    "chg": "15:c8>91",
+    "live": 1
+   }
+  ],
+  "q.meta.8": [
+   {
+    "chg": "-",
+    "live": 0
+   },
+   {
+    "chg": "22:12>90",
+    "live": 1
+   }
+  ]
+ }
+}

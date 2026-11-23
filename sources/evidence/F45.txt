@@ -1,0 +1,728 @@
+===== LETTER_SECTION_F45.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload: a static transport-store check is enforced at runtime,
+ and 14 nft spellings die silently (`tcp flags set` regressed in v7.3)
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+References: <the same Message-Id>
+
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+Theme: the IPv6 constructor that walks -- one coordinate, three failures, and a
+validation that runs before the hook.
+
+No diff below: this is the IPv6 half of the same measurement and it proposes no
+change to a line of code.
+
+Linux 7.3.4, nftables in the initial user namespace, one frame at a time, one
+rule at a time.  Five doors: family `ip` layer-3 (a control -- an IPv6 frame
+never arrives there), family `ip6` layer-3, family `inet` layer-3, family
+`netdev` at the ingress hook of a device, and family `inet` at the ingress hook
+of the same device.  Two base chains per door (priority 0/10), the first is
+`counter` + `log` + `accept` and says whether the hook ran, the second carries
+the `payload` statement and says whether the guard accepted it.  The logged
+payload is the frame at `skb->data` after the store, so every written byte is
+read back from the same skb the rule ran on.  The receiving side is IPv6/UDP
+sockets and the kernel's own Ip6 counters.  524 arms x 2 boots, byte-identical.
+
+This is the IPv6 counterpart of the IPv4 measurement: F44 showed that `@th` has
+one coordinate across four doors because IPv4 computes it as a formula
+(`ihl*4`).  IPv6 does not compute it, it walks.
+
+1. The coordinate follows the walk, and it is the right one.
+
+        nft_set_pktinfo_ipv6()          thoff = ipv6_find_hdr(skb, &thoff=0, -1, &fragoff, IP6_FH_F_AUTH)
+        __nft_set_pktinfo_ipv6_validate() the same walk, after a version and payload-length check
+        nft_set_pktinfo_ipv6_ingress()  the same walk, but a failure returns -1 -> NF_DROP
+
+`ipv6_find_hdr()` starts at `skb_network_offset(skb) + sizeof(struct ipv6hdr)`
+and returns the offset of the byte after the last extension header, measured
+from the same origin.  `skb_network_offset()` is `network_header - data`, which
+is zero at all of these hooks, so the value the walk returns is exactly the
+`skb_copy_bits()` offset wanted -- the same arithmetic that makes the IPv4
+relative and absolute formulas agree.
+
+Measured, eight `@th` cells per door and envelope, envelope = bare / hop-by-hop
+/ destination-options / hop-by-hop+destination-options:
+
+  door            bare   +8 byte ext   +16 byte ext   bare store lands at
+  ip6 / inet L3   8/8    8/8           8/8            data+40+off
+  netdev ingress  8/8    8/8           8/8            data+40/48/56+off
+  inet ingress    8/8    8/8           8/8            data+40/48/56+off
+
+128 of 128 cells accepted, and on the write side every one landed on the true
+transport header: with one 8-byte header the store for offset 0 lands on frame
+bytes 62..63, with two on 70..71.  Reads agree with writes (sport, dport, udp
+length: 3/3 on both doors and both envelopes).
+
+2. A non-first fragment makes `thoff` zero, and nothing can see it.
+
+        if (nexthdr == NEXTHDR_FRAGMENT) {
+                ... if (_frag_off) {
+                        if (target < 0 && (!ipv6_ext_hdr(hp->nexthdr) || hp->nexthdr == NEXTHDR_NONE)) {
+                                if (fragoff) *fragoff = _frag_off;
+                                return hp->nexthdr;          /* *offset is NOT written */
+                        }
+
+For a fragment with a non-zero offset, `ipv6_find_hdr()` returns from inside
+the loop without assigning `*offset`, so `pkt->thoff` keeps its initial 0 while
+the transport header is at 48.  It is invisible: `nft_payload_eval()` and
+`nft_payload_set_eval()` both refuse base `th` when `pkt->fragoff` is set, and
+that is exactly the case in which the coordinate is wrong -- 0/8 cells accepted
+on all four doors.  A first fragment (offset 0) behaves like a plain packet:
+8/8, and the datagram is delivered.
+
+3. A packet with no transport header has a `tprot`.
+
+`nexthdr = 59` (NEXTHDR_NONE, no payload): the walk succeeds with
+`thoff = 40`, `pkt->flags` gets NFT_PKTINFO_L4PROTO, `pkt->tprot = 59`.  The
+`@th` guard therefore accepts (59 != TCP) and the store dies one line later in
+`skb_ensure_writable(40+len)` against a 40-byte packet: 0/8 accepted, on every
+door.  `meta l4proto` returns 59 for this packet -- a rule `meta l4proto 59
+counter` fires on a packet that has no upper-layer header at all, while the
+same expression on a packet whose extension-header walk failed does not fire
+(no NFT_PKTINFO_L4PROTO).  The kernel does count such a packet in
+Ip6InDelivers and hands it to nobody.
+
+4. Three doors, three failure modes, one malformed frame.
+
+Four malformed frames, and the counters are unambiguous:
+
+  frame                        inet ingress  netdev ingress   ip6/inet L3
+  payload_len 512, real 26     0/0  (InTrunc) 1/1, th 0/2    0/0  (InTrunc)
+  hop-by-hop hdrlen 15, 8 real 0/0  (InHdr)   1/1, th 0/2    0/0  (InHdr)
+  dest-opts  hdrlen 15, 8 real 0/0  (InHdr)   1/1, th 0/2    1/1, th 0/2
+  nexthdr 59, no payload       1/1, th 0/2    1/1, th 0/2    1/1, th 0/2
+
+Column 1 is the inet-ingress handler returning NF_DROP before `nft_do_chain()`
+(Ip6InReceives does not move: the stack never sees the frame).  Column 2 is
+`__nft_set_pktinfo_ipv6_validate()` failing and `nft_set_pktinfo_unspec()`
+letting the chain run: counter 1, no `@th` store.  Column 3 is the surprise:
+two of these frames never reach the layer-3 hook at all, because
+`ip6_rcv_core()` -- which runs before NF_INET_PRE_ROUTING -- already checks the
+version, `payload_len + sizeof(*ip6h) > skb->len`, and, for nexthdr 0,
+`ipv6_parse_hopopts()`.  The `unspec` branch of `nft_set_pktinfo_ipv6()` is
+reachable at layer 3 only through an error `ip6_rcv_core()` does not look at:
+a malformed extension header that is not hop-by-hop.  One byte of next-header
+value (0 vs 60) decides whether the chain runs at all.
+
+5. `@nh` for IPv6: a white list that reads a constant, and a constant that
+   reads nothing.
+
+  door                    live cells of 19
+  netdev ingress          19/19
+  ip6 / inet L3, inet ingress   9/19  (exactly nft_nh_write_ok_ip6()'s branches)
+
+`nft_nh_write_ok_ip6()` case 0 is `length <= 4 && ih->version == 6`, i.e. it
+reads a constant out of the register, while `nft_nh_write_ok_ip4()` case 0
+compares the value with the packet's own first byte.  So on the IPv6 side, a
+store of 0x90 into offset 0 is refused on the three whitelisted doors and
+accepted on the netdev ingress door (which returns true unconditionally at
+NF_NETDEV_INGRESS) -- and the packet then dies in `ip6_rcv_core()`:
+Ip6InHdrErrors.  Same door, a 4-byte store at offset 2 or a 2-byte store at
+offset 4 rewrites `payload_len` and the packet dies with Ip6InTruncatedPkts.
+A store at offset 6 rewrites `nexthdr` and it dies with Ip6InUnknownProtos.
+
+And a store into `saddr`/`daddr` is whitelisted on every door (offset 24, len
+<= 16).  At layer 3 the hook has already passed `ip6_rcv_core()`, so no
+validation happens afterwards; but the route lookup for a received packet runs
+in `ip6_rcv_finish()`, i.e. AFTER NF_INET_PRE_ROUTING returns.  A rule that
+rewrites `daddr` therefore adresses the packet to nowhere: it is neither
+delivered nor counted by any Ip6 counter I can read.  Four doors, one rule,
+one silent loss.
+
+6. One chain, one rule, two families.
+
+A single base chain in family `inet` at prerouting, one `@nh` store, two
+frames:
+
+  cell                 IPv6   IPv4      reason
+  offset 2, len 2      store  refuse    case 2 is in the ip6 list only
+  offset 4, len 2      refuse store     offsetof(iphdr, id) is in the ip4 list only
+  offset 7, len 1      store  refuse    hop_limit vs nothing
+  offset 0, len 2 60 00  store refuse   ih->version == 6
+  offset 0, len 2 45 00  refuse store   same-store-as-packet-byte
+
+and `@th` in the same chain stores at `data+40+off` for the IPv6 frame and at
+`data+20+off` for the IPv4 one.  The verdict and the coordinate are properties
+of the packet's family, not of the rule.
+
+Not tested: PPPoE carrying extension headers, routing and AH headers
+(IP6_FH_F_AUTH stops the walk at AH), 12+ extension headers, IPv6 at
+local_in/forward/post_routing, GSO/CHECKSUM_PARTIAL, VLAN-bits offload
+combinations.  Every rule here is installed by root in the initial user
+namespace; nothing in this report is a privilege boundary crossing.
+
+
+===== SUMMARY.md =====
+# F45 — конструктор, который идёт по цепочке: одна координата, три отказа и проверка, которая стоит раньше хука
+
+Ход 567. Ядер не собирал: всё на том же `7.3.4-T563` (`1efbc957…2033`), образ
+F41–F44. Новый прибор `differ567` — **524 плеча в каждой из двух загрузок**.
+
+## 0. Ответ в одном абзаце
+
+Вопрос 566-го был: у `thoff` четыре конструктора, и один из них не считает
+координату формулой, а **идёт по цепочке заголовков**. Ответ: координата одна и
+она верна — `@th` попадает в настоящее поле на всех четырёх дверях при любом
+числе extension-заголовков, потому что `nft_thoff()` возвращает `pkt->thoff`, а
+`ipv6_find_hdr()` считает его от `skb_network_offset()`, который в этих путях
+равен нулю. Разница с IPv4 не в результате, а в том, **кто отвечает за
+результат**: у IPv4 координата — арифметика (`ihl*4`), у IPv6 — обход, и обход
+имеет три разных отказа, каждый со своей подписью в счётчиках. Первый отказ
+(`ieg`) роняет кадр **до** цепочки; второй (`ndg`) отдаёт управление дальше с
+`unspec`; а на двух layer-3 дверях двух из трёх классов ошибок **вообще нет**,
+потому что `ip6_rcv_core()` проверяет версию, длину и hop-by-hop **раньше**
+`NF_INET_PRE_ROUTING`. И третье, чего я не искал: страж `@nh` для IPv6
+сравнивает **константу 6**, а не байт пакета, — поэтому на `ndg` он разрешает
+записать `0x90` в версию, длину или `nexthdr`, и кадр умирает уже на стеке
+(`InHdrErrors`, `InTruncated`, `InUnknownProtos`), а запись в `daddr`
+убивает его **без единого счётчика**.
+
+## 1. Пять дверей и четыре конструктора
+
+| дверь | семейство · хук | конструктор | при отказе |
+|---|---|---|---|
+| `ip4p` | `ip` · prerouting (0) | `nft_set_pktinfo_ipv4()` | IPv6 не приходит вовсе |
+| `ip6p` | `ip6` · prerouting (0) | `nft_set_pktinfo_ipv6()` | `unspec`, без drop |
+| `inp` | `inet` · prerouting (0) | `nft_set_pktinfo_ipv6()` | `unspec`, без drop |
+| `ndg` | `netdev` · ingress (0) | `nft_set_pktinfo_ipv6_validate()` | `unspec`, без drop |
+| `ieg` | `inet` · ingress (5) | `nft_set_pktinfo_ipv6_ingress()` | **`NF_DROP`** |
+
+Опорные строки исходника — все проверяются `verify567.py` как якоря:
+
+```
+include/net/netfilter/nf_tables_ipv6.h:
+  nft_set_pktinfo_ipv6():          protohdr = ipv6_find_hdr(pkt->skb, &thoff, -1, &frag_off, &flags);
+                                   pkt->thoff = thoff;          /* результат обхода */
+                                   ... иначе nft_set_pktinfo_unspec(pkt);
+  __nft_set_pktinfo_ipv6_validate(): if (pkt_len + sizeof(*ip6h) > skb_len) return -1;
+  nft_set_pktinfo_ipv6_ingress():  INTRUNCATEDPKTS / INHDRERRORS и return -1
+net/netfilter/nft_chain_filter.c:
+  nft_do_chain_inet_ingress():     if (nft_set_pktinfo_ipv6_ingress(&pkt) < 0) return NF_DROP;
+net/ipv6/exthdrs_core.c:
+  ipv6_find_hdr():                 start = skb_network_offset(skb) + sizeof(struct ipv6hdr);
+                                   if (skb->len - start < hdrlen) return -EBADMSG;
+                                   у не-первого фрагмента return без *offset = start
+net/ipv6/ip6_input.c:
+  ip6_rcv_core():                  INTRUNCATEDPKTS до хука; ipv6_parse_hopopts() -> INHDRERRORS
+include/net/netfilter/nf_tables.h:
+  nft_thoff():                     return pkt->thoff;            /* без добавок */
+include/linux/skbuff.h:
+  skb_network_offset():            return skb_network_header(skb) - skb->data;
+```
+
+## 2. `@th` идёт по цепочке — и приходит в то же самое место
+
+Восемь клеток транспорта F43, четыре конверта и четыре двери — **128 из 128 живых** (T1). Ни одна не отказана, и каждая легла в байт, который называет: у
+`v6` запись `t0_2` — это байты 40..41 заголовка L3, у `hb` — 48..49, у `hbdo` —
+56..57 (T2). Это и есть разница между формулой и обходом: у IPv4 координата не
+меняется от содержимого, у IPv6 её задаёт число extension-заголовков, и обход
+считает его сам.
+
+Чтение и запись берут **одну** функцию (`nft_thoff`), поэтому чтение тоже идёт
+по обходу: три клетки (`sport`, `dport`, `len`) сходятся на 3/3 на обеих
+дверях и в обоих конвертах (T6).
+
+## 3. Фрагменты и кадр без транспорта
+
+| кадр | что это | `@th` |
+|---|---|---|
+| `fr0` | фрагмент с offset 0 | **8/8 живы на всех дверях**, кадр доставлен (`u6a=1`) |
+| `frn` | фрагмент с offset 8 | **0/8 на всех дверях**, `i6deliv=0` |
+| `none` | `nexthdr = 59`, тела нет | **0/8 на всех дверях** |
+
+`frn` — это тот случай, где страж отказывает **и чтению, и записи** одной
+строкой (`if (!(pkt->flags & NFT_PKTINFO_L4PROTO) || pkt->fragoff) goto err;`), и
+потому снаружи не видно самого интересного: у не-первого фрагмента
+`ipv6_find_hdr()` выходит из цикла, **не записав `*offset`**, и `pkt->thoff`
+остаётся нулём, хотя транспортный заголовок лежит на 48. Это прочитано в коде,
+а не измерено: через `@th` оно невидимо именно потому, что `fragoff` убивает все
+клетки.
+
+`none` — обратный случай: обход заканчивается **успешно** (`tprot = 59`,
+`thoff = 40`), страж `@th` пропускает (59 ≠ TCP), и запись умирает на длине:
+`skb_ensure_writable(40+len)` при 40 байтах. А `meta l4proto` на этом кадре
+**срабатывает и возвращает 59** (T7) — то есть состояние описывает транспортный
+заголовок, которого в пакете нет. Стек этот кадр «доставляет» (`i6deliv=1`,
+T9) и никому не отдаёт (`u6a=0`).
+
+## 4. `@nh` для IPv6: белый список против константы ingress
+
+Девятнадцать клеток сети, четыре двери (T4): `ndg` — **19/19**, `ip6p`/`inp`/
+`ieg` — **9/19**, и эти девять суть ровно ветви `nft_nh_write_ok_ip6()`:
+`case 0` (len ≤ 4 и **version == 6**), `case 2` (len ≤ 2), `hop_limit`
+(len == 1), `saddr` (len ≤ 32), `daddr` (len ≤ 16).
+
+Две клетки показывают, что `case 0` читает **значение**, а не пакет:
+
+| клетка | imm | ip6p/inp/ieg | ndg |
+|---|---|---|---|
+| `n0_1` | `60` | жив | жив |
+| `n0_1x` | `90` | **мёртв** | жив |
+| `n0_2v` | `61 00` | жив | жив |
+| `n0_2x` | `90 91` | **мёртв** | жив |
+
+У IPv4 та же ветвь сравнивает `*new_octets` с **первым байтом кадра**
+(`nft_nh_write_ok_ip4`), у IPv6 — с константой 6. Это одна и та же проверка «не
+измени версию», написанная двумя разными способами, и на `ndg` она не работает
+вовсе (константа ingress), поэтому `0x90` в версию проходит — а кадр после
+этого умирает (T12: `n0_1x` → `InHdrErrors`).
+
+## 5. Одна цепь, одно правило, два семейства
+
+Дверь `inp`, цепь `ch`, правило `@nh`: вердикт **переворачивается по семейству**
+(T5):
+
+| клетка | IPv6 | IPv4 |
+|---|---|---|
+| `x2_2` | жив | мёртв |
+| `x4_2` | мёртв | жив |
+| `x7_1` | жив (`hop_limit`) | мёртв |
+| `x0_2v` (`60 00`) | жив | мёртв |
+| `x0_2d` (`45 00`) | мёртв | жив |
+
+И `@th` на той же цепи жива на обоих — но пишет в **разные байты кадра**: `xt0_2`
+кладёт `9091` в 40..41 у IPv6 и в 20..21 у IPv4, `xt12_4` — в 52..55 и 32..35
+(T5). То есть «правило» в nftables — это вердикт стража и координата, и обе
+зависят от семейства пакета, а не от правила.
+
+## 6. Malformed: один кадр, три двери, три исхода
+
+Четыре кадра: `mtrunc` (payload_len 512), `mexth` (hop-by-hop с hdrlen 15),
+`mdobad` (**dest-opts** с hdrlen 15), `none`. Матрица — T8, и в ней три разных
+механизма:
+
+1. **`ieg` роняет до цепочки.** Счётчик 0/0 во всех четырёх случаях; `mtrunc`
+   даёт `InTruncatedPkts`, остальные — `InHdrErrors`, и `Ip6InReceives` = 0:
+   стек кадра не видел вовсе.
+2. **`ndg` не роняет, а отступает.** Валидатор отказал → `unspec` → цепь
+   считается (1/1), `@th` мертва (0/2), кадр идёт дальше и умирает на стеке.
+3. **Layer-3 двери видят только то, что пережило `ip6_rcv_core()`.** Для
+   `mtrunc` и `mexth` — **0/0**: длина и hop-by-hop проверяются **раньше**
+   `NF_INET_PRE_ROUTING`, так что `nft_set_pktinfo_ipv6()` до них не доходит.
+   А `mdobad` проходит (там парсится только `NEXTHDR_HOP`) — и тогда 1/1 при
+   `@th` 0/2, то есть `unspec` на layer-3 двери **достижим**, но только ошибкой,
+   которую `ip6_rcv_core` не проверяет.
+
+Разница между `mexth` и `mdobad` — **один байт `nexthdr`** (0 против 60) при
+одинаковом дефекте. Он решает, увидит ли layer-3 цепь кадр вообще.
+
+`none` ведёт себя одинаково на всех дверях: 1/1 и 0 записей.
+
+## 7. Страж говорит «да», стек говорит «нет»
+
+Пятнадцать `@nh` записей, которые страж пропустил, и то, что с кадром стало
+(T12). Четыре разных следствия, и три из них — потеря пакета:
+
+| что записано | дверь | стек |
+|---|---|---|
+| `n0_1x`/`n0_2x` — версия → 9 | `ndg` | `InHdrErrors` |
+| `n2_4`/`n4_2` — payload_len | `ndg` | `InTruncated` |
+| `n6_2` — nexthdr → 144 | `ndg` | `InUnknownProtos` |
+| `n24_*`, `n28_4` — daddr | **все четыре** | ничего: ни счётчика, ни доставки |
+
+Последняя строка — главная. Запись в `daddr` разрешена (`case 24: len ≤ 16`) на
+всех дверях, пакет после неё адресован в никуда, и он исчезает **между
+маршрутизацией и доставкой**: `ip6_rcv_finish` (okfn хука) делает route lookup
+уже по переписанным байтам, forwarding выключен, кадр не доставлен и не
+отброшен ни одним счётчиком, который я измеряю. Видно это только по `post`
+(NFLOG) и по молчанию сокета.
+
+При этом на layer-3 дверях те же записи в длину и версию **безвредны**: там
+`ip6_rcv_core` уже отработал до записи, и никто длину заново не проверяет —
+`n2_4` на `inp` доставлен. Один и тот же байт, записанный на двух дверях,
+решает судьбу пакета по-разному, потому что двери стоят по разные стороны
+одной проверки.
+
+## 8. Межсемейного отравления нет, но копия моста есть
+
+T10: три IPv4-кадра, посланные до, между и после отброшенных IPv6 — все три
+считаются и доставляются (`u4=2`), IPv6-кадры при этом ведут себя одинаково.
+`switch (skb->protocol)` в `nft_do_chain_inet_ingress()` — по кадру, не по
+устройству.
+
+А двойка в `u4=2` — не ошибка прибора: мост заливает кадр в `r1`, копия
+возвращается на `r0`, и IPv4 (**weak host**) доставляет её второй раз. У IPv6
+та же копия приходит на `r0`, где IPv6 выключен, и считается в `Ip6InReceives`
+и `Ip6InDiscards` (T9: `i6in=2`, `i6deliv=1`, `u6a=1`). Это различие семей, а
+не различие правил, и оно видно только по счётчикам.
+
+## 9. Ошибки хода, все мои
+
+1. **`md`-секция первого прибора путала имена и кадры**: `M[i]` был `E[i]`
+   (plain/hb/do), а подписи — `mtrunc/mexth/none`. Весь блок был измерен не на
+   тех кадрах; поймал, читая строки лога, до отчёта; переписал на
+   `E[MD_FRAMES[i]]`.
+2. **`meta l4proto` сравнивался двумя байтами** (`00 11`), а значение —
+   однобайтовое: 16 плеч показывали «мертво» на верных данных. Исправлено на
+   len 1; после этого `l4_17` ожил.
+3. **Модель «стек доставит» строилась по исходному кадру**, а не по
+   записанному: 36 красных проверок на верных данных (`nh`-секция) — и все 36
+   оказались находкой (запись в версию/длину/`daddr` меняет судьбу пакета).
+4. **`ip6_rcv_core` в модели применялся ко всем дверям одинаково**: для
+   layer-3 он работает по **до**-записанному кадру, для ingress — по
+   **после**-записанному. Разделил по двери; 34 красных ушли.
+5. **`i6deliv` ≠ «кадр дошёл до стека»**: у неизвестного протокола
+   `InDelivers` не растёт, растёт `InUnknownProtos` — нашёл на `n6_2`.
+6. **cpio: выравнивал имя, а не смещение в архиве** — пятый раз в проекте
+   (F43, F44, снова). Поймал дымом: differ «не найден в initramfs».
+7. **Адрес IPv6 сначала повесил на `i1`**, и доставки не было вовсе: IPv6
+   отдаёт unicast только устройству, которому адрес принадлежит, а кадр мост
+   отдаёт наверх как `br0`. Перенёс адрес на `br0` — сокет-оракул заработал.
+8. `f567_section_mp` в первой версии гонял `meta` при живом `ieg`, то есть
+   мерил отказ чужой двери; добавил второй проход после удаления таблицы.
+9. **Три дыры в верификаторе нашёл его же селфтест**: у контрольного плеча не
+   проверялся сокет-оракул (мутация `u6a` проходила незамеченной), поле `len`
+   в строке кадра не использовалось вовсе (мутация `frame_len`), а сам
+   мутатор падал на CRLF в логе (`frame_byte`). Все три исправлены, после чего
+   батарея выросла с 9639 до **9782** проверок.
+
+## 10. Чем проверено
+
+| | |
+|---|---|
+| `tools/verify567.py` | **9782 проверки, 0 расхождений** — провенанс (sha ядра из шапки лога против файла, initrd, differ **извлечённый из initramfs** и сверенный побайтово), 22 якоря исходника, порт `ipv6_find_hdr()` и `ip6_rcv_core()` на Python, порт трёх конструкторов pktinfo и четырёх стражей, **все 524 плеча** против модели, побайтовая сверка NFLOG-груза на каждой принятой записи, судьба пакета на стеке (in/hdr/trun/deliv/unk) из **записанных** байтов, сокет-оракул из тех же байтов, детерминизм, 0 splat |
+| `tools/verify567_selftest.sh` | **23/23** — 23 мутации по одному полю, каждая краснит **свою** проверку; три первые породы (непроверенный сокет у контроля, неиспользованное поле `len` у кадра, CRLF в мутаторе) — это дыры в верификаторе, а не в мутациях, и они исправлены |
+| `tools/audit_f45_doc.py` | таблицы §2–§9 — это вывод `tools/f567_summary.py`, а не набор руками: аудитор требует, чтобы каждая строка вывода присутствовала в документе, и три одиночные подмены в копии документа дают по расхождению |
+| коллекция | перегенерирована |
+| регрессия | verify566 1692, verify565 884, verify564 895, verify563 1179, verify562 2332, verify561 1937 |
+
+## 11. Что не измерено, прямо
+
+**PPPoE с extension-заголовками** (`nhoff = 8` и обход одновременно) — прогноз
+это композиция двух измеренных сдвигов, а не измерение. **Routing header** и
+**AH** (`IP6_FH_F_AUTH` останавливает обход на AH — прочитано, не измерено).
+`thoff > U16_MAX` недостижим. `@ll`/`@nh` на кадрах с 12+ extension-заголовками
+(граница `IP6_MAX_EXT_HDRS_CNT`). IPv6 в хуках `local_in`/`forward`/`post_routing`
+(`thoff` там строит тот же `nft_set_pktinfo_ipv6`, но `skb->data` может быть
+другой). GSO/`CHECKSUM_PARTIAL`, `CHECKSUM_UNNECESSARY`, VLAN-биты `=m`/`=y`.
+Один отправитель, одна пара veth, один мост.
+
+**Не уязвимость:** правило ставит root в начальном user ns; следствия — запись,
+разрешённая стражем и убивающая пакет (`InHdrErrors`/`InTruncated`
+/`InUnknownProtos`), запись в `daddr`, теряющая пакет без единого счётчика, и
+координата `thoff = 0` у не-первого фрагмента.
+
+## 12. Файлы
+
+`vm/differ567_add.c`, `vm/build_f45_differ.sh`, `vm/make_initramfs567.sh`,
+`vm/build/differ567`; `tools/{f45_run.sh, verify567.py, verify567_selftest.sh,
+f567_mutate.py, f567_summary.py, audit_f45_doc.py}`;
+`research/predictions_567.md`; логи `logs/f45_{rep1,rep2}.log`.
+
+<!-- BEGIN GENERATED (tools/f567_summary.py) -->
+```
+## T1  @th: live cells out of 8, per door and envelope
+| door | v6 | hb | do | hbdo |
+|---|---|---|---|---|
+| `ip6p` | 8 | 8 | 8 | 8 |
+| `inp` | 8 | 8 | 8 | 8 |
+| `ndg` | 8 | 8 | 8 | 8 |
+| `ieg` | 8 | 8 | 8 | 8 |
+
+## T2  where the write landed (NFLOG payload diff, L3 offsets)
+| `v6` | `t0_2` | 1 | 40+2 |
+| `v6` | `t2_2` | 1 | 42+2 |
+| `v6` | `t16_2` | 1 | 56+2 |
+| `hb` | `t0_2` | 1 | 48+2 |
+| `hb` | `t2_2` | 1 | 50+2 |
+| `hb` | `t16_2` | 1 | 64+2 |
+| `do` | `t0_2` | 1 | 48+2 |
+| `do` | `t2_2` | 1 | 50+2 |
+| `do` | `t16_2` | 1 | 64+2 |
+| `hbdo` | `t0_2` | 1 | 56+2 |
+| `hbdo` | `t2_2` | 1 | 58+2 |
+| `hbdo` | `t16_2` | 1 | 72+2 |
+
+## T3  fragments and the none-header
+| door | fr0 | frn | none |
+|---|---|---|---|
+| `ip6p` | 8 | 0 | 0 |
+| `inp` | 8 | 0 | 0 |
+| `ndg` | 8 | 0 | 0 |
+| `ieg` | 8 | 0 | 0 |
+
+## T4  @nh: live cells out of 19
+| door | live |
+|---|---|
+| `ip6p` | 9 |
+| `inp` | 9 |
+| `ndg` | 19 |
+| `ieg` | 9 |
+
+| cell | ip6p | inp | ndg | ieg |
+|---|---|---|---|---|
+| `n0_1` | + | + | + | + |
+| `n0_1x` | . | . | + | . |
+| `n0_2v` | + | + | + | + |
+| `n0_2x` | . | . | + | . |
+| `n1_1` | . | . | + | . |
+| `n2_2` | + | + | + | + |
+| `n2_4` | . | . | + | . |
+| `n4_2` | . | . | + | . |
+| `n6_2` | . | . | + | . |
+| `n7_1` | + | + | + | + |
+| `n7_2` | . | . | + | . |
+| `n8_1` | + | + | + | + |
+| `n8_2` | + | + | + | + |
+| `n8_16` | + | + | + | + |
+| `n24_4` | + | + | + | + |
+| `n24_16` | + | + | + | + |
+| `n28_4` | . | . | + | . |
+| `n40_2` | . | . | + | . |
+| `n44_2` | . | . | + | . |
+
+## T5  one chain, two families (door inp)
+| cell | IPv6 | IPv4 |
+|---|---|---|
+| `x2_2` | + | . |
+| `x4_2` | . | + |
+| `x7_1` | + | . |
+| `x0_2x` | . | . |
+| `x0_2v` | + | . |
+| `x0_2d` | . | + |
+| `xt0_2` | + | + |
+| `xt2_2` | + | + |
+| `xt12_4` | + | + |
+
+| `v6` | `xt0_2` | 40+2 |
+| `p4` | `xt0_2` | 20+2 |
+| `v6` | `xt2_2` | 42+2 |
+| `p4` | `xt2_2` | 22+2 |
+| `v6` | `xt12_4` | 52+4 |
+| `p4` | `xt12_4` | 32+4 |
+
+## T6  reads (door, envelope) -> hits out of 3
+| `inp` | `v6` | 3/3 |
+| `inp` | `hb` | 3/3 |
+| `ieg` | `v6` | 3/3 |
+| `ieg` | `hb` | 3/3 |
+
+## T7  meta verdicts on inp
+| section | env | l4_17 | l4_59 | pr_86 |
+|---|---|---|---|---|
+| `mp` | `v6` | 1 | 0 | 1 |
+| `mp` | `none` | 0 | 1 | 1 |
+| `mp` | `mexth` | 0 | 0 | 0 |
+| `mp` | `mdobad` | 0 | 0 | 0 |
+| `mp_l3` | `v6` | 1 | 0 | 1 |
+| `mp_l3` | `none` | 0 | 1 | 1 |
+| `mp_l3` | `mexth` | 0 | 0 | 0 |
+| `mp_l3` | `mdobad` | 0 | 0 | 1 |
+
+## T8  malformed matrix: (chain counter, writes, Ip6 counter)
+| section | door | frame | cntp | th0_2 | th2_2 | i6 = in/hdr/trun/deliv |
+|---|---|---|---|---|---|---|
+| `md_both_ndg` | `ndg` | `mtrunc` | 0 | 0 | 0 | 0/0/1/0 |
+| `md_both_ndg` | `ndg` | `mexth` | 0 | 0 | 0 | 0/1/0/0 |
+| `md_both_ndg` | `ndg` | `mdobad` | 0 | 0 | 0 | 0/1/0/0 |
+| `md_both_ndg` | `ndg` | `none` | 1 | 0 | 0 | 2/0/0/1 |
+| `md_both_ieg` | `ieg` | `mtrunc` | 0 | 0 | 0 | 0/0/1/0 |
+| `md_both_ieg` | `ieg` | `mexth` | 0 | 0 | 0 | 0/1/0/0 |
+| `md_both_ieg` | `ieg` | `mdobad` | 0 | 0 | 0 | 0/1/0/0 |
+| `md_both_ieg` | `ieg` | `none` | 1 | 0 | 0 | 2/0/0/1 |
+| `md_ndg_only` | `ndg` | `mtrunc` | 1 | 0 | 0 | 2/0/1/0 |
+| `md_ndg_only` | `ndg` | `mexth` | 1 | 0 | 0 | 2/1/0/0 |
+| `md_ndg_only` | `ndg` | `mdobad` | 1 | 0 | 0 | 2/1/0/0 |
+| `md_ndg_only` | `ndg` | `none` | 1 | 0 | 0 | 2/0/0/1 |
+| `md_inp_l3` | `inp` | `mtrunc` | 0 | 0 | 0 | 2/0/1/0 |
+| `md_inp_l3` | `inp` | `mexth` | 0 | 0 | 0 | 2/1/0/0 |
+| `md_inp_l3` | `inp` | `mdobad` | 1 | 0 | 0 | 2/1/0/0 |
+| `md_inp_l3` | `inp` | `none` | 1 | 0 | 0 | 2/0/0/1 |
+| `md_ip6p_l3` | `ip6p` | `mtrunc` | 0 | 0 | 0 | 2/0/1/0 |
+| `md_ip6p_l3` | `ip6p` | `mexth` | 0 | 0 | 0 | 2/1/0/0 |
+| `md_ip6p_l3` | `ip6p` | `mdobad` | 1 | 0 | 0 | 2/1/0/0 |
+| `md_ip6p_l3` | `ip6p` | `none` | 1 | 0 | 0 | 2/0/0/1 |
+| `md_ieg_only` | `ieg` | `mtrunc` | 0 | 0 | 0 | 0/0/1/0 |
+| `md_ieg_only` | `ieg` | `mexth` | 0 | 0 | 0 | 0/1/0/0 |
+| `md_ieg_only` | `ieg` | `mdobad` | 0 | 0 | 0 | 0/1/0/0 |
+| `md_ieg_only` | `ieg` | `none` | 1 | 0 | 0 | 2/0/0/1 |
+| `md_again_ieg` | `ieg` | `mtrunc` | 0 | 0 | 0 | 0/0/1/0 |
+| `md_again_ieg` | `ieg` | `mexth` | 0 | 0 | 0 | 0/1/0/0 |
+| `md_again_ieg` | `ieg` | `mdobad` | 0 | 0 | 0 | 0/1/0/0 |
+| `md_again_ieg` | `ieg` | `none` | 1 | 0 | 0 | 2/0/0/1 |
+| `md_again_ndg` | `ndg` | `mtrunc` | 0 | 0 | 0 | 0/0/1/0 |
+| `md_again_ndg` | `ndg` | `mexth` | 0 | 0 | 0 | 0/1/0/0 |
+| `md_again_ndg` | `ndg` | `mdobad` | 0 | 0 | 0 | 0/1/0/0 |
+| `md_again_ndg` | `ndg` | `none` | 1 | 0 | 0 | 2/0/0/1 |
+
+## T9  diagnostic: which door sees which frame
+| frame | ip4p | ip6p | inp | ndg | ieg | i6in | i6deliv | u6a |
+|---|---|---|---|---|---|---|---|---|
+| `v6` | 0 | 1 | 1 | 1 | 1 | 2 | 1 | 1 |
+| `hb` | 0 | 1 | 1 | 1 | 1 | 2 | 1 | 1 |
+| `do` | 0 | 1 | 1 | 1 | 1 | 2 | 1 | 1 |
+| `hbdo` | 0 | 1 | 1 | 1 | 1 | 2 | 1 | 1 |
+| `fr0` | 0 | 1 | 1 | 1 | 1 | 2 | 1 | 1 |
+| `frn` | 0 | 1 | 1 | 1 | 1 | 2 | 0 | 0 |
+| `none` | 0 | 1 | 1 | 1 | 1 | 2 | 1 | 0 |
+| `mexth` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `mdobad` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `mtrunc` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `mver` | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| `t6` | 0 | 1 | 1 | 1 | 1 | 2 | 1 | 0 |
+| `p4` | 2 | 0 | 2 | 1 | 1 | 0 | 0 | 0 |
+
+## T10  cross-family sequence
+| 0 | `p4` | 2 | 0 | 2 | 1 | 1 | u4=2 u6=0 |
+| 1 | `v6` | 0 | 1 | 1 | 1 | 1 | u4=0 u6=1 |
+| 2 | `mtrunc` | 0 | 0 | 0 | 0 | 0 | u4=0 u6=0 |
+| 3 | `p4` | 2 | 0 | 2 | 1 | 1 | u4=2 u6=0 |
+| 4 | `mexth` | 0 | 0 | 0 | 0 | 0 | u4=0 u6=0 |
+| 5 | `p4` | 2 | 0 | 2 | 1 | 1 | u4=2 u6=0 |
+
+## T11  delivery oracle for the plain frames
+| `v6` | u6a=1 u6b=0 |
+| `hb` | u6a=1 u6b=0 |
+| `do` | u6a=1 u6b=0 |
+| `hbdo` | u6a=1 u6b=0 |
+| `fr0` | u6a=1 u6b=0 |
+| `frn` | u6a=0 u6b=0 |
+| `none` | u6a=0 u6b=0 |
+| `mexth` | u6a=0 u6b=0 |
+| `mdobad` | u6a=0 u6b=0 |
+| `mtrunc` | u6a=0 u6b=0 |
+| `mver` | u6a=0 u6b=0 |
+| `t6` | u6a=0 u6b=0 |
+| `p4` | u6a=0 u6b=0 |
+
+## T12  @nh: the guard's verdict and the stack's, side by side
+| cell | door | lives | the stack saw |
+|---|---|---|---|
+| `n0_1` | `ip6p` | 1 | InDelivers |
+| `n0_1` | `inp` | 1 | InDelivers |
+| `n0_1` | `ndg` | 1 | InDelivers |
+| `n0_1` | `ieg` | 1 | InDelivers |
+| `n0_1x` | `ndg` | 1 | InHdrErrors |
+| `n0_2v` | `ip6p` | 1 | InDelivers |
+| `n0_2v` | `inp` | 1 | InDelivers |
+| `n0_2v` | `ndg` | 1 | InDelivers |
+| `n0_2v` | `ieg` | 1 | InDelivers |
+| `n0_2x` | `ndg` | 1 | InHdrErrors |
+| `n1_1` | `ndg` | 1 | InDelivers |
+| `n2_2` | `ip6p` | 1 | InDelivers |
+| `n2_2` | `inp` | 1 | InDelivers |
+| `n2_2` | `ndg` | 1 | InDelivers |
+| `n2_2` | `ieg` | 1 | InDelivers |
+| `n2_4` | `ndg` | 1 | InTruncated |
+| `n4_2` | `ndg` | 1 | InTruncated |
+| `n6_2` | `ndg` | 1 | InUnknownProtos |
+| `n7_1` | `ip6p` | 1 | InDelivers |
+| `n7_1` | `inp` | 1 | InDelivers |
+| `n7_1` | `ndg` | 1 | InDelivers |
+| `n7_1` | `ieg` | 1 | InDelivers |
+| `n7_2` | `ndg` | 1 | InDelivers |
+| `n8_1` | `ip6p` | 1 | InDelivers |
+| `n8_1` | `inp` | 1 | InDelivers |
+| `n8_1` | `ndg` | 1 | InDelivers |
+| `n8_1` | `ieg` | 1 | InDelivers |
+| `n8_2` | `ip6p` | 1 | InDelivers |
+| `n8_2` | `inp` | 1 | InDelivers |
+| `n8_2` | `ndg` | 1 | InDelivers |
+| `n8_2` | `ieg` | 1 | InDelivers |
+| `n8_16` | `ip6p` | 1 | InDelivers |
+| `n8_16` | `inp` | 1 | InDelivers |
+| `n8_16` | `ndg` | 1 | InDelivers |
+| `n8_16` | `ieg` | 1 | InDelivers |
+| `n24_4` | `ip6p` | 1 | nothing |
+| `n24_4` | `inp` | 1 | nothing |
+| `n24_4` | `ndg` | 1 | nothing |
+| `n24_4` | `ieg` | 1 | nothing |
+| `n24_16` | `ip6p` | 1 | nothing |
+| `n24_16` | `inp` | 1 | nothing |
+| `n24_16` | `ndg` | 1 | nothing |
+| `n24_16` | `ieg` | 1 | nothing |
+| `n28_4` | `ndg` | 1 | nothing |
+| `n40_2` | `ndg` | 1 | InDelivers |
+| `n44_2` | `ndg` | 1 | InDelivers |
+
+## counts: arms=524 frames=13 sections=['md_again_ieg', 'md_again_ndg', 'md_both_ieg', 'md_both_ndg', 'md_ieg_only', 'md_inp_l3', 'md_ip6p_l3', 'md_ndg_only', 'mp', 'mp_l3', 'nh', 'rd', 'td', 'tf', 'xf']
+```
+<!-- END GENERATED -->
+
+
+===== summary.json =====
+{
+ "finding": "F45-ipv6-walk",
+ "turn": 567,
+ "kernel": "7.3.4-T563",
+ "kernel_sha256_prefix": "1efbc957",
+ "arms_per_boot": 524,
+ "boots": 2,
+ "answer_short": "IPv6 does not compute @th, it walks for it: nft_set_pktinfo_ipv6(), __nft_set_pktinfo_ipv6_validate() and nft_set_pktinfo_ipv6_ingress() all take thoff from ipv6_find_hdr(). Measured on five doors, the coordinate is still the true transport header (128/128 cells at data+40/48/56+off, read == write), because nft_thoff() is pkt->thoff and skb_network_offset() is data-relative. What differs from IPv4 is who owns the failure: a non-first fragment leaves thoff = 0 (the walk returns before writing *offset) and the fragoff guard hides it; nexthdr 59 yields tprot = 59 with no transport header at all; and the three IPv6 constructors fail in three different ways on one malformed frame, because ip6_rcv_core() validates version, payload length and hop-by-hop BEFORE NF_INET_PRE_ROUTING, so the layer-3 unspec branch is reachable only through an error it does not look at. @nh for IPv6 is a whitelist that compares a constant: 19/19 at netdev ingress vs 9/19 elsewhere, and the accepted stores kill the packet (InHdrErrors, InTruncated, InUnknownProtos) -- one of them, into daddr, kills it with no counter at all, because the route lookup is the hook's okfn and runs after the write.",
+ "tables": {
+  "th_grid_live_of_8": {
+   "doors": ["ip6p", "inp", "ndg", "ieg"],
+   "envelopes": ["v6", "hb", "do", "hbdo"],
+   "live": [[8, 8, 8, 8], [8, 8, 8, 8], [8, 8, 8, 8], [8, 8, 8, 8]],
+   "note": "the store lands at data + thoff + off with thoff = 40 (bare), 48 (hop-by-hop or dest-opts), 56 (both)"
+  },
+  "fragments_and_none_live_of_8": {
+   "fr0": 8, "frn": 0, "none": 0,
+   "note": "frn: pkt->fragoff != 0 kills read and write alike; fr0 is delivered (u6a=1)"
+  },
+  "nh_grid_live_of_19": {
+   "ip6p": 9, "inp": 9, "ieg": 9, "ndg": 19,
+   "whitelist_cells": ["n0_1", "n0_2v", "n2_2", "n7_1", "n8_1", "n8_2",
+                       "n8_16", "n24_4", "n24_16"],
+   "value_dependent_cells": {
+    "n0_1 (imm 60)": "accepted on the three whitelisted doors",
+    "n0_1x (imm 90)": "refused: ih->version == 6 is a constant check"
+   }
+  },
+  "two_families_one_chain": {
+   "x2_2": {"ipv6": "store", "ipv4": "refuse"},
+   "x4_2": {"ipv6": "refuse", "ipv4": "store"},
+   "x7_1": {"ipv6": "store", "ipv4": "refuse"},
+   "x0_2v": {"ipv6": "store", "ipv4": "refuse"},
+   "x0_2d": {"ipv6": "refuse", "ipv4": "store"},
+   "th_store_offsets": {"ipv6": "data+40+off", "ipv4": "data+20+off"}
+  },
+  "malformed_matrix": {
+   "mtrunc": {"ieg": [0, "InTruncatedPkts"], "ndg": [1, "unspec, 0 stores"],
+              "inp": [0, "never reaches the hook, InTruncatedPkts"]},
+   "mexth": {"ieg": [0, "InHdrErrors"], "ndg": [1, "unspec, 0 stores"],
+             "inp": [0, "never reaches the hook, InHdrErrors (hopopts)"]},
+   "mdobad": {"ieg": [0, "InHdrErrors"], "ndg": [1, "unspec, 0 stores"],
+              "inp": [1, "unspec, 0 stores, then InHdrErrors"]},
+   "none": {"ieg": [1, "0 stores, length"], "ndg": [1, "0 stores, length"],
+            "inp": [1, "0 stores, length"]}
+  },
+  "guard_accepted_packet_died": {
+   "n0_1x_ndg": "InHdrErrors",
+   "n2_4_ndg": "InTruncatedPkts",
+   "n4_2_ndg": "InTruncatedPkts",
+   "n6_2_ndg": "InUnknownProtos",
+   "n24_4_all_doors": "no counter, no delivery (daddr rewritten, route lookup after the hook)"
+  },
+  "cross_family": {
+   "ipv4_frames": "counted and delivered before, between and after the dropped IPv6 frames",
+   "u4": 2,
+   "u6": 1,
+   "note": "the bridge's flooded copy returns on r0: IPv4 delivers it a second time (weak host), IPv6 counts it and discards it (Ip6InReceives 2, Ip6InDiscards 1, Ip6InDelivers 1)"
+  }
+ },
+ "verification": {
+  "verify567.py": {"checks": 9782, "failed": 0},
+  "verify567_selftest.sh": {"mutations": 23, "caught": 23},
+  "audit_f45_doc.py": {"generated_cells": 198, "prose_cells": 16,
+                       "mismatches": 0, "substitutions_caught": 3},
+  "logs": ["logs/f45_rep1.log", "logs/f45_rep2.log"]
+ },
+ "predictions": {
+  "written": 13,
+  "held": ["P1", "P2", "P3", "P4", "P5", "P8", "P9", "P10", "P11", "P12", "P13"],
+  "partly_held": ["P7 (netdev half only)"],
+  "refuted": ["P6", "P7 (layer-3 half)"],
+  "why": "ip6_rcv_core() validates version, payload length and hop-by-hop before NF_INET_PRE_ROUTING, so mtrunc and mexth never reach a layer-3 nftables chain"
+ },
+ "not_measured": [
+  "PPPoE carrying extension headers (nhoff = 8 and a walk at the same time)",
+  "routing header and AH (IP6_FH_F_AUTH stops the walk at AH)",
+  "12+ extension headers (IP6_MAX_EXT_HDRS_CNT boundary)",
+  "IPv6 at local_in / forward / post_routing",
+  "GSO / CHECKSUM_PARTIAL, VLAN-bit offload combinations"
+ ]
+}

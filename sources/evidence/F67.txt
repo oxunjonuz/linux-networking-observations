@@ -1,0 +1,1408 @@
+===== LETTER_SECTION_F67.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload and what a receive queue charges an aggregate: the head
+ is charged the whole aggregate below half a buffer and one datagram above it
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+STATUS: NOT SENT -- draft for the F28 thread; sending is the owner's call.
+
+F67 — the receive queue charges an aggregate's head for the whole aggregate,
+until the queue is above half a buffer, and then it charges it for one datagram
+
+Kernel 7.3.4-T563, no new build. Instrument: three netns, a rule on the IPv6
+forward chain that only counts and logs, and a receiver that reports what the
+socket actually kept, what the queue's own byte account says (/proc/net/udp6),
+and how many datagrams of each of two flows arrived.
+
+1. The default receive buffer is 212992, and it is what
+   `SKB_TRUESIZE(256) * 256` gives: (256 + 576) * 256, where 576 is the
+   aligned skb_shared_info plus struct sk_buff, and 576 is what the two
+   measured truesizes leave (1280 - 704, 2304 - 1728) — no other value in
+   [512, 640] does.  `SO_RCVBUF(v)` is doubled, so 106496 reproduces the
+   default and a read-back confirms it.
+
+2. For an aggregate of N datagrams the first segment is charged `N * s`
+   (`skb_gro_receive_list()` does `p->truesize += skb->truesize`, so a
+   fraglist aggregate's truesize is the SUM of the packets that went into it),
+   and each further segment `s`.  1200-byte datagrams on five buffers:
+   133120 -> 4 kept, 143360 -> 9, 153600 -> 13, 163840 -> 18, 184320 -> 27,
+   with 131328 / 142848 / 152064 / 163584 / 184320 bytes in the queue exactly.
+   At 184320 the 27th segment leaves rmem EQUAL to rcvbuf and is accepted,
+   because the test is `>`, not `>=`.
+
+3. With the queue already above half, the same aggregate's head is charged ONE
+   datagram instead of N, and — this is the part I did not predict — the
+   refusal test is decided on that smaller number too.  A queue holding 162560
+   bytes in a 212992 buffer keeps 39 of 64 datagrams, though the head's `N * s`
+   (81920) exceeds the 50432 that is left.  The cleanest pair differs only in
+   the buffer: 311296 keeps 54 of 54, 344064 keeps 25 of 54 — the SMALLER
+   buffer keeps more, because at 311296 rmem is above half and at 344064 it is
+   not.
+
+4. What I could not explain, and will not dress up: `skb_condense()` sits
+   BELOW the refusal test in `__udp_enqueue_schedule_skb()`, so that branch
+   cannot be what makes the refusal see the small size; the other condense site
+   is `___pskb_trim()`, which would have to be inert exactly when the queue is
+   empty, and I have no measurement of that.  Also open: two different socket
+   paths give the same total for 64 * 512 — a fraglist aggregate charged
+   81920 + 63 * 1280 and 64 datagrams at 2540 each are both 162560 — so a byte
+   account alone cannot tell the two shapes apart; only the 1200-byte arms do.
+
+
+===== SUMMARY.md =====
+# F67 — что очередь берёт за агрегат, и когда это число тает
+
+Ход 589. Ядро то же: `7.3.4-T563` (`1efbc957…2033`), новых сборок нет.
+Прибор `vm/build/differ589` (`94ec2799…a1ef`), режимы `dflt` (10 плеч) и
+`cond` (7 плеч), по две попытки на плечо, два независимых прогона (`rep1`,
+`rep2`). Предсказания заморожены **до** первого запуска
+(`761ed3f8…4549`).
+
+Два долга F66 §8 закрыты не так, как я их формулировал: дефолт измерен и
+оказался ровно тем числом, что я вывел; а «`skb_condense()` не срабатывает»
+оказалось неверным — срабатывает, и именно оно превращает отказ целому
+агрегату в пропуск одной дейтаграммы.
+
+---
+
+## 1. Дефолт приёмного буфера: выведен, а не вспомнен
+
+F66 написал «настоящий `rmem_default` = 212992 измерен в предыдущем
+поколении прибора» — и это была догадка, за чтением назад ничего не стояло.
+Теперь он **прочитан у самого сокета** в первой же строке прибора:
+
+```
+F67 DEFRB|def=212992|half=106496        (оба прогона)
+```
+
+и выведен из источника: `sock_init_data()` ставит
+`sk_rcvbuf = sysctl_rmem_default` (`net/core/sock.c:3761`), а тот равен
+`SK_RMEM_DEFAULT = SKB_TRUESIZE(256) * 256` (`include/net/sock.h:3085`).
+Постоянная часть `SKB_TRUESIZE` берётся из двух замеренных truesize этого же
+журнала: `1280 − 704` и `2304 − 1728` обе дают один и тот же остаток **576**
+(выровненный `skb_shared_info` 320 + `struct sk_buff` 256), и никакое другое
+значение из [512, 640] этого не даёт. Тогда
+`SKB_TRUESIZE(256) = 832` и `832 × 256 = 212992`.
+
+`SO_RCVBUF(v)` ставит `max(v*2, SOCK_MIN_RCVBUF)` (`net/core/sock.c:987`),
+поэтому просьба `106496` возвращает ровно дефолт; плечо с `rcvbuf = -1` теперь
+означает именно это, а не «оставить то, что было у прошлого плеча» (ошибка
+F66 №2).
+
+## 2. 1200 байт: бюджет на пяти буферах, ни одного промаха
+
+Одно плечо F66 (`q54x1200`) было измерено на 425984 и ничего не проверяло.
+Здесь — пять буферов, и все пять сошлись с формулой
+`kept = 1 + floor((R − 124416) / 2304)`, где 124416 = 54 × 2304 (голова
+платит за весь агрегат), 2304 — цена одной дейаграммы:
+
+| плечо | `SO_RCVBUF` → факт. | оставлено | ошибок | байт в очереди | формула |
+|---|---|---|---|---|---|
+| `d1200_133120` | 66560 → **133120** | **4** | 50 | 131328 | 1+3 |
+| `d1200_143360` | 71680 → **143360** | **9** | 45 | 142848 | 1+8 |
+| `d1200_153600` | 76800 → **153600** | **13** | 41 | 152064 | 1+12 |
+| `d1200_163840` | 81920 → **163840** | **18** | 36 | 163584 | 1+17 |
+| `d1200_184320` | 92160 → **184320** | **27** | 27 | 184320 | 1+26 |
+
+Последнее — на самом краю: 27-й сегмент оставляет `rmem` **равным** буферу, и
+он принят, потому что проверка `rmem + size > rcvbuf` строгая. Ни один из
+пяти буферов не был использован при выводе `s` и `A`: они выведены из двух
+других плеч (`c_only_test` даёт 1280, `d1200_133120` даёт 2304).
+
+## 3. Настоящий дефолт: 39 из 54, и это бюджет, а не темп читателя
+
+| плечо | `rcvbuf` | оставлено | ошибок | байт в очереди |
+|---|---|---|---|---|
+| `d54_lazy` | 212992 | **39** (в 3 попытках из 4) | 15 | **211968** |
+| `d54_eag` | 212992 | **39 … 51** | 15 … 3 | — (жадный читатель) |
+| `d64_lazy` | 212992 | **64** | 0 | 162560 |
+| `d64x1200_lazy` | 212992 | **39** | **25** | 211968 |
+| `d54_lazy_b` (дверь y2) | 212992 | **39** | 15 | 211968 |
+
+`d64x1200_lazy` — тот самый профиль F65 (64 дейаграммы по 1200): байтовый
+предел режет отправку на 54 + 10, первые 54 оставляют 39, а второй агрегат
+(голова 23040 при остатке 1024) умирает **целиком**: 39 + 25 = 64.
+
+Тем самым число F65 «29…64» — это темп читателя (жадное чтение даёт до 51), а
+не дефолт; при ленивом читателе дефолт даёт 39 воспроизводимо. Единственное
+плечо, где вышло 40, — то, где опрос NAPI разрезал отправку на **два**
+агрегата (`ch0=2`): это форма, а не бюджет, и оно названо, а не смоделировано.
+
+`d54_lazy_b` — те же 54 датаграммы через дверь y2, где **нет** `GSO_UDP_L4`:
+на провод уходят 54 кадра, приёмник собирает их заново, и бюджет выходит
+**тот же**: 39 / 15 / 211968, до байта. Приёмная очередь не знает, какой
+дверью пакет вышел.
+
+## 4. Голова агрегата платит за весь агрегат
+
+Это видно в каждой клетке ниже половины буфера:
+
+| плечо | `N` | `s` | заряд головы (из журнала) |
+|---|---|---|---|
+| `c_only_test` (64 × 512) | 64 | 1280 | **81920** = 64·s |
+| `d54_lazy_b`, `d1200_*`, `d64x1200` (54 × 1200) | 54 | 2304 | **124416** = 54·s |
+| `c_fill_test1200_344` (выше половины **нет**: 162560 < 172032) | 54 | 2304 | **124416** |
+
+Механизм, который это объясняет, в источнике есть:
+`skb_gro_receive_list()` делает `p->truesize += skb->truesize`
+(`net/core/gro.c:260`) — truesize фраглист-агрегата есть **сумма** truesize
+всех влёгших в него пакетов; линейное слияние рядом делает не это, а
+`delta_truesize = skb->truesize − SKB_TRUESIZE(end_offset)` (`:153`), то есть
+добавляет только долю груза. Заряд головы поэтому — свойство первой двери
+(сумма её пакетов), а не данных.
+
+## 5. Выше половины это число тает до одной дейаграммы — и отказ считается по нему же
+
+Три долга F66 свелись к одному опыту: агрегат приходит, когда очередь уже
+выше половины. Заполняет её «наполнитель» — 64 × 512 на **другую** дверь
+(другой адрес назначения — `ipv6_gro_receive()` сравнивает `daddr`, так что
+агрегаты не сливаются). Наполнитель стоит 162560 = 64 × 2540 байт, и все 64
+его датаграммы доходят в каждом плече.
+
+| плечо | `R` | `rmem` до теста | заряд головы | оставлено | ошибок | байт в очереди |
+|---|---|---|---|---|---|---|
+| `c_only_test` | 262144 | 0 | **81920** | 64 | 0 | 162560 |
+| `c_only_fill` (только наполнитель) | 262144 | 0 | — | 0 | 0 | 162560 |
+| `c_fill_test` | 262144 | 162560 > R/2 | **1280** | **64** | **0** | 244480 |
+| `c_fill_test1200_262` | 262144 | 162560 > R/2 | **2304** | **43** | 11 | 261632 |
+| `c_fill_test1200_311` | 311296 | 162560 > R/2 | **2304** | **54** | **0** | 286976 |
+| `c_fill_test1200_344` | 344064 | 162560 < R/2 | **124416** | **25** | 29 | 342272 |
+| `c_fill_s512_212` | 212992 | 162560 > R/2 | **1280** | **39** | 25 | 212480 |
+
+Два следствия, оба измерены и оба были предсказаны неверно (P10–P12, P14):
+
+1. **Агрегат, который «не влезает» по `N·s`, влезает по `s`.** При
+   `R = 212992` и очереди 162560 в ней остаётся 50432 байта — меньше, чем
+   голова 64 × 512 = 81920, и всё же 39 датаграмм доставлены.
+2. **Значит и отказ решается по этому же малому числу.** Один и тот же опыт
+   с `R = 311296` даёт 54 из 54, а с `R = 344064` — 25 из 54: **меньший**
+   буфер оставляет **больше**, и разница ровно в том, перевалил ли `rmem`
+   половину.
+
+Пара 311296 / 344064 — единственная клетка, где две величины отличаются
+только тем, перешла ли очередь половину буфера: два плеча отличаются одним
+числом `SO_RCVBUF`, а исход — 54 против 25.
+
+## 6. Чего я объяснить не смог, и говорю это прямо
+
+`skb_condense()` вызывается **после** проверки отказа:
+
+```c
+	if (rmem + size > rcvbuf) { ... goto drop; }        /* решено ЗДЕСЬ */
+	if (rmem > (rcvbuf >> 1)) { skb_condense(skb); size = skb->truesize; }
+```
+
+То есть собственная ветка enqueue не может ни спасти агрегат, ни повлиять на
+отказ — а замеры говорят, что отказ считается уже по уменьшенному числу.
+Значит голова уменьшается **до** enqueue. Кандидат в источнике один:
+`___pskb_trim()` кончает тем же `skb_condense()` для полученного skb
+(`net/core/skbuff.c:2806`), и его зовёт сегментация. Но тогда он уменьшал бы
+голову и при пустой очереди, а там заряд — `N·s`. **Где именно теряется
+`N·s`, я не установил.** Названный долг, а не вывод.
+
+Второе, что не сходится: `skb_gro_receive_list()` суммирует truesize
+*приходящих* пакетов, а приходящий кадр на приёмнике стоит **2540**, не 1280
+(64 × 2540 = 127 × 1280 = 162560 — оба прочтения дают одно и то же число).
+Поэтому по одному байтовому счёту очереди нельзя отличить фраглист-агрегат от
+64 отдельных датаграмм; это разрешают только 1200-е плечи, где
+`A + (k−1)s` сходится пять раз, а «по одной цене за датаграмму» не даёт даже
+целого числа (`211968 / 39 = 5435.08`).
+
+Третье: тап на y2 в плече `d54_lazy_b` показал **40** кадров из 54, хотя
+очередь учла все 54 (39 + 15 ошибок). Число измерено, механизм не установлен.
+
+## 7. Предсказания: 13 из 17
+
+Сошлись P1 (212992), P2 (39/15/211968 — в трёх попытках из четырёх; четвёртая
+разрезана опросом), P3, P4, P5, P6 (включая «второй агрегат умирает целиком»),
+P7a–P7e (все пять буферов и край 184320), P8, P9, P13, P15, P16, P17.
+
+**Опровергнуты P10, P11, P12, P14** — все четыре одним и тем же: я считал, что
+выше половины заряд головы остаётся `N·s`, и потому ждал отказа целому
+агрегату (0 / 0 / 11 / 0 оставленных). Измерено: **64 / 43 / 54 / 39**.
+
+## 8. Ошибки хода, все мои
+
+1. Модель §0c была неверна в главном: я прочитал ветку `skb_condense()` и
+   решил, что на голове она инертна (`skb_cloned`). Она не инертна.
+2. Из этого вышло, что четыре предсказания мерили не то, что я думал, — но
+   именно они и дали результат хода.
+3. Я ждал, что наполнитель соберётся в агрегат и на приёмнике (голова
+   `162560`) — при `R = 212992` это оставило бы 39 тел, а дошли все 64.
+4. `f67_summary.py` сперва терял свидетелей: они печатаются **до** строки ARM,
+   а я приклеивал их к уже известному плечу (класс F40 №2 — «прибор врёт о
+   своём», на этот раз в разборщике).
+5. Верификатор шесть раз был слишком добрым: рачевые плечи, `bn` без проверки
+   при `n = 0`, падение вместо красноты на пропавшем плече и пропавшем блоке
+   режима, сообщения склеивались по обеим попыткам, `p0` не учитывал индекс
+   первой датаграммы второго агрегата. Всё это нашли мутации селфтеста.
+6. Первая версия проверки «наполнитель — это не один агрегат» доказывала
+   неверное: при 262144 оба прочтения дают 64. Убрана, а не подогнана.
+
+## 9. Чем проверено
+
+| | |
+|---|---|
+| `tools/verify589.py` | **1717 проверок, 0** — провенанс (ядро из шапки и с диска, initrd из шапки и из файла, differ **извлечённый из initramfs**, неизменность `predictions_589.md`), 16 якорей источника, таблица плеч **из `vm/differ589_add.c`** против девяти печатных параметров, две константы (`s512`, `s1200`) и цена кадра наполнителя **выведены из двух плеч журнала**, модель головы для обеих половин буфера, все байты сообщений (длина, поле длины IPv6, адрес назначения, первые байты груза), `nf`/`nt`/`n`, `delivered + errors == N`, `rb = 2v`, окна прихода для ленивого и жадного читателя, `rmem` из `/proc/net/udp6` в каждой попытке, кадры на обеих дверях, детерминизм между прогонами, и счёт предсказаний |
+| `tools/verify589_selftest.py` | **27/27** — 27 односоставных подмен краснят без traceback, `noop` зелёный; шесть подмен сначала выжили и вскрыли настоящие дыры (§8.5) |
+| `tools/f67_summary.py` | все таблицы этого документа собраны из журнала |
+| `tools/audit_f67_doc.py` | сверка чисел документа с `summary.json` и с исходником прибора |
+| коллекция | см. `RESEARCH_LOG.md` этого хода |
+| форма писем | см. `LETTER_STATUS.md` |
+
+## 10. Что не измерено, прямо
+
+* **Где теряется `N·s`** (§6) — главный долг: нужен опыт, в котором очередь
+  ниже половины, а голова не влезает (отказ по `N·s`), плюс проба на
+  «клонирована ли голова».
+* **Отказ агрегату целиком** в этом приборе недостижим: все шесть плеч
+  `cond` прошли проверку отказа.
+* **Почему тап y2 показал 40 кадров из 54** — число есть, механизма нет.
+* **IPv4-двойник обеих кривых** (там `H = 28`, а не 48) — не тронут.
+* TCP, туннели, `CHECKSUM_COMPLETE`, настоящий NIC — не тронуты.
+* **Не уязвимость**: все правила ставил root в начальном user ns (F57).
+
+## 11. Файлы
+
+`vm/{differ589_add.c, differ589.c, build_f67_differ.sh, make_initramfs589.sh,
+build/differ589}`, `tools/{f67_run.sh, verify589.py, verify589_selftest.py,
+f67_summary.py, audit_f67_doc.py}`, `research/predictions_589.md`,
+`logs/f67_{rep1,rep2}.log`, `findings/F67-queue-head/{SUMMARY.md,
+summary.json, VERIFY_REPORT.md, LETTER_SECTION_F67.txt}`.
+
+
+===== summary.json =====
+{
+ "turn": 589,
+ "finding": "F67-queue-head",
+ "kernel": "7.3.4-T563",
+ "kernel_sha256": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+ "instrument": "vm/differ589_add.c (modes dflt: 10 arms, cond: 7 arms), 2 boots x 2 attempts",
+ "instrument_sha256": "94ec2799df9ba2873b0b40bff915cdcec0c840f3d6c88b3ae7a710cfcbbda1ef",
+ "predictions": "research/predictions_589.md",
+ "predictions_sha256": "761ed3f85a5e852c942483509a5c57dab54a07a36f04fc19a01f7d7f37c14549",
+ "headline": "Above half a receive buffer, the aggregate's head is charged ONE datagram instead of the whole aggregate: 39 kept at rcvbuf 212992 where the frozen model said the aggregate would be refused entire, and 54 of 54 at 311296.",
+ "answer_short": "13 of 17 predictions held (P1-P9, P13, P15-P17); P10-P12 and P14 refuted, all four by the same collapse. The default buffer is 212992, derived and measured; the 1200-byte budget curve fits A + (k-1)s at five buffers exactly.",
+ "default_rcvbuf": {
+  "printed": [
+   212992,
+   212992
+  ],
+  "derived": 212992,
+  "derivation": "SKB_TRUESIZE(256)*256 = (256+576)*256"
+ },
+ "derived": {
+  "s_512": 1280,
+  "s_1200": 2304,
+  "cost_per_received_frame": 2540,
+  "filler_total": 162560,
+  "head_charge_empty_and_below_half_512": 81920,
+  "head_charge_empty_and_below_half_1200": 124416,
+  "head_charge_above_half_512": 1280,
+  "head_charge_above_half_1200": 2304
+ },
+ "arms": [
+  {
+   "name": "d54_lazy",
+   "mode": "dflt",
+   "n": 54,
+   "pl": 1200,
+   "filler": [
+    0,
+    0
+   ],
+   "door": "a",
+   "rcvbuf_request": -1,
+   "rcvbuf_eff": 212992,
+   "packets": 1,
+   "messages": 1,
+   "y1_frames": 1,
+   "y2_frames": 0,
+   "rmem": [
+    211968,
+    211968
+   ],
+   "kept": [
+    40,
+    39
+   ],
+   "filler_kept": [
+    0,
+    0
+   ],
+   "errors": [
+    14,
+    15
+   ],
+   "arrive": [
+    414,
+    405
+   ],
+   "msg_len": [
+    1248,
+    63648
+   ],
+   "msg_u6": [
+    "04b8",
+    "f878"
+   ],
+   "msg_dst": [
+    "fd030000",
+    "fd030000"
+   ],
+   "kept_rep2": [
+    39,
+    39
+   ],
+   "errors_rep2": [
+    15,
+    15
+   ],
+   "rmem_rep2": [
+    211968,
+    211968
+   ]
+  },
+  {
+   "name": "d54_eag",
+   "mode": "dflt",
+   "n": 54,
+   "pl": 1200,
+   "filler": [
+    0,
+    0
+   ],
+   "door": "a",
+   "rcvbuf_request": -1,
+   "rcvbuf_eff": 212992,
+   "packets": 1,
+   "messages": 1,
+   "y1_frames": 1,
+   "y2_frames": 0,
+   "rmem": [],
+   "kept": [
+    39,
+    39
+   ],
+   "filler_kept": [
+    0,
+    0
+   ],
+   "errors": [
+    15,
+    15
+   ],
+   "arrive": [
+    199,
+    200
+   ],
+   "msg_len": [
+    64848
+   ],
+   "msg_u6": [
+    "fd28"
+   ],
+   "msg_dst": [
+    "fd030000"
+   ],
+   "kept_rep2": [
+    51,
+    39
+   ],
+   "errors_rep2": [
+    3,
+    15
+   ],
+   "rmem_rep2": []
+  },
+  {
+   "name": "d54_lazy_b",
+   "mode": "dflt",
+   "n": 54,
+   "pl": 1200,
+   "filler": [
+    0,
+    0
+   ],
+   "door": "b",
+   "rcvbuf_request": -1,
+   "rcvbuf_eff": 212992,
+   "packets": 1,
+   "messages": 1,
+   "y1_frames": 0,
+   "y2_frames": 40,
+   "rmem": [
+    211968,
+    211968
+   ],
+   "kept": [
+    39,
+    39
+   ],
+   "filler_kept": [
+    0,
+    0
+   ],
+   "errors": [
+    15,
+    15
+   ],
+   "arrive": [
+    406,
+    404
+   ],
+   "msg_len": [
+    64848
+   ],
+   "msg_u6": [
+    "fd28"
+   ],
+   "msg_dst": [
+    "fd040000"
+   ],
+   "kept_rep2": [
+    39,
+    39
+   ],
+   "errors_rep2": [
+    15,
+    15
+   ],
+   "rmem_rep2": [
+    211968,
+    211968
+   ]
+  },
+  {
+   "name": "d64_lazy",
+   "mode": "dflt",
+   "n": 64,
+   "pl": 512,
+   "filler": [
+    0,
+    0
+   ],
+   "door": "a",
+   "rcvbuf_request": -1,
+   "rcvbuf_eff": 212992,
+   "packets": 1,
+   "messages": 1,
+   "y1_frames": 1,
+   "y2_frames": 0,
+   "rmem": [
+    162560,
+    162560
+   ],
+   "kept": [
+    64,
+    64
+   ],
+   "filler_kept": [
+    0,
+    0
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "arrive": [
+    404,
+    404
+   ],
+   "msg_len": [
+    32816
+   ],
+   "msg_u6": [
+    "8008"
+   ],
+   "msg_dst": [
+    "fd030000"
+   ],
+   "kept_rep2": [
+    64,
+    64
+   ],
+   "errors_rep2": [
+    0,
+    0
+   ],
+   "rmem_rep2": [
+    162560,
+    162560
+   ]
+  },
+  {
+   "name": "d64x1200_lazy",
+   "mode": "dflt",
+   "n": 64,
+   "pl": 1200,
+   "filler": [
+    0,
+    0
+   ],
+   "door": "a",
+   "rcvbuf_request": -1,
+   "rcvbuf_eff": 212992,
+   "packets": 2,
+   "messages": 2,
+   "y1_frames": 2,
+   "y2_frames": 0,
+   "rmem": [
+    211968,
+    211968
+   ],
+   "kept": [
+    39,
+    39
+   ],
+   "filler_kept": [
+    0,
+    0
+   ],
+   "errors": [
+    25,
+    25
+   ],
+   "arrive": [
+    405,
+    404
+   ],
+   "msg_len": [
+    64848,
+    12048
+   ],
+   "msg_u6": [
+    "fd28",
+    "2ee8"
+   ],
+   "msg_dst": [
+    "fd030000",
+    "fd030000"
+   ],
+   "kept_rep2": [
+    39,
+    39
+   ],
+   "errors_rep2": [
+    25,
+    25
+   ],
+   "rmem_rep2": [
+    211968,
+    211968
+   ]
+  },
+  {
+   "name": "d1200_133120",
+   "mode": "dflt",
+   "n": 54,
+   "pl": 1200,
+   "filler": [
+    0,
+    0
+   ],
+   "door": "a",
+   "rcvbuf_request": 66560,
+   "rcvbuf_eff": 133120,
+   "packets": 1,
+   "messages": 1,
+   "y1_frames": 1,
+   "y2_frames": 0,
+   "rmem": [
+    131328,
+    131328
+   ],
+   "kept": [
+    4,
+    4
+   ],
+   "filler_kept": [
+    0,
+    0
+   ],
+   "errors": [
+    50,
+    50
+   ],
+   "arrive": [
+    404,
+    404
+   ],
+   "msg_len": [
+    64848
+   ],
+   "msg_u6": [
+    "fd28"
+   ],
+   "msg_dst": [
+    "fd030000"
+   ],
+   "kept_rep2": [
+    4,
+    4
+   ],
+   "errors_rep2": [
+    50,
+    50
+   ],
+   "rmem_rep2": [
+    131328,
+    131328
+   ]
+  },
+  {
+   "name": "d1200_143360",
+   "mode": "dflt",
+   "n": 54,
+   "pl": 1200,
+   "filler": [
+    0,
+    0
+   ],
+   "door": "a",
+   "rcvbuf_request": 71680,
+   "rcvbuf_eff": 143360,
+   "packets": 1,
+   "messages": 1,
+   "y1_frames": 1,
+   "y2_frames": 0,
+   "rmem": [
+    142848,
+    142848
+   ],
+   "kept": [
+    9,
+    9
+   ],
+   "filler_kept": [
+    0,
+    0
+   ],
+   "errors": [
+    45,
+    45
+   ],
+   "arrive": [
+    404,
+    404
+   ],
+   "msg_len": [
+    64848
+   ],
+   "msg_u6": [
+    "fd28"
+   ],
+   "msg_dst": [
+    "fd030000"
+   ],
+   "kept_rep2": [
+    9,
+    9
+   ],
+   "errors_rep2": [
+    45,
+    45
+   ],
+   "rmem_rep2": [
+    142848,
+    142848
+   ]
+  },
+  {
+   "name": "d1200_153600",
+   "mode": "dflt",
+   "n": 54,
+   "pl": 1200,
+   "filler": [
+    0,
+    0
+   ],
+   "door": "a",
+   "rcvbuf_request": 76800,
+   "rcvbuf_eff": 153600,
+   "packets": 1,
+   "messages": 1,
+   "y1_frames": 1,
+   "y2_frames": 0,
+   "rmem": [
+    152064,
+    152064
+   ],
+   "kept": [
+    13,
+    13
+   ],
+   "filler_kept": [
+    0,
+    0
+   ],
+   "errors": [
+    41,
+    41
+   ],
+   "arrive": [
+    404,
+    404
+   ],
+   "msg_len": [
+    64848
+   ],
+   "msg_u6": [
+    "fd28"
+   ],
+   "msg_dst": [
+    "fd030000"
+   ],
+   "kept_rep2": [
+    13,
+    13
+   ],
+   "errors_rep2": [
+    41,
+    41
+   ],
+   "rmem_rep2": [
+    152064,
+    152064
+   ]
+  },
+  {
+   "name": "d1200_163840",
+   "mode": "dflt",
+   "n": 54,
+   "pl": 1200,
+   "filler": [
+    0,
+    0
+   ],
+   "door": "a",
+   "rcvbuf_request": 81920,
+   "rcvbuf_eff": 163840,
+   "packets": 1,
+   "messages": 1,
+   "y1_frames": 1,
+   "y2_frames": 0,
+   "rmem": [
+    163584,
+    163584
+   ],
+   "kept": [
+    18,
+    18
+   ],
+   "filler_kept": [
+    0,
+    0
+   ],
+   "errors": [
+    36,
+    36
+   ],
+   "arrive": [
+    404,
+    404
+   ],
+   "msg_len": [
+    64848
+   ],
+   "msg_u6": [
+    "fd28"
+   ],
+   "msg_dst": [
+    "fd030000"
+   ],
+   "kept_rep2": [
+    18,
+    18
+   ],
+   "errors_rep2": [
+    36,
+    36
+   ],
+   "rmem_rep2": [
+    163584,
+    163584
+   ]
+  },
+  {
+   "name": "d1200_184320",
+   "mode": "dflt",
+   "n": 54,
+   "pl": 1200,
+   "filler": [
+    0,
+    0
+   ],
+   "door": "a",
+   "rcvbuf_request": 92160,
+   "rcvbuf_eff": 184320,
+   "packets": 1,
+   "messages": 1,
+   "y1_frames": 1,
+   "y2_frames": 0,
+   "rmem": [
+    184320,
+    184320
+   ],
+   "kept": [
+    27,
+    27
+   ],
+   "filler_kept": [
+    0,
+    0
+   ],
+   "errors": [
+    27,
+    27
+   ],
+   "arrive": [
+    404,
+    404
+   ],
+   "msg_len": [
+    64848
+   ],
+   "msg_u6": [
+    "fd28"
+   ],
+   "msg_dst": [
+    "fd030000"
+   ],
+   "kept_rep2": [
+    27,
+    27
+   ],
+   "errors_rep2": [
+    27,
+    27
+   ],
+   "rmem_rep2": [
+    184320,
+    184320
+   ]
+  },
+  {
+   "name": "c_only_fill",
+   "mode": "cond",
+   "n": 0,
+   "pl": 512,
+   "filler": [
+    64,
+    512
+   ],
+   "door": "a",
+   "rcvbuf_request": 131072,
+   "rcvbuf_eff": 262144,
+   "packets": 1,
+   "messages": 1,
+   "y1_frames": 0,
+   "y2_frames": 64,
+   "rmem": [
+    162560,
+    162560
+   ],
+   "kept": [
+    0,
+    0
+   ],
+   "filler_kept": [
+    64,
+    64
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "arrive": [
+    406,
+    405
+   ],
+   "msg_len": [
+    32816
+   ],
+   "msg_u6": [
+    "8008"
+   ],
+   "msg_dst": [
+    "fd040000"
+   ],
+   "kept_rep2": [
+    0,
+    0
+   ],
+   "errors_rep2": [
+    0,
+    0
+   ],
+   "rmem_rep2": [
+    162560,
+    162560
+   ]
+  },
+  {
+   "name": "c_only_test",
+   "mode": "cond",
+   "n": 64,
+   "pl": 512,
+   "filler": [
+    0,
+    0
+   ],
+   "door": "a",
+   "rcvbuf_request": 131072,
+   "rcvbuf_eff": 262144,
+   "packets": 1,
+   "messages": 1,
+   "y1_frames": 1,
+   "y2_frames": 0,
+   "rmem": [
+    162560,
+    162560
+   ],
+   "kept": [
+    64,
+    64
+   ],
+   "filler_kept": [
+    0,
+    0
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "arrive": [
+    404,
+    404
+   ],
+   "msg_len": [
+    32816
+   ],
+   "msg_u6": [
+    "8008"
+   ],
+   "msg_dst": [
+    "fd030000"
+   ],
+   "kept_rep2": [
+    64,
+    64
+   ],
+   "errors_rep2": [
+    0,
+    0
+   ],
+   "rmem_rep2": [
+    162560,
+    162560
+   ]
+  },
+  {
+   "name": "c_fill_test",
+   "mode": "cond",
+   "n": 64,
+   "pl": 512,
+   "filler": [
+    64,
+    512
+   ],
+   "door": "a",
+   "rcvbuf_request": 131072,
+   "rcvbuf_eff": 262144,
+   "packets": 2,
+   "messages": 2,
+   "y1_frames": 1,
+   "y2_frames": 64,
+   "rmem": [
+    244480,
+    244480
+   ],
+   "kept": [
+    64,
+    64
+   ],
+   "filler_kept": [
+    64,
+    64
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "arrive": [
+    404,
+    404
+   ],
+   "msg_len": [
+    32816,
+    32816
+   ],
+   "msg_u6": [
+    "8008",
+    "8008"
+   ],
+   "msg_dst": [
+    "fd040000",
+    "fd030000"
+   ],
+   "kept_rep2": [
+    64,
+    64
+   ],
+   "errors_rep2": [
+    0,
+    0
+   ],
+   "rmem_rep2": [
+    244480,
+    244480
+   ]
+  },
+  {
+   "name": "c_fill_test1200_262",
+   "mode": "cond",
+   "n": 54,
+   "pl": 1200,
+   "filler": [
+    64,
+    512
+   ],
+   "door": "a",
+   "rcvbuf_request": 131072,
+   "rcvbuf_eff": 262144,
+   "packets": 2,
+   "messages": 2,
+   "y1_frames": 1,
+   "y2_frames": 64,
+   "rmem": [
+    261632,
+    261632
+   ],
+   "kept": [
+    43,
+    43
+   ],
+   "filler_kept": [
+    64,
+    64
+   ],
+   "errors": [
+    11,
+    11
+   ],
+   "arrive": [
+    404,
+    405
+   ],
+   "msg_len": [
+    32816,
+    64848
+   ],
+   "msg_u6": [
+    "8008",
+    "fd28"
+   ],
+   "msg_dst": [
+    "fd040000",
+    "fd030000"
+   ],
+   "kept_rep2": [
+    43,
+    43
+   ],
+   "errors_rep2": [
+    11,
+    11
+   ],
+   "rmem_rep2": [
+    261632,
+    261632
+   ]
+  },
+  {
+   "name": "c_fill_test1200_311",
+   "mode": "cond",
+   "n": 54,
+   "pl": 1200,
+   "filler": [
+    64,
+    512
+   ],
+   "door": "a",
+   "rcvbuf_request": 155648,
+   "rcvbuf_eff": 311296,
+   "packets": 2,
+   "messages": 2,
+   "y1_frames": 1,
+   "y2_frames": 64,
+   "rmem": [
+    286976,
+    286976
+   ],
+   "kept": [
+    54,
+    54
+   ],
+   "filler_kept": [
+    64,
+    64
+   ],
+   "errors": [
+    0,
+    0
+   ],
+   "arrive": [
+    408,
+    404
+   ],
+   "msg_len": [
+    32816,
+    64848
+   ],
+   "msg_u6": [
+    "8008",
+    "fd28"
+   ],
+   "msg_dst": [
+    "fd040000",
+    "fd030000"
+   ],
+   "kept_rep2": [
+    54,
+    54
+   ],
+   "errors_rep2": [
+    0,
+    0
+   ],
+   "rmem_rep2": [
+    286976,
+    286976
+   ]
+  },
+  {
+   "name": "c_fill_test1200_344",
+   "mode": "cond",
+   "n": 54,
+   "pl": 1200,
+   "filler": [
+    64,
+    512
+   ],
+   "door": "a",
+   "rcvbuf_request": 172032,
+   "rcvbuf_eff": 344064,
+   "packets": 2,
+   "messages": 2,
+   "y1_frames": 1,
+   "y2_frames": 64,
+   "rmem": [
+    342272,
+    342272
+   ],
+   "kept": [
+    25,
+    25
+   ],
+   "filler_kept": [
+    64,
+    64
+   ],
+   "errors": [
+    29,
+    29
+   ],
+   "arrive": [
+    417,
+    415
+   ],
+   "msg_len": [
+    32816,
+    64848
+   ],
+   "msg_u6": [
+    "8008",
+    "fd28"
+   ],
+   "msg_dst": [
+    "fd040000",
+    "fd030000"
+   ],
+   "kept_rep2": [
+    25,
+    25
+   ],
+   "errors_rep2": [
+    29,
+    29
+   ],
+   "rmem_rep2": [
+    342272,
+    342272
+   ]
+  },
+  {
+   "name": "c_fill_s512_212",
+   "mode": "cond",
+   "n": 64,
+   "pl": 512,
+   "filler": [
+    64,
+    512
+   ],
+   "door": "a",
+   "rcvbuf_request": 106496,
+   "rcvbuf_eff": 212992,
+   "packets": 2,
+   "messages": 2,
+   "y1_frames": 1,
+   "y2_frames": 64,
+   "rmem": [
+    212480,
+    212480
+   ],
+   "kept": [
+    39,
+    39
+   ],
+   "filler_kept": [
+    64,
+    64
+   ],
+   "errors": [
+    25,
+    25
+   ],
+   "arrive": [
+    404,
+    404
+   ],
+   "msg_len": [
+    32816,
+    32816
+   ],
+   "msg_u6": [
+    "8008",
+    "8008"
+   ],
+   "msg_dst": [
+    "fd040000",
+    "fd030000"
+   ],
+   "kept_rep2": [
+    39,
+    39
+   ],
+   "errors_rep2": [
+    25,
+    25
+   ],
+   "rmem_rep2": [
+    212480,
+    212480
+   ]
+  }
+ ],
+ "head_charge": {
+  "d54_lazy": [
+   122112,
+   124416
+  ],
+  "d54_eag": null,
+  "d54_lazy_b": [
+   124416,
+   124416
+  ],
+  "d64_lazy": [
+   81920,
+   81920
+  ],
+  "d64x1200_lazy": [
+   124416,
+   124416
+  ],
+  "d1200_133120": [
+   124416,
+   124416
+  ],
+  "d1200_143360": [
+   124416,
+   124416
+  ],
+  "d1200_153600": [
+   124416,
+   124416
+  ],
+  "d1200_163840": [
+   124416,
+   124416
+  ],
+  "d1200_184320": [
+   124416,
+   124416
+  ],
+  "c_only_fill": [
+   null,
+   null
+  ],
+  "c_only_test": [
+   81920,
+   81920
+  ],
+  "c_fill_test": [
+   1280,
+   1280
+  ],
+  "c_fill_test1200_262": [
+   2304,
+   2304
+  ],
+  "c_fill_test1200_311": [
+   2304,
+   2304
+  ],
+  "c_fill_test1200_344": [
+   124416,
+   124416
+  ],
+  "c_fill_s512_212": [
+   1280,
+   1280
+  ]
+ },
+ "frozen": {
+  "satisfied": [
+   "P1",
+   "P2",
+   "P3",
+   "P4",
+   "P5",
+   "P6",
+   "P7a",
+   "P7b",
+   "P7c",
+   "P7d",
+   "P7e",
+   "P8",
+   "P9",
+   "P13",
+   "P15",
+   "P16",
+   "P17"
+  ],
+  "refuted": [
+   "P10",
+   "P11",
+   "P12",
+   "P14"
+  ],
+  "script": "tools/verify589.py"
+ },
+ "verification": {
+  "verify589": "checks=1717 failures=0",
+  "selftest": "27/27 single-clause mutations red without a traceback",
+  "audit": "see VERIFY_REPORT.md"
+ }
+}

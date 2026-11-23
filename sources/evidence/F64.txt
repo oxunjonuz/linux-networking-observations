@@ -1,0 +1,297 @@
+===== LETTER_SECTION_F64.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload on a GRO aggregate: the length a rule reads is a sum
+ no datagram has, and the tail is the splitter's own arithmetic
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+The F63 follow-up measured who pays for a store into a GRO aggregate.  This
+one measures what the aggregate IS, because the first question turned out to
+depend on the second: the same four datagrams give a rule two different
+lengths and two different checksum fields depending only on whether the
+aggregate is a fraglist or linear.
+
+  nft_payload evaluates on the skb the hook receives.
+
+  With Generic Receive Offload that skb is one packet built out of several
+  datagrams, and its UDP header is not any datagram's header:
+
+   512,512,512           fraglist   uh->len 0x0608  uh->check fcc2 = seed(520)
+   512,512,512,200       fraglist   uh->len 0x06d0  uh->check fcc2 = seed(520)
+   512,512,512,200       linear     uh->len 0x06d0  uh->check 018b = seed(1744)
+   64 x 512              fraglist   uh->len 0x8008  uh->check fcc2 = seed(520)
+   64 x 512              linear     uh->len 0x8008  uh->check 7ac3 = seed(32776)
+
+`uh->len` is the sum (udp_gro_complete() writes skb->len - nhoff).  The
+checksum field is the first datagram's own CHECKSUM_PARTIAL seed on the
+fraglist path -- udp_gro_receive() merges without touching the head's field --
+and a seed over the whole aggregate on the linear path, where
+skb_gro_receive() completes the header.  A rule that reads @th,4,2 sees a
+length no datagram in the packet has; a rule that reads @th,6,2 sees a number
+that addresses 520 bytes of a 1744-byte packet.
+
+Two consequences that a rule cannot see at all:
+
+1.  The tail.  When the split happens on a device without GSO the trailing
+    segment's length is computed, not derived: 208 = 8 + 200 comes from the
+    `if (!skb_is_gso(seg))` clause, the only per-segment arithmetic in
+    __udp_gso_segment().  The hop limit says which path ran: the fraglist
+    split copies only the MAC header into each fragment, so only the first
+    segment carries the router's decrement (63,64,64,64) while the linear
+    path copies the whole header (63,63,63,63).
+
+2.  Who pays depends on the store's own offset, not on the shape.  Through a
+    device without checksum offload a fraglist aggregate ships the senders'
+    seeds (fcc3,fcc3,fcc3,fb8b -- auxdata 9, CHECKSUM_PARTIAL, delivered).
+    The same aggregate with the same rule, whose store lands four bytes past
+    the head instead of inside it, is linearised: skb_pagelen() - 8 no longer
+    equals gso_size, the geometry test fails, and every segment is hashed
+    (02b0,01b0,00b0,1248 -- auxdata 129).  The rule did not change; the
+    offset did.
+
+Two smaller measurements, offered as data rather than as argument:
+
+  *  UDP_GRO_CNT_MAX is 64 and the datagram that did not fit is a plain
+     packet, not a one-datagram aggregate: gro_complete() sets gso_size = 0
+     when count == 1.  With 65 datagrams one rule instance reads seed(32776)
+     for the aggregate and seed(520) for the 65th, in the same arm.
+  *  A store into the length field has three fates: rewritten by
+     udp_set_len_short() on an aggregate (the store vanishes, 4 datagrams
+     delivered), applied verbatim on a lone datagram (the receiver trims to
+     32 bytes and delivers 24), and used as the base of every per-segment
+     checksum delta on a linear aggregate (nothing delivered, +4 errors).
+
+Measured on 7.3.4-T563, 26 arms x 2 boots x 2 agreeing attempts, one rule per
+arm at ip6/forward, three netns; every number verified byte for byte by
+verify586.py (1271 checks) against a reimplementation of csum_ipv6_magic()
+and of the aggregate's composition.  Not measured: real NICs (every door here
+is a veth with bits cleared by hand), BIG TCP (udp_set_len() writes a zero
+length at or above GRO_LEGACY_MAX_SIZE -- out of reach at these sizes), TCP
+GRO, CHECKSUM_COMPLETE, and the CHECKSUM_NONE provenance, which could not be
+made deterministic on this rig and is therefore not used as evidence.
+
+
+===== SUMMARY.md =====
+# F64 — the geometry of an aggregate: the length a rule reads is a sum no
+# datagram in it has
+
+Kernel `7.3.4-T563` (`1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033`),
+the same image as F41..F63; nothing rebuilt.
+Instrument `vm/differ586_add.c`, mode `geom`, **26 arms × 2 boots × 2 attempts**,
+three netns, the F63 topology unchanged: `S` sends, the parent is the router
+(`x0` in, `y1`/`y2` out, one rule per arm in `ip6` table `f85p` chain `fwd`),
+`D` receives with sockets on 5000 (plain) and 5001 (`UDP_GRO`), a witness chain
+in its own netns, and taps on `y1`, `y2`, `y3`, `y4`.
+
+Predicted before the first run: `research/predictions_586.md`
+(`7453657736e143a89e34265fa5e8ec3e82ec29b510ac74b8a12c3e507bebcb56`).
+This was the debt F63 left: turn 585 froze no predictions at all.
+
+## 1. The rule reads a header that describes no datagram
+
+One socket, one rule, one packet to the rule — and four different numbers,
+depending only on how many datagrams the aggregate holds and whether the
+aggregate is a fraglist or linear:
+
+| arm | datagrams | `uh->len` the rule reads | `uh->check` the rule reads | NFLOG length |
+|---|---|---|---|---|
+| `g_eq_a` (3×512, fraglist) | 3 | `0x0608` = 1544 | `fcc2` = seed(520) | 1584 |
+| `g_t3_a` (3×512+200, fraglist) | 4 | `0x06d0` = 1744 | `fcc2` = seed(**520**) | 1784 |
+| `g_t3u_a` (same, linear) | 4 | `0x06d0` = 1744 | `018b` = seed(**1744**) | 1784 |
+| `g_c65_a` (65×512, fraglist) | 64 | `0x8008` = 32776 | `fcc2` = seed(**520**) | 32816 |
+| `g_c65u_a` (same, linear) | 64 | `0x8008` = 32776 | `7ac3` = seed(**32776**) | 32816 |
+
+The length is the **sum** — `udp_gro_complete()` writes `skb->len - nhoff` into
+the head's `uh->len` (`net/ipv4/udp_offload.c`), so the rule sees 1744 where no
+datagram in the packet is longer than 520. The checksum field is *not* the sum's
+seed unless the aggregate is linear: on the fraglist path the head is still the
+first datagram and carries that datagram's own `CHECKSUM_PARTIAL` seed. Both
+fields are verified against a reimplementation of `csum_ipv6_magic()`
+(`fold(pseudo)` for a seed, `~fold(pseudo+packet)` for a device checksum).
+
+## 2. The split: one door carries the aggregate, the other computes each tail
+
+| arm | door | frames on the wire | `uh->len` per frame | hop limit per frame |
+|---|---|---|---|---|
+| `g_t3_a` | `y1` (GSO_UDP_L4 kept) | **1** × 1798 | 1744 | 63 |
+| `g_t3_b` | `y2` (no HW_CSUM, no GSO) | 574, 574, 574, **262** | 520, 520, 520, **208** | 63, 64, 64, 64 |
+| `g_t3u_b` | `y2` | 574, 574, 574, **262** | 520, 520, 520, **208** | 63, 63, 63, 63 |
+
+`208 = 8 + 200` is the only segment length the segmenter *computes*: it comes
+from the `if (!skb_is_gso(seg))` clause (`net/ipv4/udp_offload.c:592-594`), the
+one place where the trailing segment is measured rather than derived from
+`gso_size`. The hop limit is the sharper witness of which path ran: the fraglist
+split copies only the MAC header into each fragment (`skb_segment_list()`), so
+only the first segment carries the router's decrement, while the linear path
+copies the whole header and all four show 63.
+
+## 3. A store in the tail reaches it — and changes who pays
+
+`@th,1544,4 = a0a1a2a3` addresses the first four bytes of the fourth datagram.
+It lands there through the fraglist (`lgp3 = a0a1a2a3 84858687`, `lgp0..lgp2`
+untouched) and the socket receives it (`B = 0,1,2,160`).
+
+What it costs is decided by the shape and by the store's own offset:
+
+| arm | shape | store | checksum fields on `y2` | auxdata | delivered |
+|---|---|---|---|---|---|
+| `g_t3_b` | fraglist | — | `fcc3`, `fcc3`, `fcc3`, `fb8b` (seeds) | 9 (PARTIAL) | 4 |
+| `g_t3_len_b` | fraglist | `@th,4,2` in the head | `fcc3`, `fcc3`, `fcc3`, `fb8b` (seeds) | 9 | 4 |
+| `g_t3_w_b` | fraglist | `@th,1544,4` in the tail | **`02b0`, `01b0`, `00b0`, `1248`** (real) | **129** | 4 |
+| `g_t3u_b` | linear | — | `02b0`, `01b0`, `00b0`, `cf88` (real) | 129 | 4 |
+| `g_t3u_w_b` | linear | `@th,1544,4` | `02b0`, `01b0`, `00b0`, `1248` (real) | 129 | 4 |
+
+This refines F63's rule. F63 measured that a fraglist aggregate ships seeds and
+nobody pays; that is true of a store **inside the head**. A store that reaches
+past the head pulls data out of `frag_list`, the geometry test
+(`skb_pagelen(gso_skb) - 8 == gso_size`) fails, the aggregate is linearised, and
+then *every* segment is hashed — `1248` is the tail's own checksum, computed
+over 208 bytes of the *stored* datagram. Same shape, same length, same rule:
+whether the fraglist pays is decided by four bytes of the rule's own offset.
+
+## 4. Two bytes of length, three fates
+
+`@th,4,2 = 0x0020` — the same instruction, three different packets:
+
+| arm | what the rule's packet is | what happened | delivered |
+|---|---|---|---|
+| `g_t3_len_b` (fraglist) | an aggregate | head length put back to 520 by `udp_set_len_short(udp_hdr(skb), 8+mss)`; the other three fragments were never touched | **4**, `Udp6InErrors` 0 |
+| `g_one_len_a/b` (one datagram) | a plain datagram | nothing rewrites it: the receiver trims the skb to 32 bytes and delivers **24** | 1, 0 errors |
+| `g_t3u_len_b` (linear) | an aggregate | the per-segment delta is computed against the **stored** number (`check = csum16_add(csum16_sub(uh->check, uh->len), htons(newlen))`) so every field is a sum over the wrong pseudo length: `fbff`, `faff`, `f9ff`, `c8d8` | **0**, `Udp6InErrors` **+4** |
+
+The 24-byte datagram is the cleanest number of the turn: the rule writes two
+bytes, the packet keeps them, the application loses 488 bytes, and nothing in
+the counters says why.
+
+## 5. The cap is 64, and the packet that did not fit is not an aggregate
+
+`udp_gro_receive_segment()` closes the aggregate at
+`NAPI_GRO_CB(p)->count >= UDP_GRO_CNT_MAX` (`net/ipv4/udp_offload.c:694,766`).
+65 datagrams → the rule counts **2** packets: 32816 bytes and 560. The socket
+receives **65** datagrams of 512, in order (`B = 0,1,2,3,4,5,…,63,64`).
+
+The 65th is a *plain* packet, not a one-datagram aggregate, because
+`gro_complete()` sets `gso_size = 0` when `count == 1` (`net/core/gro.c:280`) —
+and the wire says so: on the linear arm the aggregate's field is `7ac3` = seed
+over 32776 while the lone packet's field is `fcc2` = seed over 520. One rule,
+one arm, two different lengths under the same instruction.
+
+## 6. `mss` larger than the payload is not a property of the wire (P8 refuted)
+
+A frame sent with `UDP_SEGMENT 9000` and 1200 bytes of payload is a GSO skb with
+`gso_segs = 1`; `__udp_gso_segment()` refuses a GSO frame not longer than its
+own mss (`gso_skb->len <= sizeof(*uh) + mss` → `-EINVAL`). Predicted: 0
+delivered, `Udp6InErrors` +1. Measured: **delivered, on both doors, with x0's
+GRO on and off** (`g_mssbig_a/b/ng_a/ng_b`, all 1200 bytes, 0 errors).
+
+The reason is one line of `gro_complete()`: a packet entering GRO with
+`count == 1` leaves with `gso_size = 0`, i.e. **GRO does not only aggregate, it
+un-GSOs a single-segment GSO packet**. The segmentation state never reaches the
+wire; the receiving device's GRO erases it before the door is asked. The cell is
+therefore not measurable on this rig at all — it needs a GSO skb that reaches
+`__udp_gso_segment()` *without* crossing a GRO-enabled device.
+
+## 7. What the rule cannot see, and what I could not make deterministic
+
+* The rule sees the shape only in numbers it was not given: `uh->len` (the sum)
+  and `uh->check` (the first datagram's seed). It cannot tell an aggregate of
+  three from a datagram of 1544 except by the fact that no such datagram exists.
+* **A datagram that starts a GRO flow which nothing follows leaves the arm's
+  window.** `g_mid_a` (512,512,200,512) is one packet of 1272 — three datagrams
+  — and the fourth is in neither the rule's message nor the tap (one frame of
+  1286 bytes). Whether it is forwarded later or held by
+  `__gro_flush_chain()` (`flush_old && age == jiffies` keeps only same-jiffy
+  entries) was not isolated.
+* **The CHECKSUM_NONE provenance did not survive as evidence.** With frames the
+  sender built and checksummed itself, x0's GRO forwards **1 of 4** frames
+  (`g_t3n_*`: rule count 1, 560 bytes, one datagram at the socket), while with
+  x0's GRO off all four are forwarded and the receiver's GRO makes `[3][1]`
+  (`g_t3nd_a`: 4 packets, then 2 frames at `y3`: 1598 and 262). The same four
+  frames gave `[4]`, `[3][1]`, `[1]` and `[3]+[0]` in different builds of the
+  same instrument. Recorded in the log, asserted as *observed*, **not used as
+  evidence for any claim above**.
+* `udp_set_len()` writes `uh->len = 0` for an aggregate at or above
+  `GRO_LEGACY_MAX_SIZE` (BIG TCP). Not reachable here: 64 × 512 is 32776 and
+  veth's `gro_max_size` was not raised to 65536.
+
+## 8. Instrument defects, all mine
+
+1. **NFLOG offsets** — I read the payload as if it began at the MAC header; for
+   a `family ip6` chain it begins at the IPv6 header. The first smoke printed
+   `lgudp` from the middle of the source address and `lgp0` from payload byte 14.
+2. **The warm-up** — added to stop the first datagram escaping the aggregate, it
+   went to port 5000 because the child masked `psel` to one bit, and then, once
+   the mask was fixed and the flush timeout raised, it stayed in the GRO list for
+   200 ms and was forwarded *through the next arm's rule*: five arms carried an
+   extra 1584-byte packet. Removed.
+3. **`gro_flush_timeout` was 20 ms** — too short to survive a jiffy boundary;
+   `__gro_flush_chain()` keeps an entry across a poll-end flush only if it
+   arrived in the same jiffy, so one arm in ~30 lost its first datagram to the
+   flush. Raised to 200 ms.
+4. **One attempt per arm is not enough.** Every arm now sends its traffic twice
+   and reports the second attempt only if the first agrees with it on
+   (packets, first length, second length, message count): 26 of 26 agree in all
+   four recorded boots.
+5. **A 66-datagram arm was removed.** 66 datagrams gave `64+2` in four boots and
+   `64+1+1` in two: whether the packet that did not fit is joined by the next one
+   is a race, not a rule. The 65-datagram arm is deterministic; the 66th
+   datagram's fate is this note.
+6. **The settle drain between attempts** was printed as an arm (`i=127`) because
+   I forgot the quiet bit; harmless, but it made four arms look unstable until
+   I looked.
+7. **The `mss > payload` arm cannot work here** and the four arms built to test
+   it (with and without x0's GRO) are a measured refutation of my own model,
+   not of the kernel.
+8. `dmesg` after the run holds no splat: unlike F63, nothing in this turn
+   tripped a `DEBUG_NET_WARN_ON_ONCE`.
+
+## 9. Predictions: six held, two refuted, one unusable
+
+| | |
+|---|---|
+| P1 | **held** — `uh->len = 0x06d0`, fraglist field `fcc2` = seed(520), linear `018b` = seed(1744) |
+| P2 | **held** — 574/574/574/262 and 520/520/520/**208**, the tail's length computed by its own clause |
+| P3 | **held and refined** — the short tail does not change who pays *by itself*; a store in the tail does (§3) |
+| P4 | **held** — the linear aggregate with a tail store pays for all four, the tail's `1248` included |
+| P5 | **held, both halves** — erased on the fraglist, poisoning on the linear; and a third fate I did not predict (24 bytes on a lone datagram) |
+| P6 | **held** — 2 packets (32816 + 560), 65 datagrams at the socket, the 65th plain |
+| P7 | **refuted in its first clause** — predicted 2 packets and 4 datagrams; measured 1 packet (1272) and 3 datagrams, because the fourth leaves the window (§7) |
+| P8 | **refuted** — delivered on both doors and with GRO on and off; one line of `gro_complete()` explains it |
+| P9 | **unusable** — the CHECKSUM_NONE provenance is instrument-dependent (§7) |
+| P10 | **held** — the counter is the number of packets, not datagrams, in every arm |
+
+## 10. Files
+
+`findings/F64-aggregate-geometry/{SUMMARY.md, summary.json, VERIFY_REPORT.md,
+LETTER_SECTION_F64.txt}`; `vm/{differ586_add.c, build_f64_differ.sh,
+make_initramfs586.sh, build/differ586}`; `tools/{f64_run.sh, verify586.py,
+verify586_selftest.sh}`; `research/predictions_586.md`; logs
+`logs/f64_rep{1,2,3,4}_final.log` and the four runs they came from.
+
+`LETTER_SECTION_F64.txt` is **NOT SENT**: the reply form is the F28 thread, and
+sending is the owner's decision.
+
+
+===== summary.json =====
+{
+  "turn": 586,
+  "finding": "F64-aggregate-geometry",
+  "mode": "geom",
+  "kernel": "7.3.4-T563",
+  "kernel_sha": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+  "arms": 26,
+  "boots": ["logs/f64_rep1_final.log", "logs/f64_rep2_final.log",
+            "logs/f64_rep3_final.log", "logs/f64_rep4_final.log"],
+  "differ_sha": "d2eac999b7b02d2c30d4342c752ec2594f3d8c37b7783c1651fc72a8bd9a8a85",
+  "initramfs_sha": "40ac11b1a27cba264ebb727f09e0e59a5165265e5be3068d8237f3e03b8dcfc2",
+  "predictions": "research/predictions_586.md",
+  "predictions_sha": "7453657736e143a89e34265fa5e8ec3e82ec29b510ac74b8a12c3e507bebcb56",
+  "checks": {"verify586": 1271, "verify586_selftest": 16},
+  "claim": "An aggregate presents a rule with a header that describes no datagram: uh->len is the SUM of the datagrams it holds (0x06d0 for 512+512+512+200, 0x8008 for 64x512) while uh->check is the FIRST datagram's own PARTIAL seed on the fraglist path and a seed over the whole length on the linear one (fcc2 vs 018b for the same four datagrams). The tail segment's length is the only one the splitter computes (208 = 8+200, from the `if (!skb_is_gso(seg))` clause), and whether the fraglist path pays for a store is decided by the store's own offset: inside the head it ships seeds (fcc3/fcc3/fcc3/fb8b, auxdata 9), four bytes past the head it linearises and every segment is hashed (02b0/01b0/00b0/1248, auxdata 129). The cap is 64 datagrams per aggregate and the one that did not fit is a plain packet (gro_complete sets gso_size = 0 when count == 1), so the same rule reading the same field sees seed(32776) in one packet and seed(520) in the next. And `mss > payload` is not a property of the wire at all: GRO un-GSOs a single-segment GSO packet before any door is asked, so the frame is delivered on every door.",
+  "answer_short": "The rule reads a length that is the sum of the datagrams in the aggregate and a checksum that addresses only the first of them; the tail's length is the splitter's own arithmetic; a store in the tail makes the fraglist path pay where a store in the head does not; the 65th datagram is a plain packet with its own seed; mss>payload never reaches a door because GRO erases it.",
+  "refuted": ["P7 first clause: 512,512,200,512 gave one packet and three datagrams, not two packets and four datagrams",
+              "P8: a frame smaller than its own mss is delivered on both doors and with x0's GRO on and off"],
+  "unusable": ["P9: the CHECKSUM_NONE provenance gave 1 of 4 frames forwarded with x0 aggregating and 3+1 without, across builds of the same instrument; recorded, not used as evidence"]
+}

@@ -1,0 +1,6489 @@
+===== LETTER_SECTION_F74.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: UDP GRO: the receive queue keeps floor(sk_rcvbuf / charge) zerocopy
+ datagrams -- and the charge is chosen by the SENDER's iov page offset
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+STATUS: NOT SENT -- draft for the F28 thread; sending is the owner's call.
+
+F74 -- what the offset charge does to the queue, and where the head of a copied
+skb comes from
+
+Kernel 7.3.4-T563 (`1efbc957…2033`), no new build. Same three-netns IPv4 path
+as F65-F73. Thirty arms over two boots, two attempts each, every modelled field
+identical between the boots and between attempts within a boot.
+
+1. The receive queue holds `floor(sk_rcvbuf / charge)` datagrams, and the
+   boundary is a byte of the socket's own request. 64 zerocopy datagrams of
+   512 bytes, `SO_RCVBUF` doubled by the kernel into `sk_rcvbuf`:
+
+       R = 38400   charge 5056  ->  7 kept, rmem 35392
+       R = 51200   charge 5056  -> 10 kept, rmem 50560
+       R = 76800   charge 5056  -> 15 kept, rmem 75840
+       R = 102400  charge 5056  -> 20 kept, rmem 101120
+       R = 38400   charge 9152  ->  4 kept, rmem 36608
+       R = 51200   charge 9152  ->  5 kept, rmem 45760
+       R = 76800   charge 9152  ->  8 kept, rmem 73216
+       R = 102400  charge 9152  -> 11 kept, rmem 100672
+
+   Two arms pin the boundary: `SO_RCVBUF` 17695 (R 35390) keeps 6, and 17696
+   (R 35392 = 7 x 5056) keeps 7 -- one byte of the request, one datagram. Two
+   more leave `rmem` equal to `sk_rcvbuf` to the byte and keep all 64
+   (323584 = 64 x 5056 and 585728 = 64 x 9152), which only works because the
+   check in `__udp_enqueue_schedule_skb()` is `rmem + size > rcvbuf`, strictly.
+
+2. The same 64 datagrams are 7 or 4 depending on a byte the receiver cannot
+   see. 512 bytes at page offset 0 cost 5056; at offset 3600, 9152; a
+   4097-byte payload at offset 0 also costs 9152. The gate record is identical
+   in all three -- `len` 512, `dlen` 512, `end` 384, `tail` 44, no clone -- so
+   the socket cannot tell them apart, and the number of datagrams it will hold
+   before dropping (and therefore where it starts dropping) is decided by the
+   sender's buffer alignment. The forward rule's own shape changes nothing: a
+   counter-only chain prints the same 7 / 35392 / 57 as one that logs.
+
+3. Above half the buffer the charge can disappear, and that is the receiver's
+   own branch. `skb_condense()` pulls a payload into the head when
+   `data_len <= end - tail` (340 bytes for a zerocopy skb) and charges
+   `SKB_TRUESIZE(end)` = 960. 64 datagrams of 200 bytes at `R` = 38400 keep
+   18 with 33664 in the queue -- four at 5056 and fourteen at 960 -- where the
+   same datagrams of 512 bytes keep 7. So the page charge a misaligned sender
+   inflicts is bounded by whether the payload fits the head's tailroom, and the
+   same branch can cut the bill by 57344 bytes.
+
+4. Where a copied skb's `end` comes from: the small-head cache, and the
+   boundary is a byte of payload. `kmalloc_reserve()` gives every skb whose
+   `SKB_HEAD_ALIGN(size)` is at most `SKB_SMALL_HEAD_CACHE_SIZE` a head of
+   exactly that size -- 704 in this kernel, read from the booting kernel's own
+   `skbuff_small_head` slab cache -- and `end` is that size minus
+   `SKB_DATA_ALIGN(sizeof(struct skb_shared_info))` = 320, so `end` = 384 and
+   `truesize` = 960 for **every** copy with a payload up to 325 bytes. One byte
+   more (326) and the request `payload + 59` leaves the small head, the
+   allocator rounds up to 1024 (there is no 768 class), and `end` jumps to 704
+   and the bill to 1280. Measured on the wire for 270, 277, 278, 309, 310 and
+   325 (384/960) against 326 and 342 (704/1280) and 5000 (7872/8448).
+
+5. A queue with a mixed charge sequence is not `floor(R / mean)`: the check runs
+   for every datagram, so a charge that was refused does not stop a later,
+   smaller one. With charges alternating 9152 and 5056 at `R` = 51200 the
+   seventh (9152) is refused at 51776 and the eighth (5056) is accepted,
+   47680, 7 datagrams where `floor(51200/9152)` = 5 would suggest. The order
+   matters as much as the multiset: the same charges starting with 5056 keep 5
+   and bill 33472 instead of 37568.
+
+Two of my predictions were refuted in this turn by my own arithmetic (a
+simulation that stopped at the first refusal, and a sender whose 2048-byte
+stride mixed two offsets into one arm); both are recorded, with the numbers
+they got wrong, in the finding. Nothing here is a memory-safety claim: every
+rule was installed by root in the initial user namespace, and the effect is
+accounting -- the sender's iov alignment, and the receiver's own condense
+branch, both move the number of datagrams a socket will hold for a given
+`sk_rcvbuf`.
+
+
+===== SUMMARY.md =====
+# F74 — the receiver's queue capacity is set by a byte in the sender's iov, and the head of a copy is the small-head cache floor
+
+Turn 596. Kernel `7.3.4-T563` (`1efbc957…2033`), **no new build**. Instrument
+`differ596`, modes `q` (21 arms) and `h` (9 arms) — **30 arms × 2 attempts ×
+2 boots = 120 measured attempts**. Predictions frozen before the first boot
+(`research/predictions_596.md`, `743c6360…6f5e`) and, after one smoke that
+found a flaw in my own instrument, a second frozen file
+(`research/predictions_596b.md`, `878121a5…3b68`) before the counted boots.
+Neither file was edited afterwards. Five predictions of the first file and two
+of the second were refuted; all seven refutations are in §6.
+
+## 0. The two debts
+
+F73 §"Что не измерено, прямо", first bullet:
+
+> почему у 5000-байтной линейной копии `end` = 7872, а у 512-байтной 704:
+> тождество `ts = end + 576` держится для обеих, но откуда берётся `end`
+> (корзина аллокатора, а не полезная нагрузка) — прочитано, а не измерено.
+
+and the plan named at the end of turn 595:
+
+> следствие заряда для очереди: 64 zerocopy-датаграммы из выровненного буфера
+> против тех же 64 со смещением 3600 при `sk_rcvbuf` 38400 (ожидание 7 против 4).
+
+Both are answered by cells here. §1–§4 answer the second debt's first half, §5
+the second.
+
+## 1. The law: a queue accepts while the bill fits, and the check is `>`
+
+`__udp_enqueue_schedule_skb()` (`net/ipv4/udp.c:1678`) reads the bill of the
+skb **before** anything shrinks it, drops when `rmem + size > rcvbuf`, accepts
+a datagram into an empty queue regardless, and runs `skb_condense()` only when
+the queue is already above half. For one constant charge `s` that is
+`kept = floor(R/s)` with `R = sk_rcvbuf = 2 × SO_RCVBUF`. Eight arms with a
+constant charge (`ts` identical on all 64 gate records of the arm) and eight
+buffers:
+
+| arm | R | charge s | kept | rmem | errors |
+|---|---|---|---|---|---|
+| `q64_a0_R38`     | 38400  | 5056 | **7**  | 35392  | 57 |
+| `q64_a0_R50`     | 51200  | 5056 | **10** | 50560  | 54 |
+| `q64_a0_R76`     | 76800  | 5056 | **15** | 75840  | 49 |
+| `q64_a0_R102`    | 102400 | 5056 | **20** | 101120 | 44 |
+| `q64_4096a36_R38`  | 38400  | 9152 | **4**  | 36608  | 60 |
+| `q64_4096a36_R50`  | 51200  | 9152 | **5**  | 45760  | 59 |
+| `q64_4096a36_R76`  | 76800  | 9152 | **8**  | 73216  | 56 |
+| `q64_4096a36_R102` | 102400 | 9152 | **11** | 100672 | 53 |
+
+Two cells pin the boundary from both sides, and each is a byte of the
+*socket's* request:
+
+| arm | SO_RCVBUF | R | kept | rmem |
+|---|---|---|---|---|
+| `q64_a0_one` | 17695 | 35390 | **6** | 30336 |
+| `q64_a0_eq`  | 17696 | **35392** = 7·5056 | **7** | **35392** |
+| `q64_a0_full` | 161792 | **323584** = 64·5056 | **64** | **323584** |
+| `q64_4096a36_full` | 292864 | **585728** = 64·9152 | **64** | **585728** |
+
+`q64_a0_one` and `q64_a0_eq` differ by **one byte of the request** and by one
+datagram kept; the two `_full` arms leave `rmem` equal to `sk_rcvbuf` to the
+byte and keep all 64, which is only possible because the check is strictly
+greater. Errors and kept add up to 64 in every arm of the table above.
+
+The forward rule does not touch the bill: `q64_a0_cn`, a chain that only
+counts and never logs, prints the same 7 / 35392 / 57 as `q64_a0_R38`.
+
+## 2. The same 64 datagrams, 7 or 4: a byte the receiver cannot see
+
+One sender, one socket, one door, 64 datagrams of 512 bytes, `sk_rcvbuf`
+38400 — and the only difference is where the payload starts in its page:
+
+| arm | page offset of datagram 0 | gate `ts` | kept | rmem | errors |
+|---|---|---|---|---|---|
+| `q64_a0_R38`  | 0    | 5056 | **7** | 35392 | 57 |
+| `q64_a36_R38` | 3600 | **9152, 5056, 9152, 5056, …** | **5** | 37568 | 59 |
+| `q64_4096a36_R38` | 3600 | 9152 | **4** | 36608 | 60 |
+| `q64_4097a0`  | 0 (payload 4097 crosses a page) | 9152 | **4** | 36608 | 60 |
+
+The receiver's socket cannot see which of these a datagram is: `len` = 512,
+`dlen` = 512, `end` = 384, `tail` = 44, `fl` = 0 on every record of every arm.
+The queue keeps 7 datagrams (3584 payload bytes) at offset 0 and 4 (2048
+bytes) when the sender's iov starts at 3600 or when the payload itself crosses
+a page — for 35392 against 36608 bytes of memory. **The number of datagrams a
+receiver can hold is decided by the sender's buffer alignment**, and so is the
+point at which it starts dropping.
+
+## 3. The mixed sequence, and two predictions my arithmetic got wrong
+
+The first smoke found that my own sender advances its payload pointer by
+`F591_MAXPL` = 2048 (`vm/differ595_add.c`), so an `al=2` burst does not sit at
+one offset — it alternates 3600 and 1552, and therefore 9152 and 5056. Those
+arms were kept, because a mixed sequence tests the algorithm harder. Measured,
+both attempts, both boots:
+
+| arm | R | kept | rmem | errors |
+|---|---|---|---|---|
+| `q64_a36_R38`  | 38400  | **5**  | **37568** | 59 |
+| `q64_a36_R50`  | 51200  | **7**  | **47680** | 57 |
+| `q64_a36_R76`  | 76800  | **11** | **76096** | 53 |
+| `q64_a36_R102` | 102400 | **14** | **99456** | 50 |
+| `q64_a36_full` | 585728 | **64** | **454656** | 0 |
+
+The lesson of the row `R` = 51200: **a dropped 9152 does not stop a later
+5056.** The queue is checked again for every datagram: the seventh charge
+(9152) fails at 42624 + 9152 = **51776 > 51200**, and the eighth (5056) still
+fits, 42624 + 5056 = **47680**, so the queue ends with 7 datagrams — more
+datagrams and less memory than `floor(R/9152)` = 5 would suggest. The phase matters as much as the
+multiset: `q64_4096a0_R38`, the same charges as `q64_a36_R38` but starting
+with 5056, keeps the same 5 datagrams and bills **33472** instead of 37568.
+
+## 4. Above half a buffer the page charge disappears — for small payloads
+
+`skb_condense()` pulls the payload into the head when `data_len` fits the
+head's free room, which for a zerocopy skb is `end − tail` = 384 − 44 = 340
+bytes, and then charges `SKB_TRUESIZE(end)` = 960. 64 datagrams of **200**
+bytes at offset 0, `sk_rcvbuf` 38400 (`q64_z200`):
+
+| number | measured | arithmetic |
+|---|---|---|
+| gate `ts` | 5056 on all 64 records | the probe reads the skb before condense |
+| kept | **18** | 4 · 5056 = 20224, then 14 · 960 |
+| rmem | **33664** | 20224 + 13440 |
+| errors | 46 | 64 − 18 |
+
+The same 64 datagrams of 512 bytes keep 7; the 200-byte ones keep 18, because
+from the fifth on the queue is above half (`R >> 1` = 19200) and the receiver's
+own `skb_condense()` erases the sender's page charge. The branch that exists to
+save memory saves **57344** bytes here: 18 · 5056 = **91008** would have been
+the bill without it, and the bill is 33664 — the receiver's accounting, not the
+sender's buffer, is what moves.
+
+## 5. Where `end` comes from: the small-head cache, and a boundary that is a byte
+
+`kmalloc_reserve()` (`net/core/skbuff.c:605`) gives every skb whose
+`SKB_HEAD_ALIGN(size)` is at most `SKB_SMALL_HEAD_CACHE_SIZE` a head of exactly
+that size (`:618`), and `__finalize_skb_around()` sets `end` to that size minus
+`SKB_DATA_ALIGN(sizeof(struct skb_shared_info))`. The booting kernel's own
+slab cache says the number: `F596 SLAB|src=sysfs|obj=704`. Nine copied
+datagrams, one per arm:
+
+| payload | `end` at the wire | `ts` | the arm's identity |
+|---|---|---|---|
+| 270 | **384** | 960 | `ts = end + 576` |
+| 277 | **384** | 960 | |
+| 278 | **384** | 960 | |
+| 309 | **384** | 960 | |
+| 310 | **384** | 960 | |
+| **325** | **384** | **960** | the last payload in the small head |
+| **326** | **704** | **1280** | one byte more, one kmalloc class up |
+| 342 | **704** | 1280 | |
+| 5000 | **7872** | 8448 | `kmalloc_size_roundup(5440)` = 8192 |
+
+So `end` is not a property of the payload at all: it is `ksize − 320`, where
+`ksize` is 704 for everything up to a 325-byte payload and the allocator's
+class above it — and the class list the boot printed has no 768, which is why
+the step is 320 and not 64. The request is `payload + 59`: `28` bytes of IP
+and UDP headers, `hh_len` = 16 (`LL_RESERVED_SPACE` of a veth with a zero
+`needed_headroom`: `((14 + 0) & ~15) + 16`) and `15` of tailroom
+(`net/ipv4/ip_output.c:1108-1136`). Three hypotheses were on the table before
+the run — boundary at 277/278 if the alignment unit were 64, at 309/310 if
+`needed_headroom` were 14, at 325/326 if it is 0 and the unit is 16. The step
+is between 325 and 326, so `hh_len` = 16 and the unit is 16, and the plateau
+below is flat at 960 across five payloads.
+
+## 6. Predictions: which held, which did not
+
+Held: of the first file **P1, P3, P5, P7, P9, P10, P11, P13, P14, P15** (mode
+`q`) and **P16–P24** (mode `h`, all nine, including the step at 326 and the
+5000-byte bucket); of the second file **P26–P30, P33, P34, P35**.
+
+Refuted, all seven, and each with its cause:
+
+| P | said | measured | why |
+|---|---|---|---|
+| P2  | 4 / 36608 | **5 / 37568** | my sender's 2048-byte stride: `al=2` alternates 9152 and 5056 (§3) |
+| P4  | 5 / 45760 | **7 / 47680** | same stride |
+| P6  | 8 / 73216 | **11 / 76096** | same stride |
+| P8  | 11 / 100672 | **14 / 99456** | same stride |
+| P12 | 64 / 585728 | **64 / 454656** | same stride: the 64 charges are 32 × 9152 + 32 × 5056 |
+| P31 | 6 / 42624 | **7 / 47680** | my simulation stopped at the first drop (§3) |
+| P32 | 10 / 71040 | **11 / 76096** | same |
+
+P2–P12 are the same error five times: I predicted the curve of a constant
+offset for arms that deliver two offsets. The numbers those five predictions
+intended are carried by `q64_4096a36_*`, which really do carry one charge
+(P26–P30) — measured after the flaw was found and before the counted boots.
+P31/P32 are a second, separate error of mine: in a mixed sequence the queue is
+re-examined for every datagram, so it does not stop at the first refusal; the
+arm `q64_a36_R102` matched by luck only because after 99456 nothing else fit.
+
+## 7. Ошибки хода, все мои
+
+1. **The sender's stride** (§3): five refuted predictions from one unread line
+   of my own instrument. Found by the first smoke, not by thinking.
+2. **My simulation stopped at the first drop** (§3): P31/P32 wrong in a way
+   that would have hidden the most interesting sentence of §3.
+3. **The trace was never cleared**: F73's own error #2 (`echo > trace`, not
+   `echo >> trace`) came back the moment a boot ran 21 arms of 64 datagrams:
+   by arm 13 the 2 MB read window no longer reached the markers, `mark=0`, and
+   every counter read zero while the receiver still reported the right queue.
+   The first counted attempt was killed and the campaign restarted; the fix is
+   `O_TRUNC` before every arm (`f596_clear()`), which is what the shell's
+   `echo > trace` does and what `f595_wf` (open `O_WRONLY`) never did.
+4. **The verifier's post-condense charge was 576, not 960** — I wrote
+   `SKB_DATA_ALIGN_SHINFO + SKB_DATA_ALIGN_SKB` where the head's own 384 bytes
+   belong. It said the 200-byte arm should keep 27 and bill 33472; the log says
+   18 and 33664. Found by running the verifier, not by reading it.
+5. **The same 576 in the charge base** of every arm's sequence, which made the
+   first verifier run disagree with every gate record.
+6. **The reader's buffer is 4096 bytes**: a 4097-byte datagram is *read* as
+   4096. The verifier now expects `min(payload, 4096)` and says why; the
+   measured `dl0` of that arm is the witness's limit, not the kernel's.
+7. **The verifier crashed instead of going red** when an RCV line was deleted
+   (a `None` in the InErrors subtraction) — found by the selftest, fixed with a
+   presence check.
+8. **Two source anchors were wrong** (a rule wrapped over two lines, and a
+   stray closing parenthesis in my needle); the search is now
+   whitespace-insensitive.
+9. The arm table's `exp_charge` labels on the mixed arms still carry the
+   first-file numbers. They are labels printed by the instrument, not checks:
+   the verifier compares the printed table against the source and computes its
+   own model, and no check reads `exp_charge`.
+
+## 8. Что не измерено, прямо
+
+- The mixed-sequence arms' charges are *predicted* by the 2048-byte stride and
+  match the first 16 gate records; the last 48 of each arm are not printed
+  (the instrument caps its arrays at 16), so the sequence beyond the 16th is
+  inferred, not read.
+- No arm brings the queue to exactly `rcvbuf >> 1` at a condense decision, so
+  the strictness of *that* comparison is not pinned here (F70 pinned it with
+  its own arms; a mutation `>` → `>=` survives this turn's arms and is named in
+  `tools/verify596_selftest.py`).
+- No arm sends a datagram larger than the whole buffer, so the empty-queue
+  clause and the second (locked) `udp_rmem_schedule()` check are never the
+  reason for an outcome here — both survive mutation and are named.
+- The 200-byte arm's `skb_condense()` call is inferred from the arithmetic
+  (4 × 5056 + 14 × 960), not from a probe on the function: this instrument has
+  no probe there (F71/F73 measured it directly).
+- IPv6, TCP, tunnels, `CHECKSUM_COMPLETE`, a real NIC, `SO_RCVBUFFORCE`: not
+  touched.
+- **Не уязвимость**: every rule was installed by root in the initial user
+  namespace (F57), and the effect is accounting — a sender's iov alignment
+  changes the receiver's bill per datagram by up to one page. It is not memory
+  corruption, and the same branch that raises the bill (§4) can also cut it.
+
+## 9. Чем проверено
+
+| | |
+|---|---|
+| `tools/verify596.py` | **5101 проверка, 0** on both boots (2388 on rep1 alone, 2383 on rep2) — provenance (kernel sha256 from the log header and from the disk, the initrd's sha256 from the header, from the file and from `logs/f74_initrd_hashes.txt`, `differ596` **extracted from the initramfs** and compared byte for byte with the built binary, both prediction files unchanged), `pahole` re-deriving `sizeof(skb_shared_info)` = 320 and `ALIGN(sizeof(sk_buff))` = 256 from the booting vmlinux, **17 source anchors** (the two queue checks, the `>` and the empty-queue clause, the condense call site and its clause 1, the small-head cache and its two lines, `hh_len`, `alloc_extra`, `sock_alloc_send_skb`, `SKB_HEAD_ALIGN`, `SKB_TRUESIZE`), the arm tables parsed from `vm/differ596_add.c` against every printed ARM line, the probe offsets, the slab witness, the charge sequence per arm against the first 16 gate records, the full queue simulation against `n0`, `rmem0` and the InErrors delta of every attempt, the logged-packet length of every arm with a log rule, `ts = end + 576` on every wire record of mode `h`, the model's `end` and `ts` per payload, and determinism between the two boots |
+| `tools/verify596_selftest.py` | **29/32 red**, noop green, **3 named survivors** with a reason each, no unexplained survivor, no mutation that failed to apply; 20 data mutations on copies of a real log (a kept count, a bill, a charge, an `end`, a `dlen`, an enqueue count, a TX `end`, an arm parameter, a logged length, an InErrors delta, an arm name, the slab size, the marker, `rb0`, the first payload byte, a WAIT, a deleted RCV, a deleted EQ, a truncated log, a FAIL line) and 12 model mutations on copies of the verifier (the strict `>`, the condense branch and its threshold, the 960 base, the page granularity, the small-head size, the 320, the request's `hh`, the reader's buffer, the empty-queue clause, the second check) |
+| `tools/audit_f74_doc.py` | see VERIFY_REPORT.md |
+| collection | see VERIFY_REPORT.md |
+| regression | see VERIFY_REPORT.md |
+
+**Файлы:** `findings/F74-sender-sets-the-bill/{SUMMARY.md, summary.json,
+VERIFY_REPORT.md, LETTER_SECTION_F74.txt}`; `vm/{differ596_add.c, differ596.c,
+build_f74_differ.sh, make_initramfs596.sh, build/differ596}`;
+`tools/{f74_run.sh, verify596.py, verify596_selftest.py, f74_summary.py,
+audit_f74_doc.py}`; `research/{predictions_596.md, predictions_596b.md}`;
+logs `logs/f74_{rep1,rep2}.log`; artifacts registered in summary.json.
+
+
+===== summary.json =====
+{
+ "differ_sha256": "1c7c9e596a621360d3d5830fdf3f4568ef71801e9e0fceb9c95411cc07d4ae91",
+ "finding": "F74-sender-sets-the-bill",
+ "h": [
+  {
+   "arm": "h270",
+   "att": 0,
+   "boot": "rep1",
+   "i": 0,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 270,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 312,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h270",
+   "att": 1,
+   "boot": "rep1",
+   "i": 0,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 270,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 312,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h277",
+   "att": 0,
+   "boot": "rep1",
+   "i": 1,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 277,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 319,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h277",
+   "att": 1,
+   "boot": "rep1",
+   "i": 1,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 277,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 319,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h278",
+   "att": 0,
+   "boot": "rep1",
+   "i": 2,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 278,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 320,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h278",
+   "att": 1,
+   "boot": "rep1",
+   "i": 2,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 278,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 320,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h309",
+   "att": 0,
+   "boot": "rep1",
+   "i": 3,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 309,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 351,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h309",
+   "att": 1,
+   "boot": "rep1",
+   "i": 3,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 309,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 351,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h310",
+   "att": 0,
+   "boot": "rep1",
+   "i": 4,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 310,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 352,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h310",
+   "att": 1,
+   "boot": "rep1",
+   "i": 4,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 310,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 352,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h325",
+   "att": 0,
+   "boot": "rep1",
+   "i": 5,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 325,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 367,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h325",
+   "att": 1,
+   "boot": "rep1",
+   "i": 5,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 325,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 367,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h326",
+   "att": 0,
+   "boot": "rep1",
+   "i": 6,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 326,
+   "rmem": 1280,
+   "tx_copies": 2,
+   "tx_end": 704,
+   "tx_len": 368,
+   "tx_ts": 1280
+  },
+  {
+   "arm": "h326",
+   "att": 1,
+   "boot": "rep1",
+   "i": 6,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 326,
+   "rmem": 1280,
+   "tx_copies": 2,
+   "tx_end": 704,
+   "tx_len": 368,
+   "tx_ts": 1280
+  },
+  {
+   "arm": "h342",
+   "att": 0,
+   "boot": "rep1",
+   "i": 7,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 342,
+   "rmem": 1280,
+   "tx_copies": 2,
+   "tx_end": 704,
+   "tx_len": 384,
+   "tx_ts": 1280
+  },
+  {
+   "arm": "h342",
+   "att": 1,
+   "boot": "rep1",
+   "i": 7,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 342,
+   "rmem": 1280,
+   "tx_copies": 2,
+   "tx_end": 704,
+   "tx_len": 384,
+   "tx_ts": 1280
+  },
+  {
+   "arm": "h5000",
+   "att": 0,
+   "boot": "rep1",
+   "i": 8,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 5000,
+   "rmem": 8448,
+   "tx_copies": 2,
+   "tx_end": 7872,
+   "tx_len": 5042,
+   "tx_ts": 8448
+  },
+  {
+   "arm": "h5000",
+   "att": 1,
+   "boot": "rep1",
+   "i": 8,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 5000,
+   "rmem": 8448,
+   "tx_copies": 2,
+   "tx_end": 7872,
+   "tx_len": 5042,
+   "tx_ts": 8448
+  },
+  {
+   "arm": "h270",
+   "att": 0,
+   "boot": "rep2",
+   "i": 0,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 270,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 312,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h270",
+   "att": 1,
+   "boot": "rep2",
+   "i": 0,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 270,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 312,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h277",
+   "att": 0,
+   "boot": "rep2",
+   "i": 1,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 277,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 319,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h277",
+   "att": 1,
+   "boot": "rep2",
+   "i": 1,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 277,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 319,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h278",
+   "att": 0,
+   "boot": "rep2",
+   "i": 2,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 278,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 320,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h278",
+   "att": 1,
+   "boot": "rep2",
+   "i": 2,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 278,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 320,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h309",
+   "att": 0,
+   "boot": "rep2",
+   "i": 3,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 309,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 351,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h309",
+   "att": 1,
+   "boot": "rep2",
+   "i": 3,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 309,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 351,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h310",
+   "att": 0,
+   "boot": "rep2",
+   "i": 4,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 310,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 352,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h310",
+   "att": 1,
+   "boot": "rep2",
+   "i": 4,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 310,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 352,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h325",
+   "att": 0,
+   "boot": "rep2",
+   "i": 5,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 325,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 367,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h325",
+   "att": 1,
+   "boot": "rep2",
+   "i": 5,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 325,
+   "rmem": 960,
+   "tx_copies": 2,
+   "tx_end": 384,
+   "tx_len": 367,
+   "tx_ts": 960
+  },
+  {
+   "arm": "h326",
+   "att": 0,
+   "boot": "rep2",
+   "i": 6,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 326,
+   "rmem": 1280,
+   "tx_copies": 2,
+   "tx_end": 704,
+   "tx_len": 368,
+   "tx_ts": 1280
+  },
+  {
+   "arm": "h326",
+   "att": 1,
+   "boot": "rep2",
+   "i": 6,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 326,
+   "rmem": 1280,
+   "tx_copies": 2,
+   "tx_end": 704,
+   "tx_len": 368,
+   "tx_ts": 1280
+  },
+  {
+   "arm": "h342",
+   "att": 0,
+   "boot": "rep2",
+   "i": 7,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 342,
+   "rmem": 1280,
+   "tx_copies": 2,
+   "tx_end": 704,
+   "tx_len": 384,
+   "tx_ts": 1280
+  },
+  {
+   "arm": "h342",
+   "att": 1,
+   "boot": "rep2",
+   "i": 7,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 342,
+   "rmem": 1280,
+   "tx_copies": 2,
+   "tx_end": 704,
+   "tx_len": 384,
+   "tx_ts": 1280
+  },
+  {
+   "arm": "h5000",
+   "att": 0,
+   "boot": "rep2",
+   "i": 8,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 5000,
+   "rmem": 8448,
+   "tx_copies": 2,
+   "tx_end": 7872,
+   "tx_len": 5042,
+   "tx_ts": 8448
+  },
+  {
+   "arm": "h5000",
+   "att": 1,
+   "boot": "rep2",
+   "i": 8,
+   "n0": 1,
+   "n_records": 1,
+   "pl": 5000,
+   "rmem": 8448,
+   "tx_copies": 2,
+   "tx_end": 7872,
+   "tx_len": 5042,
+   "tx_ts": 8448
+  }
+ ],
+ "kernel_sha256": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+ "logs": {
+  "rep1": "d122b6ea072b4b0d6287d1c48337cbe5e4a27c2a84f7ef28815f886177d324d8",
+  "rep2": "9b71c9f199165f3f4de0f720a89ee3285072c7ac3a7cd14beac4584d7842ee0b"
+ },
+ "predictions": {
+  "a": "743c6360141fc542e217f93f9ede9229700822df1fb291f300981b38036b6f5e",
+  "b": "878121a5f087a7fd58540aa537be714a8b2f4823bcfdef4f2b0fbd4ca3f83b68"
+ },
+ "q": [
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_a0_R38",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 0,
+   "inerrors": 57,
+   "kept": 7,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 57,
+   "model_kept": 7,
+   "model_rmem": 35392,
+   "pl": 512,
+   "rcvbuf": 19200,
+   "rmem": 35392,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_a0_R38",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 0,
+   "inerrors": 114,
+   "kept": 7,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 57,
+   "model_kept": 7,
+   "model_rmem": 35392,
+   "pl": 512,
+   "rcvbuf": 19200,
+   "rmem": 35392,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 2,
+   "arm": "q64_a36_R38",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 1,
+   "inerrors": 173,
+   "kept": 5,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 59,
+   "model_kept": 5,
+   "model_rmem": 37568,
+   "pl": 512,
+   "rcvbuf": 19200,
+   "rmem": 37568,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 2,
+   "arm": "q64_a36_R38",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 1,
+   "inerrors": 232,
+   "kept": 5,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 59,
+   "model_kept": 5,
+   "model_rmem": 37568,
+   "pl": 512,
+   "rcvbuf": 19200,
+   "rmem": 37568,
+   "rule": 0
+  },
+  {
+   "R": 51200,
+   "align": 1,
+   "arm": "q64_a0_R50",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 2,
+   "inerrors": 286,
+   "kept": 10,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 54,
+   "model_kept": 10,
+   "model_rmem": 50560,
+   "pl": 512,
+   "rcvbuf": 25600,
+   "rmem": 50560,
+   "rule": 0
+  },
+  {
+   "R": 51200,
+   "align": 1,
+   "arm": "q64_a0_R50",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 2,
+   "inerrors": 340,
+   "kept": 10,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 54,
+   "model_kept": 10,
+   "model_rmem": 50560,
+   "pl": 512,
+   "rcvbuf": 25600,
+   "rmem": 50560,
+   "rule": 0
+  },
+  {
+   "R": 51200,
+   "align": 2,
+   "arm": "q64_a36_R50",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 3,
+   "inerrors": 397,
+   "kept": 7,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 57,
+   "model_kept": 7,
+   "model_rmem": 47680,
+   "pl": 512,
+   "rcvbuf": 25600,
+   "rmem": 47680,
+   "rule": 0
+  },
+  {
+   "R": 51200,
+   "align": 2,
+   "arm": "q64_a36_R50",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 3,
+   "inerrors": 454,
+   "kept": 7,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 57,
+   "model_kept": 7,
+   "model_rmem": 47680,
+   "pl": 512,
+   "rcvbuf": 25600,
+   "rmem": 47680,
+   "rule": 0
+  },
+  {
+   "R": 76800,
+   "align": 1,
+   "arm": "q64_a0_R76",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 4,
+   "inerrors": 503,
+   "kept": 15,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 49,
+   "model_kept": 15,
+   "model_rmem": 75840,
+   "pl": 512,
+   "rcvbuf": 38400,
+   "rmem": 75840,
+   "rule": 0
+  },
+  {
+   "R": 76800,
+   "align": 1,
+   "arm": "q64_a0_R76",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 4,
+   "inerrors": 552,
+   "kept": 15,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 49,
+   "model_kept": 15,
+   "model_rmem": 75840,
+   "pl": 512,
+   "rcvbuf": 38400,
+   "rmem": 75840,
+   "rule": 0
+  },
+  {
+   "R": 76800,
+   "align": 2,
+   "arm": "q64_a36_R76",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 5,
+   "inerrors": 605,
+   "kept": 11,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 53,
+   "model_kept": 11,
+   "model_rmem": 76096,
+   "pl": 512,
+   "rcvbuf": 38400,
+   "rmem": 76096,
+   "rule": 0
+  },
+  {
+   "R": 76800,
+   "align": 2,
+   "arm": "q64_a36_R76",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 5,
+   "inerrors": 658,
+   "kept": 11,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 53,
+   "model_kept": 11,
+   "model_rmem": 76096,
+   "pl": 512,
+   "rcvbuf": 38400,
+   "rmem": 76096,
+   "rule": 0
+  },
+  {
+   "R": 102400,
+   "align": 1,
+   "arm": "q64_a0_R102",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 6,
+   "inerrors": 702,
+   "kept": 20,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 44,
+   "model_kept": 20,
+   "model_rmem": 101120,
+   "pl": 512,
+   "rcvbuf": 51200,
+   "rmem": 101120,
+   "rule": 0
+  },
+  {
+   "R": 102400,
+   "align": 1,
+   "arm": "q64_a0_R102",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 6,
+   "inerrors": 746,
+   "kept": 20,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 44,
+   "model_kept": 20,
+   "model_rmem": 101120,
+   "pl": 512,
+   "rcvbuf": 51200,
+   "rmem": 101120,
+   "rule": 0
+  },
+  {
+   "R": 102400,
+   "align": 2,
+   "arm": "q64_a36_R102",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 7,
+   "inerrors": 796,
+   "kept": 14,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 50,
+   "model_kept": 14,
+   "model_rmem": 99456,
+   "pl": 512,
+   "rcvbuf": 51200,
+   "rmem": 99456,
+   "rule": 0
+  },
+  {
+   "R": 102400,
+   "align": 2,
+   "arm": "q64_a36_R102",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 7,
+   "inerrors": 846,
+   "kept": 14,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 50,
+   "model_kept": 14,
+   "model_rmem": 99456,
+   "pl": 512,
+   "rcvbuf": 51200,
+   "rmem": 99456,
+   "rule": 0
+  },
+  {
+   "R": 35390,
+   "align": 1,
+   "arm": "q64_a0_one",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 8,
+   "inerrors": 904,
+   "kept": 6,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 58,
+   "model_kept": 6,
+   "model_rmem": 30336,
+   "pl": 512,
+   "rcvbuf": 17695,
+   "rmem": 30336,
+   "rule": 0
+  },
+  {
+   "R": 35390,
+   "align": 1,
+   "arm": "q64_a0_one",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 8,
+   "inerrors": 962,
+   "kept": 6,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 58,
+   "model_kept": 6,
+   "model_rmem": 30336,
+   "pl": 512,
+   "rcvbuf": 17695,
+   "rmem": 30336,
+   "rule": 0
+  },
+  {
+   "R": 35392,
+   "align": 1,
+   "arm": "q64_a0_eq",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 9,
+   "inerrors": 1019,
+   "kept": 7,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 57,
+   "model_kept": 7,
+   "model_rmem": 35392,
+   "pl": 512,
+   "rcvbuf": 17696,
+   "rmem": 35392,
+   "rule": 0
+  },
+  {
+   "R": 35392,
+   "align": 1,
+   "arm": "q64_a0_eq",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 9,
+   "inerrors": 1076,
+   "kept": 7,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 57,
+   "model_kept": 7,
+   "model_rmem": 35392,
+   "pl": 512,
+   "rcvbuf": 17696,
+   "rmem": 35392,
+   "rule": 0
+  },
+  {
+   "R": 323584,
+   "align": 1,
+   "arm": "q64_a0_full",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 10,
+   "inerrors": 1076,
+   "kept": 64,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 0,
+   "model_kept": 64,
+   "model_rmem": 323584,
+   "pl": 512,
+   "rcvbuf": 161792,
+   "rmem": 323584,
+   "rule": 0
+  },
+  {
+   "R": 323584,
+   "align": 1,
+   "arm": "q64_a0_full",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 10,
+   "inerrors": 1076,
+   "kept": 64,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 0,
+   "model_kept": 64,
+   "model_rmem": 323584,
+   "pl": 512,
+   "rcvbuf": 161792,
+   "rmem": 323584,
+   "rule": 0
+  },
+  {
+   "R": 585728,
+   "align": 2,
+   "arm": "q64_a36_full",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 11,
+   "inerrors": 1076,
+   "kept": 64,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 0,
+   "model_kept": 64,
+   "model_rmem": 454656,
+   "pl": 512,
+   "rcvbuf": 292864,
+   "rmem": 454656,
+   "rule": 0
+  },
+  {
+   "R": 585728,
+   "align": 2,
+   "arm": "q64_a36_full",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 11,
+   "inerrors": 1076,
+   "kept": 64,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 0,
+   "model_kept": 64,
+   "model_rmem": 454656,
+   "pl": 512,
+   "rcvbuf": 292864,
+   "rmem": 454656,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_a0_cn",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 12,
+   "inerrors": 1133,
+   "kept": 7,
+   "logged_packets": null,
+   "logged_uhlen": [],
+   "model_drops": 57,
+   "model_kept": 7,
+   "model_rmem": 35392,
+   "pl": 512,
+   "rcvbuf": 19200,
+   "rmem": 35392,
+   "rule": 1
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_a0_cn",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 12,
+   "inerrors": 1190,
+   "kept": 7,
+   "logged_packets": null,
+   "logged_uhlen": [],
+   "model_drops": 57,
+   "model_kept": 7,
+   "model_rmem": 35392,
+   "pl": 512,
+   "rcvbuf": 19200,
+   "rmem": 35392,
+   "rule": 1
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_4097a0",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4097
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 13,
+   "inerrors": 1250,
+   "kept": 4,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4105
+   ],
+   "model_drops": 60,
+   "model_kept": 4,
+   "model_rmem": 36608,
+   "pl": 4097,
+   "rcvbuf": 19200,
+   "rmem": 36608,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_4097a0",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4097
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 13,
+   "inerrors": 1310,
+   "kept": 4,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4105
+   ],
+   "model_drops": 60,
+   "model_kept": 4,
+   "model_rmem": 36608,
+   "pl": 4097,
+   "rcvbuf": 19200,
+   "rmem": 36608,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_z200",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    200
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 14,
+   "inerrors": 1356,
+   "kept": 18,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    208
+   ],
+   "model_drops": 46,
+   "model_kept": 18,
+   "model_rmem": 33664,
+   "pl": 200,
+   "rcvbuf": 19200,
+   "rmem": 33664,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_z200",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    200
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 14,
+   "inerrors": 1402,
+   "kept": 18,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    208
+   ],
+   "model_drops": 46,
+   "model_kept": 18,
+   "model_rmem": 33664,
+   "pl": 200,
+   "rcvbuf": 19200,
+   "rmem": 33664,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 2,
+   "arm": "q64_4096a36_R38",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 15,
+   "inerrors": 1462,
+   "kept": 4,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 60,
+   "model_kept": 4,
+   "model_rmem": 36608,
+   "pl": 4096,
+   "rcvbuf": 19200,
+   "rmem": 36608,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 2,
+   "arm": "q64_4096a36_R38",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 15,
+   "inerrors": 1522,
+   "kept": 4,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 60,
+   "model_kept": 4,
+   "model_rmem": 36608,
+   "pl": 4096,
+   "rcvbuf": 19200,
+   "rmem": 36608,
+   "rule": 0
+  },
+  {
+   "R": 51200,
+   "align": 2,
+   "arm": "q64_4096a36_R50",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 16,
+   "inerrors": 1581,
+   "kept": 5,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 59,
+   "model_kept": 5,
+   "model_rmem": 45760,
+   "pl": 4096,
+   "rcvbuf": 25600,
+   "rmem": 45760,
+   "rule": 0
+  },
+  {
+   "R": 51200,
+   "align": 2,
+   "arm": "q64_4096a36_R50",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 16,
+   "inerrors": 1640,
+   "kept": 5,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 59,
+   "model_kept": 5,
+   "model_rmem": 45760,
+   "pl": 4096,
+   "rcvbuf": 25600,
+   "rmem": 45760,
+   "rule": 0
+  },
+  {
+   "R": 76800,
+   "align": 2,
+   "arm": "q64_4096a36_R76",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 17,
+   "inerrors": 1696,
+   "kept": 8,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 56,
+   "model_kept": 8,
+   "model_rmem": 73216,
+   "pl": 4096,
+   "rcvbuf": 38400,
+   "rmem": 73216,
+   "rule": 0
+  },
+  {
+   "R": 76800,
+   "align": 2,
+   "arm": "q64_4096a36_R76",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 17,
+   "inerrors": 1752,
+   "kept": 8,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 56,
+   "model_kept": 8,
+   "model_rmem": 73216,
+   "pl": 4096,
+   "rcvbuf": 38400,
+   "rmem": 73216,
+   "rule": 0
+  },
+  {
+   "R": 102400,
+   "align": 2,
+   "arm": "q64_4096a36_R102",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 18,
+   "inerrors": 1805,
+   "kept": 11,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 53,
+   "model_kept": 11,
+   "model_rmem": 100672,
+   "pl": 4096,
+   "rcvbuf": 51200,
+   "rmem": 100672,
+   "rule": 0
+  },
+  {
+   "R": 102400,
+   "align": 2,
+   "arm": "q64_4096a36_R102",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 18,
+   "inerrors": 1858,
+   "kept": 11,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 53,
+   "model_kept": 11,
+   "model_rmem": 100672,
+   "pl": 4096,
+   "rcvbuf": 51200,
+   "rmem": 100672,
+   "rule": 0
+  },
+  {
+   "R": 585728,
+   "align": 2,
+   "arm": "q64_4096a36_full",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 19,
+   "inerrors": 1858,
+   "kept": 64,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 0,
+   "model_kept": 64,
+   "model_rmem": 585728,
+   "pl": 4096,
+   "rcvbuf": 292864,
+   "rmem": 585728,
+   "rule": 0
+  },
+  {
+   "R": 585728,
+   "align": 2,
+   "arm": "q64_4096a36_full",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 19,
+   "inerrors": 1858,
+   "kept": 64,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 0,
+   "model_kept": 64,
+   "model_rmem": 585728,
+   "pl": 4096,
+   "rcvbuf": 292864,
+   "rmem": 585728,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_4096a0_R38",
+   "att": 0,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152
+   ],
+   "charge_model16": [
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 20,
+   "inerrors": 1917,
+   "kept": 5,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 59,
+   "model_kept": 5,
+   "model_rmem": 33472,
+   "pl": 4096,
+   "rcvbuf": 19200,
+   "rmem": 33472,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_4096a0_R38",
+   "att": 1,
+   "boot": "rep1",
+   "charge_first16": [
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152
+   ],
+   "charge_model16": [
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 20,
+   "inerrors": 1976,
+   "kept": 5,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 59,
+   "model_kept": 5,
+   "model_rmem": 33472,
+   "pl": 4096,
+   "rcvbuf": 19200,
+   "rmem": 33472,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_a0_R38",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 0,
+   "inerrors": 57,
+   "kept": 7,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 57,
+   "model_kept": 7,
+   "model_rmem": 35392,
+   "pl": 512,
+   "rcvbuf": 19200,
+   "rmem": 35392,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_a0_R38",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 0,
+   "inerrors": 114,
+   "kept": 7,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 57,
+   "model_kept": 7,
+   "model_rmem": 35392,
+   "pl": 512,
+   "rcvbuf": 19200,
+   "rmem": 35392,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 2,
+   "arm": "q64_a36_R38",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 1,
+   "inerrors": 173,
+   "kept": 5,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 59,
+   "model_kept": 5,
+   "model_rmem": 37568,
+   "pl": 512,
+   "rcvbuf": 19200,
+   "rmem": 37568,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 2,
+   "arm": "q64_a36_R38",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 1,
+   "inerrors": 232,
+   "kept": 5,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 59,
+   "model_kept": 5,
+   "model_rmem": 37568,
+   "pl": 512,
+   "rcvbuf": 19200,
+   "rmem": 37568,
+   "rule": 0
+  },
+  {
+   "R": 51200,
+   "align": 1,
+   "arm": "q64_a0_R50",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 2,
+   "inerrors": 286,
+   "kept": 10,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 54,
+   "model_kept": 10,
+   "model_rmem": 50560,
+   "pl": 512,
+   "rcvbuf": 25600,
+   "rmem": 50560,
+   "rule": 0
+  },
+  {
+   "R": 51200,
+   "align": 1,
+   "arm": "q64_a0_R50",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 2,
+   "inerrors": 340,
+   "kept": 10,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 54,
+   "model_kept": 10,
+   "model_rmem": 50560,
+   "pl": 512,
+   "rcvbuf": 25600,
+   "rmem": 50560,
+   "rule": 0
+  },
+  {
+   "R": 51200,
+   "align": 2,
+   "arm": "q64_a36_R50",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 3,
+   "inerrors": 397,
+   "kept": 7,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 57,
+   "model_kept": 7,
+   "model_rmem": 47680,
+   "pl": 512,
+   "rcvbuf": 25600,
+   "rmem": 47680,
+   "rule": 0
+  },
+  {
+   "R": 51200,
+   "align": 2,
+   "arm": "q64_a36_R50",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 3,
+   "inerrors": 454,
+   "kept": 7,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 57,
+   "model_kept": 7,
+   "model_rmem": 47680,
+   "pl": 512,
+   "rcvbuf": 25600,
+   "rmem": 47680,
+   "rule": 0
+  },
+  {
+   "R": 76800,
+   "align": 1,
+   "arm": "q64_a0_R76",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 4,
+   "inerrors": 503,
+   "kept": 15,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 49,
+   "model_kept": 15,
+   "model_rmem": 75840,
+   "pl": 512,
+   "rcvbuf": 38400,
+   "rmem": 75840,
+   "rule": 0
+  },
+  {
+   "R": 76800,
+   "align": 1,
+   "arm": "q64_a0_R76",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 4,
+   "inerrors": 552,
+   "kept": 15,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 49,
+   "model_kept": 15,
+   "model_rmem": 75840,
+   "pl": 512,
+   "rcvbuf": 38400,
+   "rmem": 75840,
+   "rule": 0
+  },
+  {
+   "R": 76800,
+   "align": 2,
+   "arm": "q64_a36_R76",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 5,
+   "inerrors": 605,
+   "kept": 11,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 53,
+   "model_kept": 11,
+   "model_rmem": 76096,
+   "pl": 512,
+   "rcvbuf": 38400,
+   "rmem": 76096,
+   "rule": 0
+  },
+  {
+   "R": 76800,
+   "align": 2,
+   "arm": "q64_a36_R76",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 5,
+   "inerrors": 658,
+   "kept": 11,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 53,
+   "model_kept": 11,
+   "model_rmem": 76096,
+   "pl": 512,
+   "rcvbuf": 38400,
+   "rmem": 76096,
+   "rule": 0
+  },
+  {
+   "R": 102400,
+   "align": 1,
+   "arm": "q64_a0_R102",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 6,
+   "inerrors": 702,
+   "kept": 20,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 44,
+   "model_kept": 20,
+   "model_rmem": 101120,
+   "pl": 512,
+   "rcvbuf": 51200,
+   "rmem": 101120,
+   "rule": 0
+  },
+  {
+   "R": 102400,
+   "align": 1,
+   "arm": "q64_a0_R102",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 6,
+   "inerrors": 746,
+   "kept": 20,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 44,
+   "model_kept": 20,
+   "model_rmem": 101120,
+   "pl": 512,
+   "rcvbuf": 51200,
+   "rmem": 101120,
+   "rule": 0
+  },
+  {
+   "R": 102400,
+   "align": 2,
+   "arm": "q64_a36_R102",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 7,
+   "inerrors": 796,
+   "kept": 14,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 50,
+   "model_kept": 14,
+   "model_rmem": 99456,
+   "pl": 512,
+   "rcvbuf": 51200,
+   "rmem": 99456,
+   "rule": 0
+  },
+  {
+   "R": 102400,
+   "align": 2,
+   "arm": "q64_a36_R102",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 7,
+   "inerrors": 846,
+   "kept": 14,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 50,
+   "model_kept": 14,
+   "model_rmem": 99456,
+   "pl": 512,
+   "rcvbuf": 51200,
+   "rmem": 99456,
+   "rule": 0
+  },
+  {
+   "R": 35390,
+   "align": 1,
+   "arm": "q64_a0_one",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 8,
+   "inerrors": 904,
+   "kept": 6,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 58,
+   "model_kept": 6,
+   "model_rmem": 30336,
+   "pl": 512,
+   "rcvbuf": 17695,
+   "rmem": 30336,
+   "rule": 0
+  },
+  {
+   "R": 35390,
+   "align": 1,
+   "arm": "q64_a0_one",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 8,
+   "inerrors": 962,
+   "kept": 6,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 58,
+   "model_kept": 6,
+   "model_rmem": 30336,
+   "pl": 512,
+   "rcvbuf": 17695,
+   "rmem": 30336,
+   "rule": 0
+  },
+  {
+   "R": 35392,
+   "align": 1,
+   "arm": "q64_a0_eq",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 9,
+   "inerrors": 1019,
+   "kept": 7,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 57,
+   "model_kept": 7,
+   "model_rmem": 35392,
+   "pl": 512,
+   "rcvbuf": 17696,
+   "rmem": 35392,
+   "rule": 0
+  },
+  {
+   "R": 35392,
+   "align": 1,
+   "arm": "q64_a0_eq",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 9,
+   "inerrors": 1076,
+   "kept": 7,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 57,
+   "model_kept": 7,
+   "model_rmem": 35392,
+   "pl": 512,
+   "rcvbuf": 17696,
+   "rmem": 35392,
+   "rule": 0
+  },
+  {
+   "R": 323584,
+   "align": 1,
+   "arm": "q64_a0_full",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 10,
+   "inerrors": 1076,
+   "kept": 64,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 0,
+   "model_kept": 64,
+   "model_rmem": 323584,
+   "pl": 512,
+   "rcvbuf": 161792,
+   "rmem": 323584,
+   "rule": 0
+  },
+  {
+   "R": 323584,
+   "align": 1,
+   "arm": "q64_a0_full",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 10,
+   "inerrors": 1076,
+   "kept": 64,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 0,
+   "model_kept": 64,
+   "model_rmem": 323584,
+   "pl": 512,
+   "rcvbuf": 161792,
+   "rmem": 323584,
+   "rule": 0
+  },
+  {
+   "R": 585728,
+   "align": 2,
+   "arm": "q64_a36_full",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 11,
+   "inerrors": 1076,
+   "kept": 64,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 0,
+   "model_kept": 64,
+   "model_rmem": 454656,
+   "pl": 512,
+   "rcvbuf": 292864,
+   "rmem": 454656,
+   "rule": 0
+  },
+  {
+   "R": 585728,
+   "align": 2,
+   "arm": "q64_a36_full",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "charge_model16": [
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 11,
+   "inerrors": 1076,
+   "kept": 64,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    520
+   ],
+   "model_drops": 0,
+   "model_kept": 64,
+   "model_rmem": 454656,
+   "pl": 512,
+   "rcvbuf": 292864,
+   "rmem": 454656,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_a0_cn",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 12,
+   "inerrors": 1133,
+   "kept": 7,
+   "logged_packets": null,
+   "logged_uhlen": [],
+   "model_drops": 57,
+   "model_kept": 7,
+   "model_rmem": 35392,
+   "pl": 512,
+   "rcvbuf": 19200,
+   "rmem": 35392,
+   "rule": 1
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_a0_cn",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    512
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 12,
+   "inerrors": 1190,
+   "kept": 7,
+   "logged_packets": null,
+   "logged_uhlen": [],
+   "model_drops": 57,
+   "model_kept": 7,
+   "model_rmem": 35392,
+   "pl": 512,
+   "rcvbuf": 19200,
+   "rmem": 35392,
+   "rule": 1
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_4097a0",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4097
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 13,
+   "inerrors": 1250,
+   "kept": 4,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4105
+   ],
+   "model_drops": 60,
+   "model_kept": 4,
+   "model_rmem": 36608,
+   "pl": 4097,
+   "rcvbuf": 19200,
+   "rmem": 36608,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_4097a0",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4097
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 13,
+   "inerrors": 1310,
+   "kept": 4,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4105
+   ],
+   "model_drops": 60,
+   "model_kept": 4,
+   "model_rmem": 36608,
+   "pl": 4097,
+   "rcvbuf": 19200,
+   "rmem": 36608,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_z200",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    200
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 14,
+   "inerrors": 1356,
+   "kept": 18,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    208
+   ],
+   "model_drops": 46,
+   "model_kept": 18,
+   "model_rmem": 33664,
+   "pl": 200,
+   "rcvbuf": 19200,
+   "rmem": 33664,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_z200",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "charge_model16": [
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056,
+    5056
+   ],
+   "gate_dlen": [
+    200
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 14,
+   "inerrors": 1402,
+   "kept": 18,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    208
+   ],
+   "model_drops": 46,
+   "model_kept": 18,
+   "model_rmem": 33664,
+   "pl": 200,
+   "rcvbuf": 19200,
+   "rmem": 33664,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 2,
+   "arm": "q64_4096a36_R38",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 15,
+   "inerrors": 1462,
+   "kept": 4,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 60,
+   "model_kept": 4,
+   "model_rmem": 36608,
+   "pl": 4096,
+   "rcvbuf": 19200,
+   "rmem": 36608,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 2,
+   "arm": "q64_4096a36_R38",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 15,
+   "inerrors": 1522,
+   "kept": 4,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 60,
+   "model_kept": 4,
+   "model_rmem": 36608,
+   "pl": 4096,
+   "rcvbuf": 19200,
+   "rmem": 36608,
+   "rule": 0
+  },
+  {
+   "R": 51200,
+   "align": 2,
+   "arm": "q64_4096a36_R50",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 16,
+   "inerrors": 1581,
+   "kept": 5,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 59,
+   "model_kept": 5,
+   "model_rmem": 45760,
+   "pl": 4096,
+   "rcvbuf": 25600,
+   "rmem": 45760,
+   "rule": 0
+  },
+  {
+   "R": 51200,
+   "align": 2,
+   "arm": "q64_4096a36_R50",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 16,
+   "inerrors": 1640,
+   "kept": 5,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 59,
+   "model_kept": 5,
+   "model_rmem": 45760,
+   "pl": 4096,
+   "rcvbuf": 25600,
+   "rmem": 45760,
+   "rule": 0
+  },
+  {
+   "R": 76800,
+   "align": 2,
+   "arm": "q64_4096a36_R76",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 17,
+   "inerrors": 1696,
+   "kept": 8,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 56,
+   "model_kept": 8,
+   "model_rmem": 73216,
+   "pl": 4096,
+   "rcvbuf": 38400,
+   "rmem": 73216,
+   "rule": 0
+  },
+  {
+   "R": 76800,
+   "align": 2,
+   "arm": "q64_4096a36_R76",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 17,
+   "inerrors": 1752,
+   "kept": 8,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 56,
+   "model_kept": 8,
+   "model_rmem": 73216,
+   "pl": 4096,
+   "rcvbuf": 38400,
+   "rmem": 73216,
+   "rule": 0
+  },
+  {
+   "R": 102400,
+   "align": 2,
+   "arm": "q64_4096a36_R102",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 18,
+   "inerrors": 1805,
+   "kept": 11,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 53,
+   "model_kept": 11,
+   "model_rmem": 100672,
+   "pl": 4096,
+   "rcvbuf": 51200,
+   "rmem": 100672,
+   "rule": 0
+  },
+  {
+   "R": 102400,
+   "align": 2,
+   "arm": "q64_4096a36_R102",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 18,
+   "inerrors": 1858,
+   "kept": 11,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 53,
+   "model_kept": 11,
+   "model_rmem": 100672,
+   "pl": 4096,
+   "rcvbuf": 51200,
+   "rmem": 100672,
+   "rule": 0
+  },
+  {
+   "R": 585728,
+   "align": 2,
+   "arm": "q64_4096a36_full",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 19,
+   "inerrors": 1858,
+   "kept": 64,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 0,
+   "model_kept": 64,
+   "model_rmem": 585728,
+   "pl": 4096,
+   "rcvbuf": 292864,
+   "rmem": 585728,
+   "rule": 0
+  },
+  {
+   "R": 585728,
+   "align": 2,
+   "arm": "q64_4096a36_full",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "charge_model16": [
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 19,
+   "inerrors": 1858,
+   "kept": 64,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 0,
+   "model_kept": 64,
+   "model_rmem": 585728,
+   "pl": 4096,
+   "rcvbuf": 292864,
+   "rmem": 585728,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_4096a0_R38",
+   "att": 0,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152
+   ],
+   "charge_model16": [
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 20,
+   "inerrors": 1917,
+   "kept": 5,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 59,
+   "model_kept": 5,
+   "model_rmem": 33472,
+   "pl": 4096,
+   "rcvbuf": 19200,
+   "rmem": 33472,
+   "rule": 0
+  },
+  {
+   "R": 38400,
+   "align": 1,
+   "arm": "q64_4096a0_R38",
+   "att": 1,
+   "boot": "rep2",
+   "charge_first16": [
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152
+   ],
+   "charge_model16": [
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152,
+    5056,
+    9152
+   ],
+   "gate_dlen": [
+    4096
+   ],
+   "gate_end": [
+    384
+   ],
+   "gate_enq": 64,
+   "i": 20,
+   "inerrors": 1976,
+   "kept": 5,
+   "logged_packets": 64,
+   "logged_uhlen": [
+    4104
+   ],
+   "model_drops": 59,
+   "model_kept": 5,
+   "model_rmem": 33472,
+   "pl": 4096,
+   "rcvbuf": 19200,
+   "rmem": 33472,
+   "rule": 0
+  }
+ ],
+ "queues": {
+  "by_arm": {
+   "q64_4096a0_R38": {
+    "R": 38400,
+    "kept": 5,
+    "kept_rep2": [
+     5,
+     5,
+     5,
+     5
+    ],
+    "rmem": 33472
+   },
+   "q64_4096a36_R102": {
+    "R": 102400,
+    "kept": 11,
+    "kept_rep2": [
+     11,
+     11,
+     11,
+     11
+    ],
+    "rmem": 100672
+   },
+   "q64_4096a36_R38": {
+    "R": 38400,
+    "kept": 4,
+    "kept_rep2": [
+     4,
+     4,
+     4,
+     4
+    ],
+    "rmem": 36608
+   },
+   "q64_4096a36_R50": {
+    "R": 51200,
+    "kept": 5,
+    "kept_rep2": [
+     5,
+     5,
+     5,
+     5
+    ],
+    "rmem": 45760
+   },
+   "q64_4096a36_R76": {
+    "R": 76800,
+    "kept": 8,
+    "kept_rep2": [
+     8,
+     8,
+     8,
+     8
+    ],
+    "rmem": 73216
+   },
+   "q64_4096a36_full": {
+    "R": 585728,
+    "kept": 64,
+    "kept_rep2": [
+     64,
+     64,
+     64,
+     64
+    ],
+    "rmem": 585728
+   },
+   "q64_4097a0": {
+    "R": 38400,
+    "kept": 4,
+    "kept_rep2": [
+     4,
+     4,
+     4,
+     4
+    ],
+    "rmem": 36608
+   },
+   "q64_a0_R102": {
+    "R": 102400,
+    "kept": 20,
+    "kept_rep2": [
+     20,
+     20,
+     20,
+     20
+    ],
+    "rmem": 101120
+   },
+   "q64_a0_R38": {
+    "R": 38400,
+    "kept": 7,
+    "kept_rep2": [
+     7,
+     7,
+     7,
+     7
+    ],
+    "rmem": 35392
+   },
+   "q64_a0_R50": {
+    "R": 51200,
+    "kept": 10,
+    "kept_rep2": [
+     10,
+     10,
+     10,
+     10
+    ],
+    "rmem": 50560
+   },
+   "q64_a0_R76": {
+    "R": 76800,
+    "kept": 15,
+    "kept_rep2": [
+     15,
+     15,
+     15,
+     15
+    ],
+    "rmem": 75840
+   },
+   "q64_a0_cn": {
+    "R": 38400,
+    "kept": 7,
+    "kept_rep2": [
+     7,
+     7,
+     7,
+     7
+    ],
+    "rmem": 35392
+   },
+   "q64_a0_eq": {
+    "R": 35392,
+    "kept": 7,
+    "kept_rep2": [
+     7,
+     7,
+     7,
+     7
+    ],
+    "rmem": 35392
+   },
+   "q64_a0_full": {
+    "R": 323584,
+    "kept": 64,
+    "kept_rep2": [
+     64,
+     64,
+     64,
+     64
+    ],
+    "rmem": 323584
+   },
+   "q64_a0_one": {
+    "R": 35390,
+    "kept": 6,
+    "kept_rep2": [
+     6,
+     6,
+     6,
+     6
+    ],
+    "rmem": 30336
+   },
+   "q64_a36_R102": {
+    "R": 102400,
+    "kept": 14,
+    "kept_rep2": [
+     14,
+     14,
+     14,
+     14
+    ],
+    "rmem": 99456
+   },
+   "q64_a36_R38": {
+    "R": 38400,
+    "kept": 5,
+    "kept_rep2": [
+     5,
+     5,
+     5,
+     5
+    ],
+    "rmem": 37568
+   },
+   "q64_a36_R50": {
+    "R": 51200,
+    "kept": 7,
+    "kept_rep2": [
+     7,
+     7,
+     7,
+     7
+    ],
+    "rmem": 47680
+   },
+   "q64_a36_R76": {
+    "R": 76800,
+    "kept": 11,
+    "kept_rep2": [
+     11,
+     11,
+     11,
+     11
+    ],
+    "rmem": 76096
+   },
+   "q64_a36_full": {
+    "R": 585728,
+    "kept": 64,
+    "kept_rep2": [
+     64,
+     64,
+     64,
+     64
+    ],
+    "rmem": 454656
+   },
+   "q64_z200": {
+    "R": 38400,
+    "kept": 18,
+    "kept_rep2": [
+     18,
+     18,
+     18,
+     18
+    ],
+    "rmem": 33664
+   }
+  }
+ },
+ "slab": {
+  "classes": [
+   32,
+   64,
+   128,
+   256,
+   512,
+   1024,
+   2048,
+   4096,
+   8192,
+   16384
+  ],
+  "small_head": 704
+ },
+ "turn": 596
+}

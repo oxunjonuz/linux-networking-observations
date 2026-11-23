@@ -1,0 +1,472 @@
+===== LETTER_SECTION_F55.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload: a static transport-store check is enforced at runtime,
+ and 14 nft spellings die silently (`tcp flags set` regressed in v7.3)
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+References: <the same Message-Id>
+
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+Theme: of the four bytes of an 802.1Q tag, three bits are reachable from a
+rule -- the PCP -- and they are not reached through the tag at all.
+
+Follows the earlier mail about the tag being the egress device's property.  The
+vid has a single writer, `vlan_dev_hard_header()`: it writes
+`vlan->vlan_id | vlan_dev_get_egress_qos_mask(dev, skb->priority)` into four
+fresh bytes.  The vid half ignores `skb->priority` entirely, which is why a
+store into the TCI does not survive.  The other half reads it, so a rule *can*
+put a PCP on the wire:
+
+    table ip6 f {
+      chain fwd { type filter hook forward priority 0;
+                  meta priority set 5 }
+    }
+    # ip link add link x1 name x1.102 type vlan id 102
+    # ip link set x1.102 type vlan egress-qos-map 5:3
+
+The frame then leaves with TCI 0x6066 instead of 0x0066 -- readable in the
+egress door's `NFULA_L2HDR`, in the receiving device's `NFULA_VLAN` attribute,
+in a far-end `@ll,14,2` read (which `nft_payload_copy_vlan()` rebuilds from
+`skb->vlan_proto`/`skb->vlan_tci`), and in the AF_PACKET auxdata.  Four
+independent witnesses, one number.
+
+Three details that are easy to get wrong, each measured:
+
+  * the map is a hash table with a composite key.  The bucket is
+    `skprio & 0xF` but the match is the full 32-bit value, so `meta priority
+    set 0x15` does **not** reach a mapping written for 5 although both hash to
+    bucket 5 (`vlan_dev_get_egress_qos_mask()`, include/linux/if_vlan.h).  A
+    mapping written for 0x15 does reach it.
+  * the reader sits in `neigh_resolve_output()`/`neigh_connected_output()`,
+    between the FORWARD hook and the device's egress hook.  So a store at
+    prerouting or forward changes the PCP; the same store at the egress door
+    does not (the four bytes are already in the frame there -- the door's own
+    `NFULA_L2HDR` is 18 bytes).
+  * the receive side reads the same three bits before any hook:
+    `vlan_do_receive()` sets `skb->priority = vlan_get_ingress_priority(...)`
+    and clears the tag metadata.  The netdev ingress hook fires before that
+    call, ip6 prerouting after it, so one frame reads priority 0 at the first
+    door and 5 at the next.  With an ingress map 3:5 and an egress map 5:7 a
+    frame that arrives with PCP 3 leaves with PCP 7 and no rule at all.
+
+The PCP is therefore a pair of device tables with the packet stack in between:
+the ingress device turns PCP into `skb->priority`, the egress device turns
+`skb->priority` back into PCP.  A hook can only step into the middle, and only
+if the tables are there.  Two rules that agree on every byte they can write can
+still put different bits on the wire because the devices they leave through
+disagree -- `skb->priority` is not part of the packet.
+
+Not a vulnerability: the map needs CAP_NET_ADMIN over the device, and the rule
+needs root in the initial namespace.  The finding is a boundary of what `@ll`
+writes can mean, not a privilege crossing.
+
+Numbers, for the record (kernel 7.3.4-T563, one frame per arm, twenty arms,
+two boots, every value from the frame's own bytes and the receiving device's
+counters):
+
+  * store 5 at forward, egress map 5->3: wire 6066; map 5->7: e066; no map:
+    0066, while `meta priority` at the egress door still reads 5.
+  * store 0x15 with a mapping from=5: 0066; with a mapping from=0x15: a066.
+  * store at forward or prerouting: 6066; the same store at the egress door:
+    0066.
+  * same store, second egress device with 5->6: c067, and the far end demuxes
+    that device's vid.
+  * ingress map 3->5: priority 0 at the netdev ingress door, 5 at ip6
+    prerouting; with an egress map 5->7 the wire carries e066 with no rule.
+  * in all twenty arms the frame is forwarded once and demuxed by exactly one
+    VLAN device: nothing a rule or a map did to `skb->priority` moved it.
+
+
+===== SUMMARY.md =====
+# F55 — the PCP is the only part of the tag a rule can reach, and the channel is not the tag
+
+Turn 577.  Kernel: **7.3.4-T563** (`1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033`),
+the same image F41–F54 measured; no new build.
+
+Named at the end of 576: *"the one channel a rule can still use is
+`skb->priority` plus an egress QoS map — `vlan_dev_get_egress_qos_mask()` is
+the only reader of the tag that a store could feed, and the instrument has no
+map installed, so the PCP question is open on the affirmative side."*
+
+## 0. What was built
+
+One veth pair `x0↔x1`.  On the box: `x1.101` (vid 101, `REORDER_HDR` cleared)
+receives, and **two** possible egress VLAN devices, `x1.102` (fd02::91/64) and
+`x1.103` (fd03::91/64), both with the flag cleared.  The far end carries
+`x0.101`, `x0.102`, `x0.103`.  Three frames, 84 bytes each: 18 bytes of
+ethernet + 802.1Q, 40 of IPv6, 8 of UDP, 18 of `0x77`; the TCI and the
+destination are the parameters (`f0` = 8100/**0065** → fd02::92, `f3` =
+8100/**6065** → fd02::92, `fb` = 8100/0065 → fd03::92).
+
+Six doors: `f6` ip6 forward, `g6` ip6 prerouting, `e0` netdev egress x1.102,
+`e3` netdev egress x1.103, `n1` netdev ingress x1, `r0` netdev ingress x0.
+**20 arms × 2 boots**, 200 `F577` lines per boot, and after normalising the two
+MACs the two boots are line-identical.
+
+The new expressions in this instrument are two: `meta priority set <v>` (an
+immediate into a register, then `meta` with `NFTA_META_SREG`) and a QoS map in
+`IFLA_VLAN_EGRESS_QOS`/`IFLA_VLAN_INGRESS_QOS` (`struct ifla_vlan_qos_mapping`
+is two host-order `u32`), read back from the kernel's own `RTM_GETLINK` dump
+before every arm.
+
+## 1. The reader sits between FORWARD and the egress hook
+
+`vlan_dev_hard_header()` (`net/8021q/vlan_dev.c:47`) pushes four bytes when the
+flag is cleared and writes
+
+```c
+	vlan_tci = vlan->vlan_id;
+	vlan_tci |= vlan_dev_get_egress_qos_mask(dev, skb->priority);
+	vhdr->h_vlan_TCI = htons(vlan_tci);
+```
+
+The mask function (`include/linux/if_vlan.h:211`) hashes `skprio & 0xF` into a
+bucket and then compares the **full 32-bit** value; the stored word is already
+`pcp << 13`.  The header is built through `dev_hard_header()`, and for a routed
+frame the caller is `neigh_connected_output()`/`neigh_resolve_output()`
+(`net/core/neighbour.c:1640,1611`) — **before** `dev_queue_xmit()`, therefore
+before the netdev egress hook.
+
+The doors bracket that point exactly:
+
+| store at | wire TCI | arm |
+|---|---|---|
+| `g6` (prerouting) | **6066** | `p5_g6` |
+| `f6` (forward) | **6066** | `p5_m3` |
+| `e0` (egress of x1.102) | **0066** | `p5_e0` |
+
+The third row is not an accident of ordering: at `e0` the four bytes are
+already in the frame — the same door's `NFULA_L2HDR` is 18 bytes long and ends
+`8100 0066 86dd` (`rd_e0` reads `@ll,12,2` = 8100 and `@ll,14,2` = 0066 with
+the counters at 1).  A store there changes `skb->priority` and nothing else.
+
+## 2. Every arm, and what each witness says
+
+The map readback is the kernel's; the four witnesses are independent of each
+other: the egress door's L2 header bytes, the far end's `NFULA_VLAN`
+attribute, the far end's `@ll` read (rebuilt from the metadata by
+`nft_payload_copy_vlan()`), and the AF_PACKET **auxdata** of the tap on `x0`
+(`tp_vlan_tci` / `tp_vlan_tpid`, status `0x51` = `USER|VLAN_VALID|VLAN_TPID_VALID`).
+
+| arm | frame | maps (kernel readback) | action | auxdata tci | e0/e3 L2 tci | r0 VLAN attr | ch0/ch1 |
+|---|---|---|---|---|---|---|---|
+| n0 | 0 | - | - | - | - | - | -1/-1 |
+| ctl | 0 | x1.102:eg=5>3 | - | 0066 | 0066 | 0066 | -1/-1 |
+| rd_e0 | 0 | x1.102:eg=5>3 | e0 rd@12=8100 rd@14=0066 | 0066 | 0066 | 0066 | 1/-1 |
+| p5_nomap | 0 | - | f6 set=5 + e0 cmp=5 | 0066 | 0066 | 0066 | 1/1 |
+| p5_m3 | 0 | x1.102:eg=5>3 | f6 set=5 | 6066 | 6066 | 6066 | 1/-1 |
+| p15_m5 | 0 | x1.102:eg=5>3 | f6 set=21 | 0066 | 0066 | 0066 | 1/-1 |
+| p15_m15 | 0 | x1.102:eg=21>5 | f6 set=21 | a066 | a066 | a066 | 1/-1 |
+| p5_m7 | 0 | x1.102:eg=5>7 | f6 set=5 | e066 | e066 | e066 | 1/-1 |
+| p6_m3 | 0 | x1.102:eg=5>3 | f6 set=6 | 0066 | 0066 | 0066 | 1/-1 |
+| p5_e0 | 0 | x1.102:eg=5>3 | e0 set=5 | 0066 | 0066 | 0066 | 1/-1 |
+| p5_g6 | 0 | x1.102:eg=5>3 | g6 set=5 | 6066 | 6066 | 6066 | 1/-1 |
+| p5_rm | 0 | - | f6 set=5 | 0066 | 0066 | 0066 | 1/-1 |
+| ctl_b | B | x1.103:eg=5>6 | - | 0067 | 0067 | 0067 | -1/-1 |
+| p5_b | B | x1.102:eg=5>3 x1.103:eg=5>6 | f6 set=5 | c067 | c067 | c067 | 1/-1 |
+| ing3_prio | 3 | x1.101:in=3>5 | g6 cmp=5 + f6 cmp=5 | 0066 | 0066 | 0066 | 1/1 |
+| ing_n1_g6 | 3 | x1.101:in=3>5 | n1 cmp=0 + g6 cmp=5 | 0066 | 0066 | 0066 | 1/1 |
+| ing3_e | 3 | x1.101:in=3>5 x1.102:eg=5>7 | - | e066 | e066 | e066 | -1/-1 |
+| ing0_e | 0 | x1.101:in=3>5 x1.102:eg=5>7 | - | 0066 | 0066 | 0066 | -1/-1 |
+| rd_f6 | 0 | - | f6 rd@14=0065 | 0066 | 0066 | 0066 | 1/-1 |
+| rd_r0 | 0 | x1.102:eg=5>3 | f6 set=5 + r0 rd@12=8100 rd@14=6066 | 6066 | 6066 | 6066 | 1/1 |
+
+## Table 2 -- what each witness says, by arm
+
+| arm | f6 | g6 | e0 | e3 | n1 | r0 | i6in | disc | fwd | v102 | v103 | tap len | auxn |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| n0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | -1 | 0 |
+| ctl | 1 | 1 | 1 | 0 | 1 | 1 | 2 | 1 | 1 | 1 | 0 | 80 | 1 |
+| rd_e0 | 1 | 1 | 1 | 0 | 1 | 1 | 2 | 1 | 1 | 1 | 0 | 80 | 1 |
+| p5_nomap | 1 | 1 | 1 | 0 | 1 | 1 | 2 | 1 | 1 | 1 | 0 | 80 | 1 |
+| p5_m3 | 1 | 1 | 1 | 0 | 1 | 1 | 2 | 1 | 1 | 1 | 0 | 80 | 1 |
+| p15_m5 | 1 | 1 | 1 | 0 | 1 | 1 | 2 | 1 | 1 | 1 | 0 | 80 | 1 |
+| p15_m15 | 1 | 1 | 1 | 0 | 1 | 1 | 2 | 1 | 1 | 1 | 0 | 80 | 1 |
+| p5_m7 | 1 | 1 | 1 | 0 | 1 | 1 | 2 | 1 | 1 | 1 | 0 | 80 | 1 |
+| p6_m3 | 1 | 1 | 1 | 0 | 1 | 1 | 2 | 1 | 1 | 1 | 0 | 80 | 1 |
+| p5_e0 | 1 | 1 | 1 | 0 | 1 | 1 | 2 | 1 | 1 | 1 | 0 | 80 | 1 |
+| p5_g6 | 1 | 1 | 1 | 0 | 1 | 1 | 2 | 1 | 1 | 1 | 0 | 80 | 1 |
+| p5_rm | 1 | 1 | 1 | 0 | 1 | 1 | 2 | 1 | 1 | 1 | 0 | 80 | 1 |
+| ctl_b | 1 | 1 | 0 | 1 | 1 | 1 | 2 | 1 | 1 | 0 | 1 | 80 | 1 |
+| p5_b | 1 | 1 | 0 | 1 | 1 | 1 | 2 | 1 | 1 | 0 | 1 | 80 | 1 |
+| ing3_prio | 1 | 1 | 1 | 0 | 1 | 1 | 2 | 1 | 1 | 1 | 0 | 80 | 1 |
+| ing_n1_g6 | 1 | 1 | 1 | 0 | 1 | 1 | 2 | 1 | 1 | 1 | 0 | 80 | 1 |
+| ing3_e | 1 | 1 | 1 | 0 | 1 | 1 | 2 | 1 | 1 | 1 | 0 | 80 | 1 |
+| ing0_e | 1 | 1 | 1 | 0 | 1 | 1 | 2 | 1 | 1 | 1 | 0 | 80 | 1 |
+| rd_f6 | 1 | 1 | 1 | 0 | 1 | 1 | 2 | 1 | 1 | 1 | 0 | 80 | 1 |
+| rd_r0 | 1 | 1 | 1 | 0 | 1 | 1 | 2 | 1 | 1 | 1 | 0 | 80 | 1 |
+
+
+All four witnesses agree on every arm; the wire is 80 bytes at the far end
+(`x0rxb_d=80`) because `vlan_dev_hard_start_xmit()`'s in-band branch turns the
+four bytes back into `skb->vlan_tci` for a device with `NETIF_F_HW_VLAN_CTAG_TX`
+— the PCP travels as metadata even though it was *composed* as bytes.
+
+## 3. Two laws in ten lines of source, and one arm between them
+
+`vlan_dev_get_egress_qos_mask()` is a hash table whose key is compared in full:
+
+| arm | store | mapping | bucket of the store | match | wire |
+|---|---|---|---|---|---|
+| `p15_m5` | 0x15 | `5 → 3` | 5 (same bucket) | no | **0066** |
+| `p15_m15` | 0x15 | `0x15 → 5` | 5 (same bucket) | yes | **a066** |
+| `p6_m3` | 6 | `5 → 3` | 6 | no | **0066** |
+
+The first two arms differ in one thing only — the key stored in the map — and
+they are the same frame, the same store, the same door.  A rule that writes
+`0x15` cannot reach a mapping written for `5`, although both land in bucket 5.
+
+## 4. The PCP is the map's value, not the rule's
+
+`p5_m3` (`5 → 3`) and `p5_m7` (`5 → 7`) run the same store at the same door:
+wire `6066` and `e066`.  And `p5_nomap`: the same store with no map at all
+leaves `0066` — while the rule's own value reaches the egress door intact
+(a second action there, `meta priority == 5`, counts 1).  So the store works
+and the wire does not move: the number on the wire is the device's, the
+number in the stack is the rule's.
+
+The map can be removed, and then the wire returns: `p5_rm` installs `5 → 3`,
+removes it with `to = 0`, and both the readback (`eg=-`) and the wire (`0066`)
+agree.
+
+## 5. Same store, two egress devices
+
+`p5_b` sends `fb` to fd03::92, which routes out `x1.103` whose map is `5 → 6`:
+the wire carries `c067` (vid 103, PCP 6), the far end demuxes `x0.103` and not
+`x0.102`, and the egress door `e0` counts 0 while `e3` counts 1.  One rule,
+one frame, two devices, two different PCPs — the F54 statement ("the tag is a
+function of the device it leaves through") extends to the part a hook can
+write.
+
+## 6. The receive side: priority exists before the first hook
+
+`vlan_do_receive()` (`net/8021q/vlan_core.c:60`) sets
+
+```c
+	skb->priority = vlan_get_ingress_priority(vlan_dev, skb->vlan_tci);
+	__vlan_hwaccel_clear_tag(skb);
+```
+
+The ingress map is indexed by the arriving **PCP** (8 entries).  With
+`x1.101: in=3>5` and the frame arriving with PCP 3 (`f3`):
+
+| door | `meta priority ==` | arm |
+|---|---|---|
+| `n1` (netdev ingress) | **0** | `ing_n1_g6` ch0 = 1 |
+| `g6` (ip6 prerouting) | **5** | `ing_n1_g6` ch1 = 1 |
+| `f6` (ip6 forward) | **5** | `ing3_prio` ch1 = 1 |
+
+The netdev ingress hook runs before `vlan_do_receive()` (`nf_ingress()` is
+`net/core/dev.c:6159`, the call is `:6175`), so the same frame reads 0 at one
+door and 5 at the next.  And with an egress map `5 → 7` on the output device
+the **whole chain costs no rule at all**: a frame arriving with PCP 3 leaves
+with PCP 7 (`ing3_e`, wire `e066`), while the same chain with PCP 0 in leaves
+`0066` (`ing0_e`).
+
+So the PCP is a pair of device tables with the packet stack in between: the
+ingress device turns PCP into `skb->priority`, the egress device turns
+`skb->priority` back into PCP.  A rule can only step into the middle of that
+translation, and only if the tables are already there.
+
+## 7. The fate never moves
+
+Across all twenty arms the frame is forwarded once (`fwd_d=1`), the far end
+receives exactly one frame of 80 bytes, `Ip6InReceives` +2 and
+`Ip6InDiscards` +1 (the same double count F54 measured on this topology: the
+frame is seen once on the real device, whose IPv6 is off, and once on the VLAN
+device), and the demux is 102 or 103 — never both.  Nothing a rule wrote into
+`skb->priority`, and nothing a map did, changed where the frame went.
+
+## 8. Errors of the turn, all mine
+
+1. **The readback parser was off by one attribute header.**  I read the
+   children of `IFLA_VLAN_EGRESS_QOS` from the wrong offset and printed
+   `eg=65548:5` (= 0x0001000C: the length and type of the child attribute read
+   as `from`).  Found by reading the first smoke, fixed before any number went
+   into a document; the correct readback is `eg=5:3`.
+2. **The arm print reused one hex buffer for two immediates** (`r0a`/`r0b`
+   both printed `8100`): argument evaluation order overwrote the second read's
+   buffer before the first was printed.  This is the *same* mistake as F40 #2
+   and F50 #5 — a print defect that makes the log lie about what the rule
+   contained.  Found by the verifier (which re-derived the read from the
+   design), fixed, and both boots re-run so the artifact is one binary.
+3. **The far-end `@ll` witness was first armed with the wrong immediate**:
+   `rd_r0` compared `@ll,14,2` with `0066` while the store was 5 and the map
+   `5 → 3`, so it should have been `6066`.  The counter said 0 — the
+   instrument was wrong about what it was asking, not the kernel.
+4. The model in the verifier was wrong three times before it was right: it
+   forgot the store at the forward door when computing the egress priority; it
+   assumed the hardware header at the netdev ingress door still contains the
+   tag (after `skb_vlan_untag()` the mac header has moved four bytes, so the
+   14 bytes are `…86dd`); and it compared 40 hex characters against 20 bytes of
+   IPv6 header.
+5. `nf_ingress()` sits *before* `vlan_do_receive()` in `dev.c` — I assumed the
+   opposite and added arm `ing_n1_g6` to measure it rather than assert it.
+
+## 9. Predictions: 14 of 14, with one clause that had to be built first
+
+P1–P14 all held.  P2 named four witnesses and the first build had only three
+(the far end's `@ll` read did not exist as a rule); rather than soften the
+clause I added arm `rd_r0`, which reads `@ll,12,2` = `8100` and `@ll,14,2` =
+`6066` at the receiving door, and re-ran both boots.
+
+What would have refuted the picture, and did not: a store at the forward door
+that did not reach the header (P2/P5), a reader after the egress hook (P6), an
+empty auxdata at the far end (P2's fourth witness).
+
+## 10. What is not measured, plainly
+
+The bridged (L2) path for the same four bytes — F52 saw the tag as metadata
+there, F53 as bytes behind a `REORDER_HDR`-cleared device, and this turn only
+measures the **routed** path.  802.1ad (88a8) on the egress path; three or
+more tags; a real device **without** `NETIF_F_HW_VLAN_CTAG_TX`, where the tag
+would stay in bytes on the wire; the far end's ingress map with IPv6 enabled
+on the receiving VLAN device (here `x0.102`/`x0.103` have IPv6 off, so no hook
+sees the arriving packet); conntrack on this path; GSO/`CHECKSUM_PARTIAL` on
+real hardware — still unmeasured anywhere in this project.
+
+**Not a vulnerability**: every rule here is installed by root in the initial
+user namespace, and an egress QoS map needs `CAP_NET_ADMIN` over the device.
+What the measurement says is narrower: the only part of the 802.1Q tag a hook
+can influence at all is the PCP, and only through `skb->priority` — and
+`skb->priority` is not part of the packet, so two rules that agree on every
+byte they can write can still put different bits on the wire because the
+devices they leave through disagree.
+
+## Table 3 -- the egress scene per arm
+
+| arm | outdev | HWHEADER len | L2 len | L2 head | payload len |
+|---|---|---|---|---|---|
+| ctl | 8 | 0 | 18 | 36f53b09b923fecdb2c380e08100006686dd | 84 |
+| rd_e0 | 8 | 0 | 18 | 36f53b09b923fecdb2c380e08100006686dd | 84 |
+| p5_nomap | 8 | 0 | 18 | 36f53b09b923fecdb2c380e08100006686dd | 84 |
+| p5_m3 | 8 | 0 | 18 | 36f53b09b923fecdb2c380e08100606686dd | 84 |
+| p15_m5 | 8 | 0 | 18 | 36f53b09b923fecdb2c380e08100006686dd | 84 |
+| p15_m15 | 8 | 0 | 18 | 36f53b09b923fecdb2c380e08100a06686dd | 84 |
+| p5_m7 | 8 | 0 | 18 | 36f53b09b923fecdb2c380e08100e06686dd | 84 |
+| p6_m3 | 8 | 0 | 18 | 36f53b09b923fecdb2c380e08100006686dd | 84 |
+| p5_e0 | 8 | 0 | 18 | 36f53b09b923fecdb2c380e08100006686dd | 84 |
+| p5_g6 | 8 | 0 | 18 | 36f53b09b923fecdb2c380e08100606686dd | 84 |
+| p5_rm | 8 | 0 | 18 | 36f53b09b923fecdb2c380e08100006686dd | 84 |
+| ctl_b | 9 | 0 | 18 | 36f53b09b923fecdb2c380e08100006786dd | 84 |
+| p5_b | 9 | 0 | 18 | 36f53b09b923fecdb2c380e08100c06786dd | 84 |
+| ing3_prio | 8 | 0 | 18 | 36f53b09b923fecdb2c380e08100006686dd | 84 |
+| ing_n1_g6 | 8 | 0 | 18 | 36f53b09b923fecdb2c380e08100006686dd | 84 |
+| ing3_e | 8 | 0 | 18 | 36f53b09b923fecdb2c380e08100e06686dd | 84 |
+| ing0_e | 8 | 0 | 18 | 36f53b09b923fecdb2c380e08100006686dd | 84 |
+| rd_f6 | 8 | 0 | 18 | 36f53b09b923fecdb2c380e08100006686dd | 84 |
+| rd_r0 | 8 | 0 | 18 | 36f53b09b923fecdb2c380e08100606686dd | 84 |
+
+## Table 4 -- the far end and the ingress device
+
+| arm | p4 vtci | p4 hlen | p4 h | p5 vtci | p5 vpresent | p5 h | p5 plen |
+|---|---|---|---|---|---|---|---|
+| ctl | 0065 | 14 | fecdb2c380e036f53b09b92386dd | 0066 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+| rd_e0 | 0065 | 14 | fecdb2c380e036f53b09b92386dd | 0066 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+| p5_nomap | 0065 | 14 | fecdb2c380e036f53b09b92386dd | 0066 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+| p5_m3 | 0065 | 14 | fecdb2c380e036f53b09b92386dd | 6066 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+| p15_m5 | 0065 | 14 | fecdb2c380e036f53b09b92386dd | 0066 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+| p15_m15 | 0065 | 14 | fecdb2c380e036f53b09b92386dd | a066 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+| p5_m7 | 0065 | 14 | fecdb2c380e036f53b09b92386dd | e066 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+| p6_m3 | 0065 | 14 | fecdb2c380e036f53b09b92386dd | 0066 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+| p5_e0 | 0065 | 14 | fecdb2c380e036f53b09b92386dd | 0066 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+| p5_g6 | 0065 | 14 | fecdb2c380e036f53b09b92386dd | 6066 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+| p5_rm | 0065 | 14 | fecdb2c380e036f53b09b92386dd | 0066 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+| ctl_b | 0065 | 14 | fecdb2c380e036f53b09b92386dd | 0067 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+| p5_b | 0065 | 14 | fecdb2c380e036f53b09b92386dd | c067 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+| ing3_prio | 6065 | 14 | fecdb2c380e036f53b09b92386dd | 0066 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+| ing_n1_g6 | 6065 | 14 | fecdb2c380e036f53b09b92386dd | 0066 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+| ing3_e | 6065 | 14 | fecdb2c380e036f53b09b92386dd | e066 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+| ing0_e | 0065 | 14 | fecdb2c380e036f53b09b92386dd | 0066 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+| rd_f6 | 0065 | 14 | fecdb2c380e036f53b09b92386dd | 0066 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+| rd_r0 | 0065 | 14 | fecdb2c380e036f53b09b92386dd | 6066 | 1 | 36f53b09b923fecdb2c380e086dd | 66 |
+
+## Table 5 -- counters and sysctls of the run
+
+| item | value |
+|---|---|
+| settle | 3 |
+| frames | f0 84 bytes, f3 84, fb 84 |
+| tap | auxdata tpid 33024, status bits 81 |
+
+## 11. Files
+
+    findings/F55-pcp-channel/{SUMMARY.md, summary.json, VERIFY_REPORT.md,
+                              LETTER_SECTION_F55.txt}
+    vm/{differ577_add.c, differ577.c, build_f55_differ.sh,
+        make_initramfs577.sh, build/differ577, initrd577/full.cpio.gz}
+    tools/{f55_run.sh, verify577.py, verify577_selftest.sh, f577_summary.py,
+           audit_f55_doc.py}
+    research/predictions_577.md
+    logs/{f55_rep1.log, f55_rep2.log, f55_initrd_hashes.txt}
+
+
+===== summary.json =====
+{
+  "turn": 577,
+  "finding": "F55",
+  "title": "the PCP is the only part of the 802.1Q tag a hook can reach, and the channel is skb->priority through a device-side QoS map, not the tag",
+  "answer_short": "a store of meta priority at prerouting or forward reaches the egress VLAN device's map and changes the PCP on the wire (6066 / e066 / a066 / c067 by map), while the same store at the device's egress door is too late, the store without a map changes nothing, and the ingress map turns the arriving PCP into skb->priority before the first hook",
+  "kernel": "7.3.4-T563",
+  "kernel_sha256": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+  "boots": 2,
+  "arms": {
+    "pcp": 20
+  },
+  "frames_per_arm": 1,
+  "doors": [
+    "f6 ip6 forward",
+    "g6 ip6 prerouting",
+    "e0 netdev egress x1.102",
+    "e3 netdev egress x1.103",
+    "n1 netdev ingress x1",
+    "r0 netdev ingress x0"
+  ],
+  "facts": {
+    "store_5_no_map": "wire 0066; meta priority read at the egress door is 5",
+    "store_5_map_5to3": "wire 6066 (auxdata, egress L2 header, far end NFULA_VLAN, far end @ll read)",
+    "store_5_map_5to7": "wire e066",
+    "store_0x15_map_5to3": "wire 0066 (bucket matches, full value does not)",
+    "store_0x15_map_0x15to5": "wire a066",
+    "store_6_map_5to3": "wire 0066 (different bucket)",
+    "store_at_forward": "wire 6066 (in time)",
+    "store_at_prerouting": "wire 6066 (in time)",
+    "store_at_egress_door": "wire 0066 (too late: the header is already built)",
+    "store_with_map_removed": "wire 0066 and the readback shows no EGRESS_QOS",
+    "second_egress_device": "same store, x1.103 map 5to6: wire c067, demux x0.103, door e0 counts 0",
+    "ingress_map_3to5": "meta priority reads 0 at netdev ingress and 5 at ip6 prerouting",
+    "ingress_map_plus_egress_map_no_rule": "PCP 3 in, PCP 7 out (e066) with no rule at all",
+    "ingress_map_pcp0": "wire 0066",
+    "fate": "forwarded once, demuxed by exactly one VLAN device, in every arm",
+    "auxdata_status_bits": 81,
+    "auxdata_tpid": 33024,
+    "wire_frame_bytes": 80
+  },
+  "not_measured": [
+    "the bridged (L2) path for the same four bytes",
+    "802.1ad on the egress path",
+    "three or more tags",
+    "a real device without NETIF_F_HW_VLAN_CTAG_TX (tag in bytes on the wire)",
+    "the far end's ingress map with IPv6 enabled (no hook sees the arriving packet here)",
+    "conntrack on this path",
+    "GSO/CHECKSUM_PARTIAL on real hardware"
+  ],
+  "verify": {
+    "checks": 2756,
+    "mismatches": 0,
+    "selftest": "23/23",
+    "doc_audit_cells": 207,
+    "doc_audit_substitutions": "3/3"
+  },
+  "letter": {
+    "file": "LETTER_SECTION_F55.txt",
+    "status": "NOT SENT",
+    "form": "reply in the F28 thread, no [PATCH]"
+  },
+  "artifacts": {
+    "differ": "vm/build/differ577",
+    "initrd": "vm/initrd577/full.cpio.gz"
+  }
+}

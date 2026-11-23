@@ -1,0 +1,468 @@
+===== LETTER_SECTION_F31.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: nft_payload: the store guard switches on the envelope, not on the write; the netdev branch is dead code and the ARP branch admits an IPv4-header store
+
+STATUS: NOT SENT. Candidate section, written turn 554. Not appended to any
+letter on disk; the network/link letter stays as it is until the reporter says
+otherwise.
+
+============================================================================
+1. What this adds to the two-base report
+============================================================================
+
+The earlier report covered the transport base and, separately, the network and
+link bases.  This section is about the shape of nft_nh_write_ok() itself
+(nft_payload.c:963): before it looks at anything the user wrote, it looks at
+the envelope -- pf, hook, ethertype -- and three of its four branches decide
+the answer from that alone.  Two consequences follow, both measurable:
+
+  (1) in the netdev family the function is dead code even when compiled;
+  (2) in the bridge family the same store into the same frame bytes is
+      refused under an IPv4 label and accepted under an ARP label.
+
+Everything below was measured inside disposable QEMU guests on stock nftables
+1.1.7 and on two kernels built only to make these branches exist:
+CONFIG_NF_TABLES_NETDEV and CONFIG_NF_TABLES_BRIDGE are not set in any image
+this project had booted before, and nft_payload.c is byte-identical between the
+two new kernels (7.3.4 and 7.2.15) and their parents.
+
+============================================================================
+2. Statement 1: the netdev branch is dead code
+============================================================================
+
+nft_nh_write_ok() returns true before the pf switch when the hook is ingress:
+
+    if (pkt->hook == NF_INET_INGRESS)     /* nft_payload.c, before the switch */
+            return true;
+
+and netdev has exactly one hook, ingress.  So nft_nh_write_ok_netdev() is
+unreachable in the only family that could call it.  Measured at ingress, base
+network, one forwarded IPv4 datagram, counter read from the rule itself:
+
+    @nh,336,16 set 0xCAFE   (network offset 42)  counter 1, frame bytes
+                                                 56-57 = ca fe, i.e. @nh
+                                                 points at frame byte 14
+    ip length set 0x0030                         counter 1 at ingress
+                                                 (counter 0 for the same rule
+                                                 in the ip family)
+    @nh,64,32  (ttl + proto + csum, 4 bytes)     counter 2, no byte changed
+
+The first two rows are the point: the arm that the ip family refuses on all
+five kernels (7.2.15, 7.3, 7.3.4, and both +patch builds) is applied at
+ingress.  A store at network offset 22 -- the UDP destination port -- moves a
+locally delivered datagram from :5000 to :6000 (control without the rule:
+:5000 = 1, :6000 = 0), and a store at offset 36 changes payload bytes 8-9
+instead, which is the control that shows where @nh actually points.
+
+============================================================================
+3. Statement 2: the "unknown ethertype" branch is unreachable for 802.1Q
+============================================================================
+
+The receive path strips the 802.1Q tag before any bridge hook runs, so the
+guard never sees an 0x8100 frame.  Measured: a 62-byte tagged frame arrives at
+the bridge hook as 58 bytes with ethertype 0x0800, `meta protocol ip` matches
+(counter 1) while `meta protocol 8021q` does not (counter 0).  The fallback
+branch ("unknown ethertype -> false") is therefore not what handles VLAN: what
+handles it is the IPv4 branch, keyed on a field the stack rewrote on the way.
+
+============================================================================
+4. Statement 3: the ARP branch admits into the IPv4 header what the IPv4
+    branch forbids
+============================================================================
+
+The ARP branch's condition is offset >= 8 && len <= 20, with no check that
+offset + len stays inside the 28-byte ARP message.  One frame body, two
+labels, the same network offset 8, four bytes written:
+
+    label   raw 4b @nh+8      raw 4b @nh+16     `ip daddr set` (nft's own)
+    0x0800  refused           applied           applied
+    0x8100  refused           applied           applied   (tag stripped)
+    0x9100  refused           refused           refused
+    0x0806  APPLIED           applied           refused
+
+Under the ARP label the four-byte store at offset 8 is applied to the same
+IPv4 header bytes (22, 24, 25 changed) that the IPv4 branch refuses.  The
+label also decides a second time, in another function:
+nft_payload_csum_nh_write_ok() requires ethertype == ETH_P_IP, which is why
+`ip daddr set` is dead under the ARP label while it is alive under the IP one.
+
+The missing upper bound is measurable on its own: @nh,160,128 (offset 20, 16
+bytes) writes 16 bytes on a 60-byte frame, of which bytes 42-49 lie past the
+end of the 28-byte ARP message, and is refused on a 42-byte frame.
+
+============================================================================
+5. What it costs, and what it does not
+============================================================================
+
+Under `policy drop`, a store the guard refuses also skips the rest of the rule:
+`@nh,... counter; accept` on an ARP-labelled frame delivers it with counter 1,
+while on an 0x9100 frame the counter stays 0 and the packet is dropped.
+
+This is not a regression (7.2.15+config and 7.3.4+config give the same table
+cell for cell, and nft_nh_write_ok_ip4()/_arp() are the same text in both
+trees), and it is not a security issue: the rule needs root in the initial user
+namespace.  It is the same class as the two earlier reports -- a guard that
+implements "do not spill into the next header" by testing a coordinate rather
+than the write -- with one addition: the coordinate is chosen by the envelope,
+and the envelope is not always the one the frame carries.
+
+============================================================================
+6. Not measured
+============================================================================
+
+IPv6 inside these envelopes; the `arp` family itself; PPPoE/QinQ stacks
+(0x9100 here is simply an unknown ethertype); GSO/CHECKSUM_PARTIAL;
+distribution kernels that build these symbols as modules.
+nft_nh_write_ok_netdev() is measured as unreachable, not as behaviour.  One
+cell remains unexplained and is recorded as such: the ingress arm
+@nh,64,32 leaves the counter at 2 for a single sent frame.
+
+
+===== SUMMARY.md =====
+# F31 — страж записи смотрит на конверт, а не на то, что пишут; и две из четырёх его ветвей не входят в мой собственный образ
+
+## 0. Что было вопросом
+
+F30 закрыл *сетевой* страж `nft_nh_write_ok()` для семейства `ip`: белый список
+смещений, 30 форм, 12 мёртвых. Но в этой же функции четыре ветви:
+
+```c
+	case NFPROTO_ARP:    return nft_nh_write_ok_arp(priv);
+	case NFPROTO_BRIDGE: return nft_nh_write_ok_bridge(pkt, priv, src);
+	case NFPROTO_IPV4:   return nft_nh_write_ok_ip4(pkt, priv, src);
+	case NFPROTO_IPV6:   return nft_nh_write_ok_ip6(pkt, priv, src);
+	case NFPROTO_NETDEV:
+		if (pkt->state->hook == NF_NETDEV_INGRESS)
+			return true;
+		return nft_nh_write_ok_netdev(pkt, priv, src);
+```
+
+F31 спрашивает: что делают две ветви, которых F30 не касался, — и существуют ли
+они вообще в тех ядрах, которыми я меряю.
+
+## 1. Слепота четвёртого вида: две ветви не собраны
+
+`nft_nh_write_ok_netdev()` стоит под `#ifdef CONFIG_NF_TABLES_NETDEV`,
+`nft_nh_write_ok_bridge()` — под `#if IS_ENABLED(CONFIG_NF_TABLES_BRIDGE)`, и в
+**каждом** образе, который этот проект загружал (7.2.15, 7.3, 7.3.4, P548,
+P549), оба символа `not set`. Измерено, а не прочитано: `nft add table netdev` и
+`nft add table bridge` возвращают ошибку на всех трёх «обычных» ядрах и 0 на двух
+собранных здесь.
+
+| ядро | `CONFIG_BRIDGE` | `NF_TABLES_BRIDGE` | `NF_TABLES_NETDEV` | netdev/bridge/ip в госте |
+|---|---|---|---|---|
+| Q — 7.2.15 | not set | not set | not set | 0/0/1 |
+| R — 7.3.0 | not set | not set | not set | 0/0/1 |
+| B — 7.3.4 | not set | not set | not set | 0/0/1 |
+| C — 7.3.4-C553 | **y** | **y** | **y** | **1/1/1** |
+| M — 7.2.15-C553 | **y** | **y** | **y** | **1/1/1** |
+
+C553 и M553 отличаются от своих родителей **только** этими тремя символами:
+`net/netfilter/nft_payload.c` в них побайтово равен родительскому
+(`5fac0bc7…` для 7.3.4 и для 7.2.15 — файл в этих двух релизах тоже один и тот же,
+функция `nft_nh_write_ok_ip4()` совпадает посимвольно).
+
+Вторая половина того же: **в семействе `netdev` ветвь `nft_nh_write_ok_netdev()`
+недостижима даже когда собрана** — `nft_nh_write_ok()` возвращает `true` раньше,
+если хук — ingress, а других хуков у netdev нет.
+
+## 2. Одно правило, два хука: у ingress белого списка нет
+
+Один и тот же кадр (Ethernet 14 + IPv4 20 + UDP 8 + 16 байт, `id 0x5531`),
+пересылается гостем (`ip_forward=1`, `i0 → o0`), захват на дальней стороне `o1`.
+`cnt` — счётчик ядра из самого правила (после store), `nchg` — сколько байт
+прибывшего кадра отличается от контроля, `cap` — дошёл ли кадр.
+
+| правило (base `network`) | Q | R | B | C | M |
+|---|---|---|---|---|---|
+| `@nh,336,16 set 0xcafe` — вне списка | 0/0/1 | 0/0/1 | 0/0/1 | 0/0/1 | 0/0/1 |
+| `@nh,64,32 set 0x3e11aabb` — ttl, 4 байта | 0/0/1 | 0/0/1 | 0/0/1 | 0/0/1 | 0/0/1 |
+| `@nh,64,8 set 0x20` — ttl, 1 байт | 1/1/1 | 1/1/1 | 1/1/1 | 1/1/1 | 1/1/1 |
+| `@nh,128,32 set 0x0a090007` — daddr | 1/0/1 | 1/0/1 | 1/0/1 | 1/0/1 | 1/0/1 |
+| `ip length set 0x0030` (nft сам) | 0/0/1 | 0/0/1 | 0/0/1 | 0/0/1 | 0/0/1 |
+| `ip daddr set 10.9.0.7` (nft сам) | 1/0/1 | 1/0/1 | 1/0/1 | 1/0/1 | 1/0/1 |
+| **то же в netdev ingress** | skip | skip | skip | — | — |
+| ↑ `@nh,336,16 set 0xcafe` | skip | skip | skip | **1/2/1** | **1/2/1** |
+| ↑ `@nh,64,32 set 0x3e11aabb` | skip | skip | skip | **2/0/0** | **2/0/0** |
+| ↑ `@nh,64,8 set 0x20` | skip | skip | skip | **1/0/0** | **1/0/0** |
+| ↑ `@nh,128,32 set 0x0a090007` | skip | skip | skip | **1/0/1** | **1/0/1** |
+| ↑ `ip length set 0x0030` | skip | skip | skip | **1/0/0** | **1/0/0** |
+| ↑ `ip daddr set 10.9.0.7` | skip | skip | skip | **1/0/1** | **1/0/1** |
+
+Три вещи видны только вместе. **`@nh,336,16` отвергнут во всех пяти ядрах** — и в
+7.2.15 тоже, то есть сетевой белый список **старше** того релиза, где F27 нашёл
+его транспортного близнеца (`nft_th_write_ok`, v7.3). На ingress то же правило
+**применяется**: кадр приходит с `56:77>ca,57:77>fe` — записаны ровно те два
+байта, которые ip-семейство писать не даёт, и `@nh` там действительно указывает
+на кадровый байт 14. И `ip length set` в ip-семействе отвергнут (cnt 0), а на
+ingress применён (cnt 1): кадр после этого умирает в стеке (`cap=0`), и это
+видно только по паре «cnt 1 / cap 0» — счётчик один этого не сказал бы.
+
+## 3. Один кадр, три конверта: решает метка
+
+Мост `br0` с портами `s1` и `r1`; кадр шлётся на `s0` и ловится на `r0`. Тело
+IPv4-датаграма **одно и то же** во всех столбцах, меняются два байта
+ethernet-метки. В таблице — `cnt` ядра и изменённые байты кадра.
+
+| правило | 0x0800 | 0x8100 | 0x9100 | 0x0806 |
+|---|---|---|---|---|
+| `@nh,128,32` — daddr, len 4 | **жив** (2 байта) | **жив** (2) | мёртв | **жив** (2) |
+| `@nh,64,32` — ttl+proto+cksum, len 4 | мёртв | мёртв | мёртв | **жив** (3 байта: 22, 24, 25) |
+| `ip daddr set 10.9.9.9` (nft сам, с csum-фиксом) | **жив** (4) | **жив** (4) | мёртв | мёртв |
+| `meta protocol 8021q` | — | cnt 0 | — | — |
+| `meta protocol ip` | cnt 1 | **cnt 1** | cnt 0 | cnt 0 |
+| `meta protocol 0x9100` | — | — | cnt 1 | — |
+
+Читается так. `0x0800` идёт в ветвь IPv4 (её белый список: ttl только 1 или 2
+байта — значит `len 4` мёртв, daddr `len ≤ 4` — жив). `0x9100` — в `return false`:
+мёртво всё. `0x0806` — в **ARP-ветвь**, у которой условие `offset >= 8 && len <= 20`
+и никакой проверки на смысл: поэтому четырёхбайтовая запись по смещению 8,
+которая в IPv4 мертва, **применяется к тем же самым байтам IPv4-заголовка** —
+кадр, у которого в метке написано «ARP», а внутри IPv4, получает более слабого
+стража. Тот же выбор метки решает **второй раз** в другой функции:
+`nft_payload_csum_nh_write_ok()` требует `pkt->ethertype == ETH_P_IP`, поэтому
+человеческая форма `ip daddr set` на ARP-меченом кадре мертва, а на
+IP-меченом живёт.
+
+## 4. Метка, которую читает страж, — не та, что в кадре
+
+Кадр с `0x8100` на проводе доходит до моста **без метки**: 58 байт вместо 62, и
+`meta protocol ip` = 1 при `meta protocol 8021q` = 0. Приёмный путь снимает
+802.1Q-метку в `skb_vlan_untag()` до любого bridge-хука и переписывает
+`skb->protocol` на внутренний протокол; veth — не то устройство, которое вернёт её
+при передаче, поэтому в захвате метки нет вовсе. Значит:
+
+* ветвь «неизвестный ethertype → `false`» для VLAN-кадров **недостижима**: страж
+  видит `0x0800` и ведёт себя как на нетегированном кадре (столбцы 0x0800 и
+  0x8100 в таблице §3 совпадают до байта);
+* вход стража — поле, которое стек переписывает по дороге; «что написано в кадре»
+  и «что видит страж» — разные вопросы.
+
+## 5. Последствие: байт, который страж не даёт писать, решает, кому достанется датаграмма
+
+Отдельная пара `l0/l1`: на `l0` ingress-цепь, датаграмма адресована локальному
+`10.2.0.1:5000`, в госте два сокета — на `:5000` и `:6000`.
+
+| правило на ingress | :5000 | :6000 | cnt | payload |
+|---|---|---|---|---|
+| нет правила | **1** | 0 | 0 | `7777…7777` |
+| `@nh,176,16 set 0x1770` (сеть +22 = UDP dport) | 0 | **1** | 1 | `7777…7777` |
+| `@nh,288,16 set 0x1770` (сеть +36) | **1** | 0 | 1 | `7777…7777 1770 7777…` |
+
+Первая строка — контроль. Вторая: запись, которую ip-семейство отвергает
+(`offset 22` вне списка), на ingress перенаправляет датаграмму **в другой сокет**
+того же хоста. Третья — контроль на смещение: если бы `@nh` на ingress указывал на
+кадровый байт 0, работала бы она, а не вторая; она пишет в payload (байты 8–9), и
+именно это в датаграмме и видно.
+
+## 6. ARP-ветвь: односторонняя проверка длины, измеренная с двух сторон
+
+`@nh,160,128` (сеть +20, 16 байт) на 60-байтовом ARP-кадре применяется: изменены
+байты 34–49 кадра, из них 42–49 — **за пределами 28-байтового ARP-сообщения**
+(в паддинге). То же правило на 42-байтовом кадре (ARP без паддинга) отвергается
+(`cnt 0`, байты не изменились, кадр при этом доставлен) — то есть настоящая
+граница здесь не сообщение, а длина skb, как и написано в комментарии к коду.
+
+## 7. Отказ глушит остаток правила — теперь на оси метки
+
+Цепь `policy drop`; правило `@nh,64,32 …; counter; accept`:
+
+| кадр | доставлен | counter |
+|---|---|---|
+| `0x0806` (ARP-метка, IPv4 внутри) | **да** | **1** |
+| `0x9100` | нет | **0** |
+| без правила (контроль) | нет | 0 |
+
+Отказ store — это `NFT_BREAK`: счётчик, стоящий после него, не выполняется, и
+`accept` тоже, и кадр уходит в `policy drop`. Тот же механизм, что F27 и F30
+нашли в других базах, — здесь он привязан к двум байтам ethernet-метки.
+
+## 8. Что это меняет, а что нет
+
+**Не меняет** ничего из F28–F30: те таблицы про семейства `ip`/`ip6`, и они
+остаются в силе. **Не является регрессией**: таблица §3 и §2 на 7.2.15+config и
+7.3.4+config совпадает до последней клетки, а `nft_nh_write_ok_ip4()` и
+`nft_nh_write_ok_arp()` в 7.2.15 и 7.3.4 — один и тот же текст. **Не является
+уязвимостью**: правило ставит root в начальном user ns; последствие — правило
+перестаёт делать то, что написано, или делает это на байте, который автор правила
+не выбирал.
+
+**Меняет** вот что: белый список — не свойство записи, а свойство конверта
+(`pf`, хук, ethertype) плюс координаты. Из этого следуют три проверяемых
+утверждения для письма: (1) `nft_nh_write_ok_netdev()` — мёртвый код, потому что
+netdev имеет только ingress, а ingress возвращает `true` раньше; (2) ветвь
+«неизвестный ethertype» недостижима для 802.1Q, потому что метку снимают до хука;
+(3) ARP-ветвь пускает в IPv4-заголовок ровно те формы, которые IPv4-ветвь
+запрещает, — выбор делает метка, а не содержимое.
+
+## 9. Ошибки хода, все мои
+
+1. **`immediate` без вложенного `NFTA_DATA_VALUE`** — все 40 «сырых» правил
+   падали с `-EINVAL`, и это выглядело как «страж не пускает». Та же ошибка, что
+   и с вердиктом: `NFTA_IMMEDIATE_DATA` содержит **вложенный** атрибут, а не байты.
+2. **Правило, отправленное вне батча, принимается с ACK 0 и не появляется в
+   цепи** (оно остаётся в транзакции, которую никто не коммитит). Полдня
+   «мёртвых» правил. Диагноз дал собственный дамп `GETRULE` (`rules=0`), а не
+   чтение кода.
+3. **Правило в батче без `NLM_F_REQUEST`** — то же молчание по другой причине.
+4. **Цепь `policy drop` создавалась вместе с остальными**, и все три контроля
+   моста оказались «мертвы»: цепь с `policy drop` на prerouting рубит все
+   пересылаемые кадры уже фактом своего существования.
+5. **Правило предыдущей руки оставалось в цепи** и дописывало 16 байт в кадры
+   следующей секции — поймано по `nchg=19` вместо 3.
+6. **Захват без фильтра**: мост поднимает IPv6 на `br0`, и «первый кадр на
+   сокете» дважды оказывался 70-байтовым ICMPv6. Теперь фильтр по адресу.
+7. **`cap_on_src` по умолчанию 0** — все руки моста «не доставлялись», хотя
+   байты менялись. Поймано сравнением с контролем, который шёл другим путём.
+8. **Прогноз P2 опровергнут**: я ждал, что на 7.2.15 запись пройдёт, потому что
+   «стражи появились в 7.3». Сетевой страж есть уже в 7.2.15 (в 7.3 появился
+   только транспортный). Это записано как измерение, а не как опечатка.
+9. **Прогноз P9 неточен**: на 42-байтовом кадре отказ не «не доставляет кадр», а
+   «не делает запись» — кадр доставляется, потому что цепь `accept`.
+10. **`sd.nh36` предсказан как payload 14–15, измерено 8–9** — арифметику
+    кадровых смещений я снова сделал в уме.
+11. **CRLF, шестой раз за проект**: две мутации селфтеста были мертвы, пока не
+    снял якорь `$`.
+12. **Разбор cpio опять без выравнивания имени** (F25 повторился): проверка
+    «бинарник внутри архива» краснела на верном бинаре.
+13. **`sb.raw8`: счётчик 2 при одном отправленном кадре.** Воспроизводится на
+    обоих config-ядрах, объяснения у меня нет; на вывод не влияет (store применён
+    в любом случае), но записано как есть, а не подогнано.
+
+## 10. Что не измерено, прямо
+
+Только nftables 1.1.7 как клиент. Только IPv4 внутри конвертов; IPv6 в мосту и
+`arp`-семейство не трогались. `PPPoE`/`QinQ`-стеки не собирались, `0x9100` —
+просто неизвестный ethertype. GSO/`CHECKSUM_PARTIAL` не тронут. Один хук, одна
+veth-пара на секцию, `CONFIG_BRIDGE_VLAN_FILTERING=n`. Ветвь
+`nft_nh_write_ok_netdev()` проверена как **недостижимая** (чтение + отказ nft
+создать цепь на другом хуке), а не как «работает неправильно». Распределения
+вроде Debian/Ubuntu, где эти символы обычно `=m` или `=y`, не загружались: вывод
+о их поведении — это вывод из одинакового исходника и одинакового конфига, а не
+измерение.
+
+## 11. Чем проверено
+
+| | |
+|---|---|
+| `tools/verify553.py` | **311/311** — хэши пяти ядер против хэшей из логов и версии при загрузке, один общий initrd и **разобранный из него** бинарник, `nft` из архива, пять `.config` против пяти ядер, побайтовое равенство `nft_payload.c` у config-ядер и их родителей, посимвольное равенство `nft_nh_write_ok_ip4/_arp` между 7.2.15 и 7.3.4, четыре строки-якоря исходника, каждая клетка §1–§7, согласие кадра со счётчиком, детерминизм двух загрузок, равенство таблиц C и M, отсутствие splat, все `F553RC` = 0 |
+| `verify553_selftest.sh` | **12 мутаций + базовая линия, 13/13** — каждая краснит свою проверку (две были мертвы из-за CRLF, пока я их не починил) |
+| `audit_f31_doc.py` | **160 клеток, 0 расхождений** — каждая клетка таблиц §1–§7 пересобрана из логов |
+| регрессия | verify552 5633, verify551 1802, verify550 1034, verify549 318, verify548 342 — все зелёные, их артефакты не тронуты |
+
+## 12. Файлы
+
+`findings/F31-envelope-guard/{SUMMARY.md,summary.json,VERIFY_REPORT.md}` (симлинк
+`findings/F31`), `vm/differ553.c`, `vm/build/differ553`, `vm/make_initramfs553.sh`,
+`tools/{f31_run.sh,f31_build_cfg.sh,verify553.py,verify553_selftest.sh,audit_f31_doc.py}`,
+`research/predictions_553.md`, ядра `src/linux-7.3.4-C553` и
+`src/dl72/linux-7.2.15-C553`, логи `logs/f31_{C_rep1,C_rep2,B,R,Q,M}_rep1.log`.
+
+
+===== summary.json =====
+{
+  "finding": "F31",
+  "turn": 553,
+  "title": "The payload write guard is keyed on the envelope (pf, hook, ethertype), not on what is written; two of its four branches are compiled out of every image this project had booted, and the netdev one is dead code even when compiled",
+  "versions": {
+    "kernels": {
+      "Q": {"name": "linux-7.2.15", "bzImage_sha256": "from logs/f31_Q_rep1.log", "config": "no BRIDGE/NF_TABLES_BRIDGE/NF_TABLES_NETDEV"},
+      "R": {"name": "linux-7.3.0", "bzImage_sha256": "from logs/f31_R_rep1.log", "config": "no BRIDGE/NF_TABLES_BRIDGE/NF_TABLES_NETDEV"},
+      "B": {"name": "linux-7.3.4-B19", "bzImage_sha256": "5fac0bc7 nft_payload.c", "config": "no BRIDGE/NF_TABLES_BRIDGE/NF_TABLES_NETDEV"},
+      "C": {"name": "linux-7.3.4-C553", "config": "B19 + CONFIG_BRIDGE=y + CONFIG_NF_TABLES_BRIDGE=y + CONFIG_NF_TABLES_NETDEV=y, nothing else"},
+      "M": {"name": "linux-7.2.15-C553", "config": "7.2.15 + the same three symbols"}
+    },
+    "nftables": "1.1.7 (static, 77d83a42...)",
+    "same_initrd_for_all_boots": true
+  },
+  "config_relative_reachability": {
+    "netdev_bridge_ip_on_Q_R_B": [0, 0, 1],
+    "netdev_bridge_ip_on_C_M": [1, 1, 1],
+    "nft_payload_c_byte_identical_child_vs_parent": true,
+    "nft_nh_write_ok_ip4_and_arp_identical_7_2_15_vs_7_3_4": true
+  },
+  "ip_family_arms": {
+    "note": "cnt = the kernel's own counter, which sits AFTER the store; nchg = bytes of the captured frame that differ from the control",
+    "arms": {
+      "nh_off42_len2": {"cnt": 0, "nchg": 0, "cap": 1, "identical_on": ["Q", "R", "B", "C", "M"], "verdict": "refused"},
+      "nh_off8_len4": {"cnt": 0, "nchg": 0, "cap": 1, "identical_on": ["Q", "R", "B", "C", "M"], "verdict": "refused"},
+      "nh_off8_len1_ttl": {"cnt": 1, "nchg": 1, "chg": "22:3f>20", "cap": 1, "identical_on": ["Q", "R", "B", "C", "M"], "verdict": "applied"},
+      "nh_off16_len4_daddr": {"cnt": 1, "nchg": 0, "cap": 1, "identical_on": ["Q", "R", "B", "C", "M"], "verdict": "applied, same value"},
+      "kw_ip_length_set": {"cnt": 0, "nchg": 0, "cap": 1, "identical_on": ["Q", "R", "B", "C", "M"], "verdict": "refused"},
+      "kw_ip_daddr_set": {"cnt": 1, "nchg": 0, "cap": 1, "identical_on": ["Q", "R", "B", "C", "M"], "verdict": "applied, same value"}
+    },
+    "conclusion": "the network whitelist is not a 7.3 regression: the same six arms give the same six answers on 7.2.15 and 7.3.4"
+  },
+  "netdev_ingress_arms": {
+    "measured_on": ["C", "M"],
+    "arms": {
+      "nh_off42_len2": {"cnt": 1, "nchg": 2, "chg": "56:77>ca,57:77>fe", "cap": 1},
+      "nh_off8_len4": {"cnt": 2, "nchg": 0, "cap": 0},
+      "nh_off8_len1_ttl": {"cnt": 1, "nchg": 0, "cap": 0},
+      "nh_off16_len4_daddr": {"cnt": 1, "nchg": 0, "cap": 1},
+      "kw_ip_length_set": {"cnt": 1, "nchg": 0, "cap": 0},
+      "kw_ip_daddr_set": {"cnt": 1, "nchg": 0, "cap": 1}
+    },
+    "conclusion": "at ingress the guard is not consulted: the arm the ip family refuses on all five kernels writes frame bytes 56-57, i.e. @nh points at frame byte 14 there"
+  },
+  "bridge_label_table": {
+    "measured_on": ["C", "M"],
+    "labels": ["0x0800", "0x8100", "0x9100", "0x0806"],
+    "raw_off16_len4": {"0x0800": 1, "0x8100": 1, "0x9100": 0, "0x0806": 1},
+    "raw_off8_len4": {"0x0800": 0, "0x8100": 0, "0x9100": 0, "0x0806": 1},
+    "kw_ip_daddr_set": {"0x0800": 1, "0x8100": 1, "0x9100": 0, "0x0806": 0},
+    "meta_protocol": {
+      "on_0x8100_frame": {"8021q": 0, "ip": 1},
+      "on_0x9100_frame": {"0x9100": 1, "ip": 0},
+      "on_0x0800_frame": {"ip": 1},
+      "on_0x0806_frame": {"ip": 0}
+    },
+    "tagged_frame_on_the_wire": {"captured_len": 58, "sent_len": 62, "ethertype_in_capture": "0x0800"},
+    "conclusion": "the same four-byte store at network offset 8 is dead under an IPv4 label and alive under an ARP label on the same frame bytes; the label also decides a second time in nft_payload_csum_nh_write_ok()"
+  },
+  "arp_overshoot": {
+    "arm": "@nh,160,128 (network offset 20, 16 bytes)",
+    "frame_60_bytes": {"cnt": 1, "nchg": 16, "changed_range": [34, 49], "past_the_arp_message": [42, 49]},
+    "frame_42_bytes": {"cnt": 0, "nchg": 0, "cap": 1, "verdict": "refused, packet still delivered"}
+  },
+  "verdict_under_policy_drop": {
+    "arp_labelled_frame": {"cap": 1, "cnt": 1},
+    "0x9100_frame": {"cap": 0, "cnt": 0},
+    "control_no_rule": {"cap": 0, "cnt": 0}
+  },
+  "local_delivery_consequence": {
+    "control": {"port_5000": 1, "port_6000": 0},
+    "store_network_offset_22": {"port_5000": 0, "port_6000": 1, "cnt": 1},
+    "store_network_offset_36": {"port_5000": 1, "port_6000": 0, "cnt": 1, "payload": "77777777777777771770777777777777"},
+    "conclusion": "a store the ip family refuses (offset 22) moves the datagram to another local socket when placed at ingress"
+  },
+  "determinism": {"C_rep1_vs_C_rep2": "identical apart from random MACs", "C_vs_M": "identical table: not a regression"},
+  "splats": 0,
+  "verification": {
+    "verify553.py": "311/311",
+    "verify553_selftest.sh": "12 mutations + baseline, 13/13",
+    "audit_f31_doc.py": "160 cells, 0 mismatches",
+    "regression": {"verify552": "5633", "verify551": "1802", "verify550": "1034",
+                    "verify549": "318", "verify548": "342"}
+  },
+  "not_measured": [
+    "IPv6 inside envelopes; arp family; PPPoE/QinQ stacks; GSO/CHECKSUM_PARTIAL",
+    "distribution kernels that build these symbols as modules",
+    "nft_nh_write_ok_netdev() measured as unreachable, not as behaviour",
+    "the extra counter increment on the ingress off8/len4 arm (cnt=2 for one frame) is unexplained"
+  ],
+  "files": {
+    "differ": "vm/differ553.c",
+    "binary": "vm/build/differ553",
+    "initramfs": "vm/make_initramfs553.sh",
+    "run": "tools/f31_run.sh",
+    "build": "tools/f31_build_cfg.sh",
+    "predictions": "research/predictions_553.md",
+    "verify": "tools/verify553.py",
+    "selftest": "tools/verify553_selftest.sh",
+    "doc_audit": "tools/audit_f31_doc.py",
+    "logs": ["logs/f31_C_rep1.log", "logs/f31_C_rep2.log", "logs/f31_B_rep1.log",
+              "logs/f31_R_rep1.log", "logs/f31_Q_rep1.log", "logs/f31_M_rep1.log"]
+  }
+}

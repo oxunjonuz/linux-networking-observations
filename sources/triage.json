@@ -1,0 +1,145 @@
+{
+ "29": {
+  "observes": "The inner-base store (`@ih`) writes the TCP data-offset byte that the transport-base guard refuses, through VXLAN, Geneve and ipip.",
+  "not_confirmed": "It needs root in the initial user namespace, and the source states the assumption it rests on (\"real l3/l4 headers cannot be mangled\") -- which tunnel frames contradict. Reported as a gap in a guard, not as a vulnerability.",
+  "would_confirm": "An upstream patch that gives the inner base a guard, or a maintainer statement that the current behaviour is intended."
+ },
+ "30": {
+  "observes": "`ip6 ecn set` and `ip6 flowlabel set` install with rc=0 and never change a byte, while their IPv4 twins work.",
+  "not_confirmed": "The whitelist refuses (fail-closed), so the effect is a silent no-op, not a memory-safety issue; only the declared spellings were measured.",
+  "would_confirm": "A change in nft's rounding for `proto_ip6`, or a kernel case that accepts offset 1."
+ },
+ "31": {
+  "observes": "At the netdev ingress hook the guard is a constant; under an ARP label the branch admits a 4-byte store at offset 8 with no upper bound inside the 28-byte ARP message.",
+  "not_confirmed": "The ingress constant is intended (there is no envelope at ingress); the ARP bound is a coordinate check reachable only by root.",
+  "would_confirm": "A store past the end of the ARP message that survives in a configuration the maintainers treat as supported."
+ },
+ "32": {
+  "observes": "Four of nft's nine declared ARP fields (`htype`, `ptype`, `hlen`, `plen`) never reach a byte.",
+  "not_confirmed": "The guard refuses (fail-closed); the mismatch is between the declared field table and the guard's predicate.",
+  "would_confirm": "A guard extended to the four declared offsets, or a statement that they are intentionally dead."
+ },
+ "36": {
+  "observes": "A `@ll` store on a tagged forwarded frame rewrites its ethertype on the wire (0x0800 to 0x0806), while the same store on an untagged frame is refused.",
+  "not_confirmed": "Root-only; the store lands on the byte the coordinate names, and the question is whether that coordinate should be the frame's.",
+  "would_confirm": "A maintainer decision on `@ll` semantics when the tag is in skb metadata."
+ },
+ "37": {
+  "observes": "A two-byte store at `(12,2)` can leave a frame with ethertype 0x0000 while `skb->protocol` stays 0x0800 and the bridge keeps forwarding it.",
+  "not_confirmed": "Root-only, and it is the result of a store the guard deliberately allows into `skb_vlan_proto`.",
+  "would_confirm": "A guard that refuses a store which clears the ethertype."
+ },
+ "39": {
+  "observes": "A Q-in-Q frame is refused by all 40 network-base cells, while `meta protocol` reports 0x0800 for the same frame.",
+  "not_confirmed": "The refusal is fail-closed; the two subsystems disagree about the same frame.",
+  "would_confirm": "A case for 0x8100 in `nft_nh_write_ok_bridge()`."
+ },
+ "40": {
+  "observes": "After `meta protocol` on a Q-in-Q frame, an `@nh` cell compares one field and writes the field four bytes earlier.",
+  "not_confirmed": "Root-only; no memory-safety claim, and the read side is the one that was repaired.",
+  "would_confirm": "A patch that makes `nft_payload_set_eval()` add `pkt->nhoff`, as the read does."
+ },
+ "41": {
+  "observes": "On PPPoE the `@nh` read lands on the real IPv4 header and the store eight bytes earlier, so none of the 14 accepted cells writes the field it names.",
+  "not_confirmed": "Root-only; the frame is delivered with a rewritten PPPoE header or dropped, never corrupted in memory.",
+  "would_confirm": "A patch aligning the PPPoE store with the read."
+ },
+ "42": {
+  "observes": "A bridge `@nh` store on a real PPPoE session lands in the PPPoE header and is consumed by the IP stack (an `ip id` store becomes the PPPoE length).",
+  "not_confirmed": "Root-only; the consequence is a delivered or dropped datagram, not memory corruption.",
+  "would_confirm": "A patch or a maintainer ruling on the PPPoE coordinate."
+ },
+ "47": {
+  "observes": "The IPv6 network-base whitelist has no case for offset 4 (`payload_len`) and none for offset 6 (`next header`), at every door and class.",
+  "not_confirmed": "The guard refuses (fail-closed).",
+  "would_confirm": "A case added for offsets 4 and 6, with a value check where needed."
+ },
+ "48": {
+  "observes": "At the netdev egress hook on a PPPoE frame, `meta protocol` gives `@th` the right coordinate and `@nh` a coordinate inside the frame by 22 bytes.",
+  "not_confirmed": "Root-only; a rule can be written that reads one base and the other stays dead.",
+  "would_confirm": "A constructor that validates the version byte at the repaired offset."
+ },
+ "50": {
+  "observes": "`@ll` reads run past the link header while writes stop at `mac_len`, and the same verdict covers two doors whose consequences are opposite.",
+  "not_confirmed": "Root-only; the read-side domain is intentional (it lets a rule read the network header through `@ll`).",
+  "would_confirm": "A documented statement of the two domains, or a guard that bounds both the same way."
+ },
+ "54": {
+  "observes": "A root rule can trigger the `invalid VLAN protocol` WARN once per frame, and every such frame is then dropped.",
+  "not_confirmed": "It needs root and a device with a `vlan_info`; a WARN is a diagnostic, not a crash, and the frame is dropped cleanly.",
+  "would_confirm": "A maintainer statement whether the WARN is reachable by design from a payload store."
+ },
+ "59": {
+  "observes": "Two base chains on the same ingress hook point get two different guards: a netdev chain is unbounded at `@ll`/`@nh`, an inet chain at the same point is bounded.",
+  "not_confirmed": "Root-only; it follows from the `pf` rewrite in `nft_do_chain_inet_ingress()` and is only observable with two chains.",
+  "would_confirm": "A decision that the two chains should share one guard."
+ },
+ "35": {
+  "behaviour": "The `@ll` bound is the current envelope's link-header length, and 0 inside an L3 tunnel.",
+  "anchor": "Bare Ethernet 14; tagged 18; ipip 0."
+ },
+ "38": {
+  "behaviour": "The 802.1Q tag is popped before every hook, so the guard judges `skb->vlan_all` and `skb->protocol`.",
+  "anchor": "A tagged frame reaches the far side at 60 bytes; a 9100 frame is not popped."
+ },
+ "43": {
+  "behaviour": "The transport base is exact or refused: read and store share `nft_thoff(pkt)`.",
+  "anchor": "Q-in-Q 0/8 live without `meta protocol`, 8/8 with it."
+ },
+ "44": {
+  "behaviour": "Four pktinfo constructors agree on one transport coordinate at every door.",
+  "anchor": "348 arms, four doors, two priorities each."
+ },
+ "45": {
+  "behaviour": "IPv6 computes `@th` by walking extension headers, and the walk's failure modes carry three verdicts.",
+  "anchor": "524 arms, five doors, extension-header frames."
+ },
+ "46": {
+  "behaviour": "`@ll` exists only where a MAC header was built, so the traffic class decides its verdict away from the receive path.",
+  "anchor": "Local datagrams 0/12 at local_out; forwarded frames 10/12."
+ },
+ "49": {
+  "behaviour": "On ppp0 `@ll` does not exist and `@nh` is correct: no constructor has anything to add after `ppp_input()`.",
+  "anchor": "Hop limit 40 read at `@nh,7,1`; `@ll` refused for every non-zero end."
+ },
+ "51": {
+  "behaviour": "A store reaches exactly the copies the kernel makes after it; earlier copies are protected by copy-on-write.",
+  "anchor": "A store at bridge prerouting reaches all three copies; the same store at forward reaches one."
+ },
+ "52": {
+  "behaviour": "A tag with a non-zero vid and no VLAN device is `PACKET_OTHERHOST` before any IP counter, and a TCI store changes delivery without changing a wire byte.",
+  "anchor": "rx_otherhost_dropped moves; Ip6InReceives stays 0."
+ },
+ "53": {
+  "behaviour": "`VLAN_FLAG_REORDER_HDR` decides whether the tag is frame bytes or a skb word at the layer-3 doors.",
+  "anchor": "80 bytes untagged against 84 tagged; mac_len 14 against 18."
+ },
+ "55": {
+  "behaviour": "The PCP travels through `skb->priority` and the device's egress map, not through a store into the tag.",
+  "anchor": "TCI 0x6066 on the wire, read by four witnesses."
+ },
+ "56": {
+  "behaviour": "The tag's representation follows the device's offload bits, not the TPID.",
+  "anchor": "Wire 80 bytes with the bit set, 84 without; NFULA_TCI present or absent."
+ },
+ "57": {
+  "behaviour": "Two privilege gates: `CAP_NET_ADMIN` for the netlink call, and `init_user_ns` for a payload store.",
+  "anchor": "uid 1000 in its own user+netns: table 0, chain 0, read 0, store -1, meta 0."
+ },
+ "58": {
+  "behaviour": "The three write guards are a boundary, a whitelist and a coordinate; none asks the packet's length.",
+  "anchor": "One of nine `@ll` cells accepted at ip6 prerouting; all accepted at netdev ingress."
+ },
+ "60": {
+  "behaviour": "On a CHECKSUM_PARTIAL datagram the UDP checksum field is the pseudo-header seed, and the fixup block is skipped.",
+  "anchor": "fad2 (IPv6) and 14ad (IPv4) against real checksums 7a78 and 609e."
+ },
+ "61": {
+  "behaviour": "On the forwarded path the exit device decides what the checksum field means and who pays for a store.",
+  "anchor": "The same datagram: fad4 on an exit with NETIF_F_HW_CSUM, 7a75 without it."
+ },
+ "62": {
+  "behaviour": "The two exits segment in different places, so the same payload store is free on one and paid on the other.",
+  "anchor": "One 1262-byte frame against three of 574/574/238."
+ }
+}

@@ -1,0 +1,385 @@
+===== LETTER_SECTION_F32.txt =====
+STATUS: NOT SENT -- candidate section only.  Not appended to
+findings/LETTER_netfilter_devel.txt or to findings/LETTER_netfilter_devel_F29_F30.txt;
+those are frozen and nothing is added to them without the owner's word.
+
+=============================================================================
+Candidate section: the ARP branch of nft_nh_write_ok() takes only (offset,len)
+=============================================================================
+
+nft_nh_write_ok_arp() is reached from three envelopes (family arp, bridge with an
+ARP-labelled frame, netdev with an ARP-labelled frame) and receives only
+`const struct nft_payload_set *priv` -- no pkt, no state, no hook.  Two
+consequences are measurable with the stock nft 1.1.7 on a stock 7.3.4 with
+CONFIG_NF_TABLES_ARP=y (and identically on 7.2.15 with the same symbol; the four
+relevant source files are byte-identical to the unmodified trees).
+
+1. Four declared fields of the family are silently dead.
+
+   nft's own `proto_arp` names nine fields.  All nine install with rc=0 and no
+   message; nft's --debug=netlink output for each is `payload write ... @
+   network header + <off>`.  With a counter and an NFLOG tap *after* the store:
+
+     arp htype set 0x00ab   -> 2b @ +0    counter 0, no log  (dead)
+     arp ptype set 0x86dd   -> 2b @ +2    counter 0, no log  (dead)
+     arp hlen  set 8        -> 1b @ +4    counter 0, no log  (dead)
+     arp plen  set 16       -> 1b @ +5    counter 0, no log  (dead)
+     arp operation set 2    -> 2b @ +6    counter 1, byte 7: 01->02
+     arp saddr ether set .. -> 6b @ +8    counter 1, byte 13: 66->99
+     arp saddr ip set ..    -> 4b @ +14   counter 1, byte 17: 09->42
+     arp daddr ether set .. -> 6b @ +18   counter 1, six bytes
+     arp daddr ip set ..    -> 4b @ +24   counter 1, byte 25: 01->09
+
+   The guard's predicate, measured over 96 (offset,length) arms at the input
+   hook and 12 at the output hook, is exactly
+   `(off == 6 && len == 2) || (off >= 8 && len <= 20)`; nothing about the packet,
+   the hook or the direction enters it.  Offsets 0, 2, 4 and 5 are neither the
+   ar_op case nor >= sizeof(struct arphdr).
+
+   The user-visible effect is not cosmetic.  In a chain with `policy drop`, a
+   rule `arp htype set 2 counter accept` drops every matching ARP packet: the
+   store returns false, nft_payload_set_eval() takes the same `goto err` as the
+   guard's own refusal, and the rest of the rule -- counter, verdict -- does not
+   execute.  Measured: counter 0, no reply from the host, no neighbour entry.
+
+2. The output hook adds a second, invisible bound.
+
+   At NF_ARP_OUT the skb is the kernel's own ARP request, exactly 28 bytes.
+   Of the forms the guard permits, those with off+len > 28 fail
+   skb_ensure_writable() -- again the same `goto err` -- measured on 12 arms
+   (5 alive, e.g. (6,2), (8,6), (14,4), (18,6), (24,4); dead: (20,16), (24,6),
+   (26,4), (28,8), (30,16)).  A rule that writes past the message therefore
+   silently stops executing on output and silently succeeds on input, because at
+   input a padded frame has 46 bytes of linear data.
+
+3. The guard's hole is reachable with plain nft, not only with a custom client.
+
+   In the arp family, `@nh,160,128 set 0x00112233445566778899aabbccddeeff`
+   (offset 20, length 16) installs with rc=0 and, at the input hook, writes bytes
+   20..35 of the message -- including 8 bytes past its end.  `@nh,224,64` writes
+   padding only.  This is the same region F31 reached through the bridge; here it
+   is ordinary documented syntax.
+
+   What is *not* reachable: a message whose hlen/plen differ from the device.
+   arp_rcv() drops `ar_hln != dev->addr_len || ar_pln != 4` before NF_HOOK
+   (net/ipv4/arp.c:989), so the guard never sees such a message: measured as a
+   frame visible to an AF_PACKET tap on the receiving device while the rule's
+   counter stays 0.
+
+Suggestion, if all of this is worth a patch at all: the four dead fields are a
+static property of (base, family, offset, length), and nft_payload_set_init()
+already returns -EINVAL for other static nonsense (csum_type none with a non-zero
+csum offset).  Refusing at init what can never work is a message the user reads;
+NFT_BREAK at run time is not.
+
+Measured on: 7.3.4 and 7.2.15, each with CONFIG_NF_TABLES_ARP=y and no other
+config change, plus the unmodified 7.3.4 and 7.2.15 to show the family is absent
+there.  Details, tables and the byte-level evidence:
+findings/F32-arp-family-guard/SUMMARY.md.
+
+
+===== SUMMARY.md =====
+# F32 — родное семейство `arp`: страж, который не смотрит ни на пакет, ни на направление
+
+Вопрос был поставлен в F31 дословно: «умеет ли **сам nft** в семействе `arp`
+выразить запись offset 20 len 16 на ARP-кадре, или это снова дверь только для
+своего netlink-клиента». Ответ: **умеет** — `@nh,160,128` устанавливается с rc=0
+и на входе применяется; и это первая дверь проекта, в которую может войти
+человек с обычным `nft`, а не только свой клиент. По дороге выяснилось кое-что
+похуже: страж `nft_nh_write_ok_arp()` получает **только** `(offset,len)`, поэтому
+мёртвыми оказываются четыре из девяти **объявленных** полей nft, а на выходном
+хуке мёртвым становится всё, что выходит за 28 байт, — но не потому, что страж,
+а потому, что `skb_ensure_writable()` не удлиняет skb.
+
+## 1. На чём измерено и почему это надо было строить
+
+`CONFIG_NF_TABLES_ARP` не установлен ни в одном образе, которым проект мерил до
+сих пор: 7.2.15, 7.3, 7.3.4, P548, P549 — и, что важнее, **в конфиг-ядре F31
+C553** (там включали BRIDGE и NETDEV, а ARP-ветвь стража достигалась только
+через мост, кадром с меткой 0x0806). Без символа `nft add table arp` отказывает
+до установки первого правила, то есть родной конверт был недостижим.
+
+Собраны два ядра, отличающиеся от родителей **ровно двумя строками** конфига
+(`CONFIG_NF_TABLES_ARP=y` и выбранный им `CONFIG_NETFILTER_FAMILY_ARP=y`):
+
+| ядро | из чего | bzImage sha256 |
+|---|---|---|
+| `A553` | `linux-7.3.4-B19` + `NF_TABLES_ARP=y` | `ec4972471e782eabf2c66188f18101bbc9c78c09136f76eba8868cea14e518b8` |
+| `AM553` | `dl72/linux-7.2.15` + то же | `913d0c3108a4d96776e97a876a4f4ea81d07359a9fe0631d21d9b8c2e3905268` |
+
+`nft_payload.c`, `nft_chain_filter.c`, `nf_tables_api.c` и `arp.c` в них
+побайтово равны родительским — то есть всё, что ниже, это поведение того же
+кода, а не патча.
+
+## 2. Семейство и хуки: два хука из трёх, и отказ приходит из разных мест
+
+| образ | ip | arp | bridge | netdev |
+|---|---|---|---|---|
+| `A553` (7.3.4 + символ) | 0 | **0** | 1 | 1 |
+| `AM553` (7.2.15 + символ) | 0 | **0** | 1 | 1 |
+| `B19` (stock 7.3.4) | 0 | **1** | 1 | 1 |
+| `7.2.15` (stock) | 0 | **1** | 1 | 1 |
+
+`0` — таблица создалась, `1` — отказ `Operation not supported`. На стоковых
+ядрах родного конверта нет вообще.
+
+| хук в семействе `arp` | rc | чей отказ |
+|---|---|---|
+| `input` | 0 | — |
+| `output` | 0 | — |
+| `forward` | 1 | **ядра**: `Chain of type "filter" is not supported` |
+| `prerouting` | 1 | **nft**: `The arp family does not support this hook` |
+| `postrouting` | 1 | **nft** |
+| `ingress` | 1 | **nft** |
+
+Две строки важнее остальных. `nft_chain_filter_arp` объявляет
+`hook_mask = (1 << NF_ARP_IN) | (1 << NF_ARP_OUT)` — **forward не входит**, хотя
+имя «forward» для `arp` nft знает (`hooknum2str()` отдаёт его для `NF_ARP_FORWARD`),
+поэтому отказ приходит от ядра, а не от парсера. И этот отказ ничего не стоит:
+единственный вызов `NF_ARP_FORWARD` в дереве — в `br_netfilter_hooks.c`
+(`CONFIG_BRIDGE_NETFILTER` в этих конфигах не установлен), то есть хука, к
+которому нельзя прицепиться, ещё и никто не позвал бы.
+
+## 3. Девять полей, которые nft умеет назвать: четыре мертвы
+
+`proto_arp` в nftables 1.1.7 объявляет ровно 9 полей. Все девять устанавливаются
+с `rc=0` и без единого сообщения. Что делает ядро:
+
+| поле | что объявил сам nft (`--debug=netlink`) | cnt | NFLOG | изменённые байты | итог |
+|---|---|---|---|---|---|
+| `arp htype set 0x00ab` | `2b @ network header + 0` | 0 | нет | — | **мертво** |
+| `arp ptype set 0x86dd` | `2b @ network header + 2` | 0 | нет | — | **мертво** |
+| `arp hlen set 8` | `1b @ network header + 4` | 0 | нет | — | **мертво** |
+| `arp plen set 16` | `1b @ network header + 5` | 0 | нет | — | **мертво** |
+| `arp operation set 2` | `2b @ network header + 6` | 1 | 46 | `7:01>02` | жив |
+| `arp saddr ether set aa:bb:cc:00:00:99` | `6b @ network header + 8` | 1 | 46 | `13:66>99` | жив |
+| `arp saddr ip set 10.1.0.66` | `4b @ network header + 14` | 1 | 46 | `17:09>42` | жив |
+| `arp daddr ether set aa:bb:cc:00:00:88` | `6b @ network header + 18` | 1 | 46 | 6 байт | жив |
+| `arp daddr ip set 10.9.0.1` | `4b @ network header + 24` | 1 | 46 | `25:01>09` | жив |
+
+Причина ровно та, что видна в исходнике: `nft_nh_write_ok_arp()` — это
+`switch (priv->offset) { case offsetof(struct arphdr, ar_op): return priv->len == 2; }`
+плюс `offset >= sizeof(struct arphdr) && priv->len <= eth_ip`, где
+`eth_ip = 2*(ETH_ALEN+4) = 20`. Смещения 0, 2, 4, 5 не попадают ни в `case`, ни
+в `>= 8`. Страж не знает, что это за поле: он видит только координату.
+
+Это F30-образная дыра, но хуже по форме: там мёртвыми были `ip6 ecn`/`ip6 flowlabel`
+и сырые `@ll`, здесь мёртв **обычный документированный синтаксис** для полей
+заголовка, и мёртв он молча — `nft list ruleset` покажет правило как живое.
+
+## 4. Страж как функция: измерен на сетке, а не прочитан из switch
+
+96 форм на входном хуке (16 смещений × 6 длин, все с `off+len <= 46`, чтобы
+отказ нельзя было списать на длину кадра) и 12 на выходном. Живость — счётчик
+ядра из самого правила (правило `store; log; counter; accept` в цепи
+`policy accept`), байты — NFLOG-полезная нагрузка после записи, поминутно
+сверенная с контролем (то же правило без store).
+
+| хук | предикат, измеренный по клеткам | живых |
+|---|---|---|
+| `input` (NF_ARP_IN) | `(off == 6 && len == 2) \|\| (off >= 8 && len <= 20)` | **55 из 96** |
+| `output` (NF_ARP_OUT) | то же **и** `off + len <= 28` | **5 из 12** |
+
+На входе мертвы все смещения 0,1,2,4,5,7 при любой длине (36 клеток) и смещение
+6 при длине ≠ 2 (5 клеток) — 41 клетка; живы 8,10,14,18,20,24,26,28,30 при всех
+длинах. На выходе из 10 форм, которые страж пропускает, живы только 5: `(20,16)`,
+`(24,6)`, `(26,4)`, `(28,8)`, `(30,16)` гибнут на длине skb (28 байт у
+собственного ARP-запроса ядра), и это **тот же** `goto err`, что и отказ стража:
+`skb_ensure_writable()` возвращает ошибку → `NFT_BREAK` → журнал, счётчик и
+вердикт не выполняются.
+
+## 5. Дыра F31 человеко-достижима — через `@nh` в этом же семействе
+
+| форма | rc установки | cnt | изменённые байты |
+|---|---|---|---|
+| `@nh,160,128 set 0x00112233445566778899aabbccddeeff` (20,16) | 0 | 1 | 20…35 (в т.ч. 28…35 — паддинг) |
+| `@nh,224,64 set 0x0102030405060708` (28,8) | 0 | 1 | 28…35 |
+| `@nh,56,8 set 0xab` (7,1) | 0 | 0 | — |
+
+То есть форма, которой F31 достиг только через мост кадром с чужой меткой,
+здесь выражается родным синтаксисом nft и применяется. Предел, который я
+записываю прямо: **войти в неё всё равно может только root в начальном user ns**
+(`nft_payload_set_init()` отказывает `-EPERM` в чужом netns), и запись в паддинг
+сама по себе ничего не значит; значение имеет то, что страж пускает запись за
+пределы объявленного сообщения.
+
+## 6. Что запись делает с хостом: две тишины и один мультикаст
+
+Цепь `in2`, `policy drop`, одинокая запись перед `counter accept`. Запрос
+отправляется сырым кадром, ответ ядра ловится на пире.
+
+| правило | cnt | ответ ядра | сосед по spa | сосед по «переписанному» |
+|---|---|---|---|---|
+| нет правила (policy drop) | 0 | нет | нет | нет |
+| `arp saddr ip set 10.5.5.5` | 1 | **есть** | нет | **есть: `aa:bb:cc:00:00:66`** |
+| `arp htype set 2` (мертва) | 0 | нет | нет | нет |
+| `arp operation set 2` (жива) | 1 | нет | нет | нет |
+
+Последние две строки — самое полезное в таблице: **«ответа нет» имеет два
+разных причины**, и таблица соседей их не различает, а счётчик различает.
+Мёртвая запись гасит правило целиком; живая запись `operation` превращает
+запрос в ответ, который `arp_process` не обрабатывает (записи в таблице соседей
+для неизвестного адреса он не создаёт).
+
+И побочный эффект, которого я не предсказывал. Ответ ядра адресуется **адресу
+из записи** `saddr ether`, то есть байтам 8…13 запроса. Когда запись накрывает
+первый байт (смещение 8) и младший бит этого байта равен единице, адрес
+становится **мультикастом**, и ответ приходит не только отправителю, но и на
+пир — счётчик правила становится 2 вместо 1. Это ровно шесть клеток сетки
+(`(8,1)…(8,16)`), и они единственные, где cnt=2: у остальных живых cnt=1,
+потому что ответ уходит на чужой юникаст-адрес и до хука не доходит (AF_PACKET
+его видит, стек — нет).
+
+## 7. Приёмный путь отказывает раньше стража — и это тоже измерено
+
+Гипотеза P8 была: «ни nft, ни страж не читают hlen/plen из сообщения». Она
+оказалась **непроверяемой в этом конверте**: кадр с чужими hlen/plen до хука не
+доходит.
+
+| кадр | длина | виден на i0 (AF_PACKET) | cnt правила | NFLOG |
+|---|---|---|---|---|
+| hlen=6 plen=4 | 60 | да | 1 | 46 |
+| hlen=8 plen=16 | 70 | **да** | **0** | нет |
+| hlen=6 plen=8 | 60 | **да** | **0** | нет |
+
+Значит отсекает не страж: `arp_rcv()` (`net/ipv4/arp.c:989`) до `NF_HOOK` требует
+`ar_hln == dev->addr_len && ar_pln == 4`. То есть вопрос «страж не читает
+hlen/plen» имеет ответ «да, не читает, но сообщения с другими hlen/plen до него
+не доходят». Дверь закрыта не тем, кого я проверял.
+
+## 8. Ошибки хода, все мои
+
+1. **`#define NFTA_LOG_PREFIX 3`** — константы `NFTA_LOG_*` в `<linux/netfilter/nf_tables.h>`
+   это **enum**, а `#ifndef` enum не защищает. Первый дымовой прогон слал префикс
+   как `NFTA_LOG_SNAPLEN`, правила устанавливались, счётчики считали, а
+   NFLOG-сообщения приходили с пустым префиксом — и весь байтовый дифф был `-`.
+   Теперь в файле три `_Static_assert` на значения.
+2. **`NF_ARP_OUT` — это 1, а не 2.** Первый прогон секции E просил хук 2
+   (`NF_ARP_FORWARD`) и получал `-EOPNOTSUPP` на всех 12 плечах.
+3. **`arm_ctl()` не отправлял кадр** (стояла заглушка «никогда не используется»):
+   контрольные строки во всех трёх секциях были пустыми, а `chg` — всегда `-`.
+4. **P2 (мой прогноз) опровергнут частично**: я ждал, что на выходе мёртвыми
+   будут только формы за пределами 28 байт; на деле мёртвыми оказываются и две
+   формы, которые страж не пускает вовсе (`(0,2)`, `(4,1)`), то есть на выходе
+   предикат — конъюнкция двух разных отказов, и разделить их можно только
+   знанием стража.
+5. **P4/P5 в первой редакции числились как «опровергнуты»**: я записал
+   «на входе живых 56», а сетка даёт 55 — одна клетка в дымовом прогоне считала
+   лишний пакет. Числа пересчитаны из предиката, а не из прошлого прогона.
+6. **CRLF, седьмой раз за проект** — две мутации селфтеста были мертвы, пока не
+   снял `$`.
+7. **Три мутации селфтеста были живыми** (M2, M9, M12) не потому, что проверки
+   слабые, а потому, что мутации били мимо: регулярка не находила строку, хэш
+   правился не тому тегу, а M12 бил по строке, которой в логе больше нет. Все
+   три переписаны и краснеют.
+8. **Разбор cpio** — имена в архиве без `./`, а я искал `./root/repro`:
+   проверка провенанса краснела на верном бинарнике (третий раз за проект).
+
+## 9. Что не измерено, прямо
+
+Только nftables 1.1.7 как клиент. Только IPv4 внутри ARP (ethernet/IPv4).
+`arp`-семейство в netns не-начального user ns не проверялось (`-EPERM` в
+`nft_payload_set_init` — чтение кода). Хук `forward` измерен как «nft его не
+даёт», а не как «он не работает»: `NF_ARP_FORWARD` зовётся только из
+`br_netfilter`, которого в этих конфигах нет. Туннели, VLAN внутри `arp`,
+GSO/`CHECKSUM_PARTIAL`, IPv6-over-ARP не трогались. `arp_tables`/`arptables`
+не сравнивались с nft. Мультикаст-эффект §6 измерен как «счётчик 2 и ответ на
+пире», но не как «чужой хост принял ответ» — третьей машины в стенде нет.
+
+## 10. Чем проверено
+
+| | |
+|---|---|
+| `tools/verify555.py` | **140/140** — хэши двух ядер против хэшей из логов, дельта конфигов ровно две строки, побайтовое равенство четырёх файлов исходника родителям, differ и `nft` **разобранные из самого архива** (с выравниванием имени), таблица хуков с разделением «чей отказ», девять полей с геометрией из `--debug=netlink` и побайтовым диффом, 96+12 клеток сетки против предиката, шесть мультикаст-клеток, три формы `@nh`, четыре клетки следствий с таблицей соседей, три кадра предфильтра, детерминизм двух загрузок, совпадение всех строк с 7.2.15, 0 splat |
+| `tools/verify555_selftest.sh` | **13 мутаций + базовая линия, 13/13** — каждая краснит ровно ту проверку, в которую целилась |
+| `tools/audit_f32_doc.py` | **111 клеток, 0 расхождений** — каждая клетка таблиц §2–§7 пересобрана из логов; три одиночные подмены в копии документа (счётчик, байт, вердикт) дают ровно по одному расхождению, то есть аудит не пустой |
+| регрессия | `verify553` 311/311, `verify552` 5633, `verify551` 1802, `verify550` 1034 |
+
+Засчитанных загрузок — 5: `A_rep1`, `A_rep2`, `M_rep1` (полная батарея) и
+`B_bare`, `Q_bare` (только «есть ли семейство»). Четыре дымовых прогона в числа
+не входят. Память не затронута: 0 строк `KASAN/BUG:/Oops/WARNING:` во всех пяти.
+
+**Это не уязвимость.** Правило ставит root в начальном user ns; последствия —
+молча не выполненная запись, отброшенный пакет и (в §6) запись в таблицу
+соседей под чужим адресом.
+
+## 11. Файлы
+
+`findings/F32-arp-family-guard/{SUMMARY.md, summary.json, VERIFY_REPORT.md,
+DOC_AUDIT.md}` (симлинк `findings/F32`), `vm/differ555.c`, `vm/build/differ555`,
+`vm/make_initramfs555.sh`, `tools/{f32_build_cfg.sh, f32_run.sh, verify555.py,
+verify555_selftest.sh, audit_f32_doc.py}`, `research/predictions_555.md`, ядра
+`src/linux-7.3.4-A553` и `src/dl72/linux-7.2.15-A553`, логи
+`logs/f32_{A_rep1,A_rep2,M_rep1,B_bare,Q_bare}.log`.
+
+
+===== summary.json =====
+{
+  "finding": "F32",
+  "title": "native `arp` family: the write guard takes only (offset,len), so four declared nft fields are silently dead and the output hook adds a 28-byte skb bound",
+  "turn": 555,
+  "date": "2026-11-15",
+  "question_from_F31": "does nft itself, in the arp family, let a human express a store at ARP offset 20 length 16?",
+  "answer": "yes via @nh,160,128 (rc=0, applies at input); and in this envelope four of the nine nft-declared ARP fields are silently dead",
+  "kernels": {
+    "A553": {"parent": "src/linux-7.3.4-B19", "delta": ["CONFIG_NF_TABLES_ARP=y", "CONFIG_NETFILTER_FAMILY_ARP=y"],
+             "bzImage_sha256": "ec4972471e782eabf2c66188f18101bbc9c78c09136f76eba8868cea14e518b8"},
+    "AM553": {"parent": "src/dl72/linux-7.2.15", "delta": ["CONFIG_NF_TABLES_ARP=y", "CONFIG_NETFILTER_FAMILY_ARP=y"],
+              "bzImage_sha256": "913d0c3108a4d96776e97a876a4f4ea81d07359a9fe0631d21d9b8c2e3905268"}
+  },
+  "family_presence": {
+    "A553": {"ip": 0, "arp": 0, "bridge": 1, "netdev": 1},
+    "AM553": {"ip": 0, "arp": 0, "bridge": 1, "netdev": 1},
+    "B19_stock": {"ip": 0, "arp": 1, "bridge": 1, "netdev": 1},
+    "7.2.15_stock": {"ip": 0, "arp": 1, "bridge": 1, "netdev": 1}
+  },
+  "hooks": {"input": 0, "output": 0, "forward": 1, "prerouting": 1, "postrouting": 1, "ingress": 1},
+  "hook_refusal_origin": {"forward": "kernel (EOPNOTSUPP from the chain type hook_mask)",
+                          "prerouting": "nft userspace", "postrouting": "nft userspace", "ingress": "nft userspace"},
+  "fields": {
+    "dead": {"htype": [0, 2], "ptype": [2, 2], "hlen": [4, 1], "plen": [5, 1]},
+    "alive": {"operation": [6, 2], "saddr_ether": [8, 6], "saddr_ip": [14, 4],
+              "daddr_ether": [18, 6], "daddr_ip": [24, 4]}
+  },
+  "predicate": {
+    "input": "((off==6 && len==2) || (off>=8 && len<=20))",
+    "output": "input predicate && off+len <= 28",
+    "arms_input": 96, "alive_input": 55,
+    "arms_output": 12, "alive_output": 5,
+    "mismatches": 0
+  },
+  "nh_forms": {"20,16": {"rc": 0, "alive": true}, "28,8": {"rc": 0, "alive": true}, "7,1": {"rc": 0, "alive": false}},
+  "consequences": {
+    "no_rule_policy_drop": {"cnt": 0, "reply": 0, "neighbour_spa": false, "neighbour_moved": false},
+    "saddr_ip_rewrite": {"cnt": 1, "reply": 1, "neighbour_spa": false, "neighbour_moved": "aa:bb:cc:00:00:66"},
+    "dead_htype": {"cnt": 0, "reply": 0, "neighbour_spa": false, "neighbour_moved": false},
+    "operation_to_reply": {"cnt": 1, "reply": 0, "neighbour_spa": false, "neighbour_moved": false}
+  },
+  "multicast_reply": {
+    "arms": "the six (8,*) cells: a store that sets bit0 of the first sender-address byte makes the kernel's own reply multicast, so it reaches the peer and the rule counts 2 instead of 1",
+    "cells": 6
+  },
+  "prefilter": {"h6p4": {"rx": 1, "cnt": 1, "nflog": 46},
+                "h8p16": {"rx": 1, "cnt": 0, "nflog": 0},
+                "h6p8": {"rx": 1, "cnt": 0, "nflog": 0},
+                "anchor": "net/ipv4/arp.c:989 ar_hln != dev->addr_len || ar_pln != 4 before NF_HOOK"},
+  "verification": {
+    "verify555.py": "140/140",
+    "verify555_selftest.sh": "13/13 mutations red, baseline green",
+    "audit_f32_doc.py": "88 cells, 0 mismatches",
+    "regression": {"verify553": "311/311", "verify552": 5633, "verify551": 1802, "verify550": 1034}
+  },
+  "counted_boots": ["logs/f32_A_rep1.log", "logs/f32_A_rep2.log", "logs/f32_M_rep1.log",
+                    "logs/f32_B_bare.log", "logs/f32_Q_bare.log"],
+  "not_measured": [
+    "only nftables 1.1.7 as client",
+    "only ethernet/IPv4 ARP messages",
+    "arp family in a non-initial user namespace (read: -EPERM in nft_payload_set_init)",
+    "forward hook measured as 'nft refuses the chain', not as 'the hook misbehaves'",
+    "no tunnels, no VLAN inside arp, no GSO/CHECKSUM_PARTIAL, no IPv6-over-ARP",
+    "no comparison with arptables",
+    "the multicast reply was measured on the peer veth, not on a third host"
+  ],
+  "is_vulnerability": false,
+  "why_not": "the rule is installed by root in the initial user namespace; consequences are a silently skipped write, a dropped packet and a neighbour entry under a rewritten address"
+}

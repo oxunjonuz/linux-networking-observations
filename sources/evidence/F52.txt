@@ -1,0 +1,459 @@
+===== LETTER_SECTION_F52.txt =====
+To: netfilter-devel@vger.kernel.org
+Cc: pablo@netfilter.org, kadlec@netfilter.org
+Subject: Re: nft_payload: a static transport-store check is enforced at runtime,
+ and 14 nft spellings die silently (`tcp flags set` regressed in v7.3)
+In-Reply-To: <Message-Id of the report this follows up -- take it from the sent
+ mail; I do not hold it, so this line has to be filled in before sending>
+References: <the same Message-Id>
+
+STATUS: NOT SENT. Follow-up to the F28 report; no patch is proposed.
+
+Theme: on a VLAN-tagged frame the `@ll` base is not the frame.  With the tag in
+`skb->vlan_proto`/`skb->vlan_tci`, `nft_payload_copy_vlan()` rebuilds `struct
+vlan_ethhdr` and the inner ethertype sits at `@ll,16`, not `@ll,12`; once a
+VLAN sub-interface exists the tag is cleared and the whole domain shifts four
+bytes earlier, so the same rule reads different bytes depending on a piece of
+configuration that appears nowhere in it.  And a store into the TCI is a store
+into the skb, not into the frame: writing 0 there changes no byte on the wire
+and turns a frame the IP stack silently drops (`PACKET_OTHERHOST`, no IPv6
+counter moves) into a delivered datagram.
+
+No diff below: this measures the LL base, the store semantics and the guard as
+they stand and proposes no change.
+
+What was measured (7.3.4-T563, one bridge with three ports, one frame seen at
+five doors -- bridge prerouting, bridge forward, bridge local-in, ip6
+prerouting, and netdev ingress at the far end):
+
+* A tagged frame (vid 100) is counted by the bridge three times (`brp` 1,
+  `brf` 2, `brl` 1), reaches the far end's ingress hook, and **never reaches an
+  IPv6 hook**: `ip6` prerouting 0, `Ip6InReceives` 0, `Ip6InDiscards` 0.  The
+  only counters that move are `rx_otherhost_dropped` on `br0` and on both
+  ports, because `__netif_receive_skb_core()` sets
+  `pkt_type = PACKET_OTHERHOST` when `skb_vlan_tag_get_id(skb) != 0` and
+  `vlan_do_receive()` found no VLAN device (`dev.c:6207`), and
+  `ip6_rcv_core()` returns on that pkt_type before `IPSTATS_MIB_IN`
+  (`ip6_input.c:196` before `:206`).  The same frame with vid 0 is delivered.
+* `@ll` on that frame reads the frame **with** its tag: 12..13 = `8100`, 14..15
+  = the TCI, 16..17 = `86dd`, 18..19 = the first bytes of the IPv6 header --
+  the 84 bytes that were injected, while the AF_PACKET taps show the 80-byte
+  post-untag frame.  A rule spelling `@ll,12,2 = 86dd` cannot match a tagged
+  frame; the inner ethertype is at 16.
+* `@ll,14,2 = 0000` at the bridge door is accepted, writes no byte
+  (`nft_payload_set_vlan()` returns before `skb_ensure_writable()`,
+  `nft_payload.c:1129`), and the frame that was undeliverable is delivered.
+  `@ll,14,4` is refused at evaluation time and leaves no trace: the rule's own
+  counter is 0 and it logs nothing.
+* `@ll,12,2 = 0806` sets `skb->vlan_proto` only.  Because `veth` advertises
+  `NETIF_F_HW_VLAN_CTAG_TX`, `validate_xmit_vlan()` pushes only non-0x8100
+  protos into the bytes -- that is the one arm in which the tag is a byte on the
+  wire (84 bytes, `0806 0064 86dd` at 12..17).
+* `@ll,12,4 = 0000 0000` zeroes both fields at once.  `skb_vlan_tag_present()`
+  is `!!skb->vlan_all` (`if_vlan.h:82`) and `__vlan_hwaccel_put_tag()` stores no
+  present bit, so the tag is **deleted**: the wire is 80 bytes, no byte changed,
+  and the frame is delivered.
+* With `br0.100` up the same frame is delivered -- and the LL domain moves four
+  bytes earlier: 12 is `86dd` (not `8100`), 14 is `6000` (not the TCI), 16 is
+  `0000`, 18 is the payload length.  `vlan_do_receive()` finds the device,
+  `VLAN_FLAG_REORDER_HDR` (`vlan.c:276`) skips the re-insertion, the tag is
+  cleared (`vlan_core.c:61`) and `nft_payload_eval()` falls back to
+  `skb_mac_header() - skb->data` (`nft_payload.c:184`).
+* A store into the TCI at the bridge **forward** door is evaluated once per port
+  copy and reaches exactly that copy: the far end reads the new TCI while the
+  local copy, which never passed that door, keeps vid 100 and stays dead.
+
+Not measured here: 802.1ad, two tags, `VLAN_FLAG_REORDER_HDR` cleared, a VLAN
+device on a port, and a physically tagged 0x8100 frame (this veth pair cannot
+produce one).  Rules are installed by root in the initial user namespace, so
+none of this is a privilege boundary; what it shows is that the meaning of an
+`@ll` offset and the fate of a packet depend on state the rule cannot see.
+
+-- a measurement, not a patch
+
+
+===== SUMMARY.md =====
+# F52 -- the tag is not in the frame: a 4-byte store that changes no byte decides whether the packet lives
+
+Kernel 7.3.4-T563 (`1efbc957…2033`), no new build. Instrument `differ574`, mode
+`tag`: the F51 bridge (three veth pairs, `br0` with the ports `x1`,`y1`,`z1`,
+IPv6 only on `br0`), **five doors of one frame** -- `brp` (bridge prerouting),
+`brf` (bridge forward, once per port copy), `brl` (bridge local-in), `in6` (ip6
+prerouting) and `ndy` (netdev ingress on the far end `y0`). Three frames, all
+broadcast, IPv6 `fd02::11 -> fd02::92`, UDP 40000->5000: **A** plain, **B**
+802.1Q TCI `0x0064` (vid 100), **C** 802.1Q TCI `0x0000` (a priority tag).
+33 arms in each of two boots; all derived facts of the two boots are identical
+line for line once the MACs the kernel picks per boot are normalised.
+
+This closes the two holes named at the end of F51: why the local copy of a
+tagged frame never reaches the ip6 door although `brl` counts it, and why
+`@ll,12,2` at the bridge door is not the inner ethertype although the taps show
+`86dd` at 12..13.
+
+## 1. The census, and a death that no IPv6 counter sees
+
+One tagged frame, five doors:
+
+## T1 -- the census of five doors and the fate of the local copy
+| arm | frame | door | brp | brf | brl | in6 | ndy | u6n | br0 otherhost | y0 otherhost | z0 otherhost |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| c100 | B | - | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 1 | 1 |
+| r0 | B | brp | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 1 | 1 |
+| r6 | B | brp | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 1 | 1 |
+| r12t | B | brp | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 1 | 1 |
+| r12i | B | brp | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 1 | 1 |
+| r14 | B | brp | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 1 | 1 |
+| r16 | B | brp | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 1 | 1 |
+| r18 | B | brp | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 1 | 1 |
+| nh7 | B | brp | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 1 | 1 |
+| nh0 | B | brp | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 1 | 1 |
+| brl16 | B | brl | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 1 | 1 |
+| ndy14 | B | ndy | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 1 | 1 |
+| w14_same | B | brp | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 1 | 1 |
+| w14_0 | B | brp | 1 | 2 | 1 | 1 | 1 | 1 | 0 | 0 | 0 |
+| w14_len4 | B | brp | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 1 | 1 |
+| w12_p | B | brp | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 0 | 0 |
+| w16 | B | brp | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 1 | 1 |
+| w0d | B | brp | 1 | 2 | 0 | 0 | 1 | 0 | 0 | 1 | 1 |
+| w12_4 | B | brp | 1 | 2 | 1 | 1 | 1 | 1 | 0 | 0 | 0 |
+| wf14 | B | brf | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 0 | 0 |
+| wf14_ndy | B | brf | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 0 | 0 |
+| c0 | C | - | 1 | 2 | 1 | 1 | 1 | 1 | 0 | 0 | 0 |
+| w14_100 | C | brp | 1 | 2 | 1 | 0 | 1 | 0 | 1 | 1 | 1 |
+| vd_c | B | - | 1 | 2 | 1 | 1 | 1 | 1 | 0 | 1 | 1 |
+| vd_r16i | B | in6 | 1 | 2 | 1 | 1 | 1 | 1 | 0 | 1 | 1 |
+| vd_r12 | B | in6 | 1 | 2 | 1 | 1 | 1 | 1 | 0 | 1 | 1 |
+| vd_r12i | B | in6 | 1 | 2 | 1 | 1 | 1 | 1 | 0 | 1 | 1 |
+| vd_r14 | B | in6 | 1 | 2 | 1 | 1 | 1 | 1 | 0 | 1 | 1 |
+| vd_r16 | B | in6 | 1 | 2 | 1 | 1 | 1 | 1 | 0 | 1 | 1 |
+| vd_r16old | B | in6 | 1 | 2 | 1 | 1 | 1 | 1 | 0 | 1 | 1 |
+| vd_r18 | B | in6 | 1 | 2 | 1 | 1 | 1 | 1 | 0 | 1 | 1 |
+| vd_c0 | C | - | 1 | 2 | 1 | 1 | 1 | 1 | 0 | 0 | 0 |
+
+`brp` 1, `brf` 2, `brl` 1 -- the bridge sees the frame, floods it to both ports
+and hands the original to its own stack. `in6` **0** and `u6n` **0**: the local
+copy dies. `ndy` 1: the port copies reach the far end's ingress hook.
+
+Nothing in IPv6 moves:
+
+## T6 -- the counters of a death that no IPv6 counter sees
+| arm | in6 door | Ip6InReceives | Ip6InDiscards | Ip6InDelivers | br0 otherhost | y0 otherhost | br0 rx_packets |
+|---|---|---|---|---|---|---|---|
+| c100 | 0 | 0 | 0 | 0 | 1 | 1 | 1 |
+| w14_0 | 1 | 3 | 2 | 1 | 0 | 0 | 1 |
+| w12_4 | 1 | 3 | 2 | 1 | 0 | 0 | 1 |
+| c0 | 1 | 3 | 2 | 1 | 0 | 0 | 1 |
+| w14_100 | 0 | 0 | 0 | 0 | 1 | 1 | 1 |
+| vd_c | 1 | 1 | 0 | 1 | 0 | 1 | 1 |
+
+The mechanism is two lines that are not in the VLAN code and not in nft:
+
+* `net/core/dev.c:6203-6211` -- after the rx handler and after
+  `vlan_do_receive()` could not find a VLAN device, `if (skb_vlan_tag_get_id(skb))`
+  sets `skb->pkt_type = PACKET_OTHERHOST`;
+* `net/ipv6/ip6_input.c:196` -- `ip6_rcv_core()` returns on `PACKET_OTHERHOST`
+  **before** `__IP6_UPD_PO_STATS(… IPSTATS_MIB_IN …)` at line 206.
+
+So the drop is invisible to `Ip6InReceives`, `Ip6InDiscards`, `Ip6InHdrErrors`
+and every other IPv6 counter; the only witnesses are `rx_otherhost_dropped` on
+`br0` and on both ports, and `Ip6InReceives` stays 0. A frame with vid 0 (C)
+takes the other branch -- `skb_vlan_tag_get_id() == 0`, `eth_type_vlan(skb->protocol)`
+is false (the protocol is already `86dd`) -- the tag is cleared and the datagram
+is delivered: `in6` 1, `u6n` 1, `Ip6InReceives` 3 (the local copy plus both
+ports, where IPv6 is off and the arrival is counted and discarded),
+`Ip6InDiscards` 2, and **no** `rx_otherhost_dropped` anywhere.
+
+## 2. `@ll` on a tagged frame is the tagged frame
+
+Every cell below is a match against the value the rule asked for, at `brp`:
+
+## T2 -- `@ll` at the bridge door of the tagged frame (no VLAN device)
+| arm | offset | len | imm | fires | ch |
+|---|---|---|---|---|---|
+| r0 | 0 | 6 | ffffffffffff | yes | 1 |
+| r6 | 6 | 6 | 222dd0a3e660 | yes | 1 |
+| r12t | 12 | 2 | 8100 | yes | 1 |
+| r12i | 12 | 2 | 86dd | no | 0 |
+| r14 | 14 | 2 | 0064 | yes | 1 |
+| r16 | 16 | 2 | 86dd | yes | 1 |
+| r18 | 18 | 2 | 6000 | yes | 1 |
+| nh7 | 7 | 1 | 40 | yes | 1 |
+| nh0 | 0 | 4 | 60000000 | yes | 1 |
+
+`@ll` reads the frame as if the tag were present in the bytes: 12..13 =
+`8100`, 14..15 = the TCI, 16..17 = `86dd`, 18..19 = the first two bytes of the
+IPv6 header. Byte for byte this is the 84-byte frame that was injected -- and
+not the 80-byte frame the taps show, which is the post-untag view (`packet_rcv`
+pushes from `skb->data` back to `skb_mac_header`, and `skb_vlan_untag()` moved
+that header by four). The mechanism is `nft_payload_copy_vlan()`
+(`nft_payload.c:44`): for `offset + len > offsetof(struct ethhdr, h_proto)` it
+rebuilds `struct vlan_ethhdr` with `h_vlan_proto = skb->vlan_proto`,
+`h_vlan_TCI = skb_vlan_tag_get(skb)` and
+`h_vlan_encapsulated_proto = skb->protocol` (`:35-37`). `@nh` is untouched by
+the tag: hop limit 40 and `60000000` both fire.
+
+So F51's contradiction is not one: the tap shows the frame after the kernel
+removed the tag, `@ll` shows the frame with the tag put back from the skb. Both
+are right about different layers, and the inner ethertype of a tagged frame is
+at `@ll,16`, not `@ll,12`.
+
+## 3. Four bytes that decide the fate, and one that changes nothing
+
+One accepted store at `brp` into the tagged header, and what the wire carries:
+
+## T4 -- stores into the four tagged bytes: what the wire carries
+| arm | store | rcs | ch | u6n | br0 otherhost | y0 tap len | y0 tap 12..17 |
+|---|---|---|---|---|---|---|---|
+| w14_same | @ll,14,2 = 0064 | 0 | 1 | 0 | 1 | 80 | 86dd60000000 |
+| w14_0 | @ll,14,2 = 0000 | 0 | 1 | 1 | 0 | 80 | 86dd60000000 |
+| w14_len4 | @ll,14,4 = 00000000 | 0 | 0 | 0 | 1 | 80 | 86dd60000000 |
+| w12_p | @ll,12,2 = 0806 | 0 | 1 | 0 | 1 | 84 | 0806006486dd |
+| w16 | @ll,16,2 = 0800 | 0 | 1 | 0 | 1 | 80 | 080060000000 |
+| w0d | @ll,0,6 = 909192939495 | 0 | 1 | 0 | 0 | 80 | 86dd60000000 |
+| w12_4 | @ll,12,4 = 00000000 | 0 | 1 | 1 | 0 | 80 | 86dd60000000 |
+| wf14 | @ll,14,2 = 0000 | 0 | 2 | 0 | 1 | 80 | 86dd60000000 |
+| wf14_ndy | @ll,14,2 = 0000 | 0 | 2 | 0 | 1 | 80 | 86dd60000000 |
+| w14_100 | @ll,14,2 = 0064 | 0 | 1 | 0 | 1 | 80 | 86dd60000000 |
+
+Read the table as three different kinds of store:
+
+* **`w14_same` / `w14_0` / `w14_len4`** -- the TCI. `nft_payload_set_vlan()`
+  (`nft_payload.c:789`) writes `skb->vlan_tci` and returns before any byte is
+  touched (`:1129`: `if (!vlan_hlen) return;`). Storing the value the frame
+  already has changes nothing (still dead); storing `0000` changes **no byte of
+  the frame** -- the tap is 80 bytes, identical to the control -- and the frame
+  is **delivered** (`in6` 1, `u6n` 1, `Ip6InReceives` 3, no otherhost). The
+  refused length (`@ll,14,4`) never runs at all: the rule's own counter is 0 and
+  the rule logs nothing, so an accepted rule that does nothing leaves no trace.
+* **`w12_p`** -- the TPID. `skb->vlan_proto = 0x0806` while the TCI keeps
+  `0x0064`; the frame stays dead locally, and the ports leave with **84 bytes**
+  carrying `0806 0064 86dd` at 12..17. This is the first time in the project
+  that a VLAN tag is a byte on the wire.
+* **`w12_4`** -- four bytes at 12 set both fields at once
+  (`nft_payload_set_vlan`'s `len == 4` branch, `:806-809`) to `0000 0000`. In
+  this kernel `skb_vlan_tag_present()` is `!!skb->vlan_all`
+  (`include/linux/if_vlan.h:82`) and `__vlan_hwaccel_put_tag()` stores the TCI
+  **without** a present bit, so zeroing both fields **deletes the tag**: the
+  frame is delivered and the wire is 80 bytes. A store into the L2 domain that
+  removes the tag without removing a byte.
+
+`w16` (the inner ethertype) is the byte store that crosses into the skb's data:
+`@ll,16,2 = 0800` writes the physical byte at 16..17 and leaves `skb->protocol`
+alone, so the local copy stays IPv6 (and stays dead from vid 100) while the wire
+shows `0800` -- the protocol the stack uses is not the protocol in the bytes.
+`w0d` (`@ll,0,6`) is the one store below the tag: it rewrites the real
+destination MAC, the frame becomes an unknown unicast, and the local copy
+disappears (`brl` 0, no br0 tap) while both ports get it.
+
+## 4. Where the tag actually lives
+
+The taps of `w12_p` are 84 bytes and the taps of every other arm are 80: a
+0x8100 tag never becomes a byte here. `veth` advertises
+`NETIF_F_HW_VLAN_CTAG_TX` (`drivers/net/veth.c:1742`, `dev->hw_features =
+VETH_FEATURES` at `:1770`), so `validate_xmit_vlan()` (`net/core/dev.c:3990`)
+does not call `__vlan_hwaccel_push_inside()` for `skb->vlan_proto ==
+htons(ETH_P_8021Q)` and the tag crosses the pair in `skb->vlan_proto` /
+`skb->vlan_tci`. Any other proto is not "HW offload capable", the tag is pushed
+into the bytes, and the far end stops treating the frame as tagged at all --
+which is why `w12_p` is the only arm where the ports count no otherhost.
+
+## 5. With a VLAN device the same offset means four bytes later
+
+The same frame, the same door, the same rule, with `br0.100` up (`vd_c`: `in6`
+1, `u6n` 1, no otherhost at `br0`; the ports still count otherhost, because the
+device exists only on `br0`):
+
+## T3 -- the same offsets at the ip6 door, with br0.100 up
+| arm | offset | len | imm | ch |
+|---|---|---|---|---|
+| vd_r16i | 16 | 2 | 86dd | 0 |
+| vd_r12 | 12 | 2 | 8100 | 0 |
+| vd_r12i | 12 | 2 | 86dd | 1 |
+| vd_r14 | 14 | 2 | 6000 | 1 |
+| vd_r16 | 16 | 2 | 0000 | 1 |
+| vd_r16old | 16 | 2 | 001a | 0 |
+| vd_r18 | 18 | 2 | 001a | 1 |
+
+Offset 12 is `86dd`, not `8100`; offset 14 is `6000`, not `0064`; offset 16 is
+`0000` (the flow label), not `86dd`; offset 18 is the payload length `001a`,
+not `6000`. **The whole LL domain of a tagged frame is four bytes earlier once
+a VLAN sub-interface exists**, and a rule that spelled `@ll,12,2 = 86dd` would
+fire there and never without it.
+
+`vlan_do_receive()` (`net/8021q/vlan_core.c:18`) finds the device, and because
+`VLAN_FLAG_REORDER_HDR` is set by default (`net/8021q/vlan.c:276`) the
+re-insertion branch at `:41` is skipped and the tag is cleared at `:61`; from
+then on `skb_vlan_tag_present()` is false, `nft_payload_eval()` takes
+`offset = skb_mac_header(skb) - skb->data` (`nft_payload.c:184`), and that
+header is the 14-byte one the untag left in place. Both arms of this section
+are the same bytes on the wire -- only a piece of configuration that appears
+nowhere in the rule decides which of them the rule sees.
+
+## 6. A store at the forward door reaches that copy only
+
+## T5 -- the far end asked about the tag it received
+| arm | door2 | imm | c2 |
+|---|---|---|---|
+| wf14_ndy | ndy | 0000 | 1 |
+
+`wf14_ndy` stores `0000` into the TCI at `brf`; the door is evaluated twice
+(`brf` 2, one per port copy), and the far end reads `0000` -- the store reached
+the copy that passed that door. The local copy, which never did, keeps vid 100
+and is still dead (`in6` 0, `br0` otherhost 1). A store on a clone is a store
+on that clone; the copies made earlier are not reachable, which is the F51 rule
+seen from the other side.
+
+## 7. Errors of the turn, all mine
+
+1. `pkill -f "f52_run.sh full"` matched my own shell's command line and killed
+   it -- the third time in the project (F47 #6, F570 #6), and this time it
+   swallowed the patch that was supposed to follow, silently.
+2. My first `vd_r16b` / `vd_r18` cells carried the wrong immediate: I put the
+   IPv6 payload length at bytes 2..3 of the header, where the flow label lives,
+   and 4..5 is the length. A correct layout therefore looked like a hole until
+   the three new cells (`vd_r14`, `vd_r16`, `vd_r18`) were spelled right -- the
+   same arithmetic-against-the-header disease as F46's P10.
+3. Two arms were both named `vd_r16` (one with `86dd`, one with `0000`); the
+   verifier reported on the first. Renamed to `vd_r16i` and **both boots were
+   rerun**, so the artifact is one binary.
+4. The verifier's first model put the far end's `skb->data` at 18 for every
+   arm; the 70-byte message of `w12_p` showed that a physical tag makes it 14.
+5. The same model applied the store to the local copy even when it was made at
+   the forward door; the `br0` otherhost counter caught it.
+6. The `nfl` model counted one message too many for a forward-door store: the
+   rule is evaluated twice, so it logs twice.
+7. `cch()` read a bare `c2=1` as "no value", so one check passed without
+   looking at anything.
+8. One mutation (`x0mac`) survived because it edited the inherited F573 header
+   line, which the verifier is right to ignore -- the mutation, not the check,
+   was wrong.
+
+## 8. Predictions: 18 of 20, and the two refutations are §5 and §3
+
+P1-P15 and P17, P18, P20 held. Two did not:
+
+* **P16 refuted.** I predicted that the tag survives as metadata through the
+  VLAN device and that `@ll,16,2` is still `86dd` and `@ll,12,2` still `8100`.
+  Measured: the tag is cleared, and the LL domain shifts four bytes earlier.
+  The refutation is section 5.
+* **P19 refuted.** I predicted that a 4-byte store at 12 sets "a TPID+TCI
+  pair". It does -- and the consequence is not a retag but a **deletion**,
+  because presence here is `vlan_all != 0` and `put_tag` writes no present bit.
+  The refutation is the last row of section 3.
+
+## 9. Verified by
+
+| | |
+|---|---|
+| `tools/verify574.py` | **2666 checks, 0 mismatches** -- provenance (kernel sha in each header against the file, initrd from both headers, the differ **extracted from the initramfs** and compared with the build), 30 source anchors, the three frames byte for byte, and **every arm of both boots**: five door censuses, the fate, `Ip6In*` deltas, `rx_otherhost_dropped` on br0/y0/z0, all four taps (count, length, bytes), every NFLOG message (prefix, length, payload), the store/read outcome of each rule, all recomputed by a Python model of `skb_vlan_untag` -> `vlan_do_receive` -> the OTHERHOST assignment -> nft's LL reconstruction; plus determinism: the two boots agree line for line once the per-boot MACs are normalised |
+| `tools/verify574_selftest.sh` | **46/46** -- baseline green, 45 one-field mutations each redden the verifier without a traceback, `noop` stays green, a missing log exits 1 instead of crashing |
+| `tools/f574_summary.py` | every table in this document is its output, not a transcription |
+| `tools/audit_f52_doc.py` | regenerates all six tables and compares **every cell** with this file; three single-cell substitutions each redden exactly one cell |
+| `tools/check_letter_form.py` | 21 files, 0 |
+| collection | 524 checks / 674 with `--exec`, 0 |
+| regression | verify573 3186, verify572 5629, verify571 5974, verify570 753, verify569 3810, verify568 10088, verify567/566/563 OK, verify565 884, verify564 895, verify562 all sections 0 |
+
+## 10. What is not measured, plainly
+
+`meta vlan` / `meta protocol` on a tagged frame (the LL cells carry the tag;
+the meta expressions were not used in this instrument); 802.1ad (`0x88a8`) and
+two tags (`VLAN_MAX_DEPTH`, `dev.c:6217`); a VLAN device with
+`VLAN_FLAG_REORDER_HDR` cleared (`vlan_dev.c:57`, settable by netlink) -- that
+is the branch that would put the tag back into the bytes; a VLAN device on a
+port rather than on `br0`; a physically tagged 0x8100 frame (this veth pair
+cannot produce one, which is exactly why `w12_p` is the only 84-byte arm); the
+store at 12 with len 4 in the direction that keeps the tag (`8100 0064`); `@th`
+and `@nh` at the ip6 door of `br0.100`; GSO / `CHECKSUM_PARTIAL` on real
+hardware; more than one device in one chain.
+
+**Not a vulnerability**: the rules are installed by root in the initial user
+namespace. What the numbers show is that (a) a tagged frame with any vid is
+killed as `PACKET_OTHERHOST` with no IPv6 counter moving, (b) a store into the
+TCI can flip that fate without changing a byte, and (c) the meaning of every
+`@ll` offset on a tagged frame depends on whether a VLAN sub-interface exists.
+
+## 11. Files
+
+`findings/F52-vlan-tag/{SUMMARY.md, summary.json, VERIFY_REPORT.md,
+LETTER_SECTION_F52.txt}`; `vm/{differ574_add.c, build_f52_differ.sh,
+make_initramfs574.sh, build/differ574}`; `tools/{f52_run.sh, verify574.py,
+verify574_selftest.sh, f574_mutate.py, f574_summary.py, audit_f52_doc.py}`;
+`research/predictions_574.md`; logs `logs/f52_{rep1,rep2}.log`.
+
+Letters are untouched: the F52 material is a separate `LETTER_SECTION_F52.txt`,
+**NOT SENT**, in reply form like F29+F30, F31, F32, F36-F51. Sending is the
+owner's.
+
+
+===== summary.json =====
+{
+  "finding": "F52-vlan-tag",
+  "turn": 574,
+  "kernel": "7.3.4-T563",
+  "kernel_sha256": "1efbc95771acb424ec876dfa5c32ff1e993f5230b840c27ff00125978cbd2033",
+  "instrument": "vm/differ574 (mode tag), generated from differ573 + differ574_add.c",
+  "instrument_sha256": "fce9ab4f85962e1cd9b174054b2f95941d125b0cf6e06b842e295d02c33e3fda",
+  "boots": 2,
+  "arms_per_boot": 33,
+  "checks": 2666,
+  "mismatches": 0,
+  "selftest": "46/46",
+  "question": "Why does the local copy of a 802.1Q-tagged frame never reach the ip6 prerouting door although brl counts it, and why is @ll,12,2 at the bridge door not the inner ethertype although the taps show 86dd at 12..13?",
+  "answer_short": "A tagged frame with a non-zero vid and no VLAN sub-interface is turned into PACKET_OTHERHOST in __netif_receive_skb_core() and dies in ip6_rcv_core() before IPSTATS_MIB_IN, so no IPv6 counter moves; and @ll on a tagged frame is the TAGGED layout (12=8100, 14=TCI, 16=86dd) because nft_payload_copy_vlan() rebuilds struct vlan_ethhdr from skb->vlan_proto/vlan_tci -- the tap shows the post-untag frame, a different layer, not a contradiction. With a VLAN device the tag is cleared and the whole LL domain shifts four bytes earlier.",
+  "topology": {
+    "veth_pairs": [["x0", "x1"], ["y0", "y1"], ["z0", "z1"]],
+    "bridge": "br0",
+    "ports": ["x1", "y1", "z1"],
+    "ipv6": "br0 only, fd02::92/128, UDP6 socket on 5000; group D adds br0.100 (vid 100)",
+    "taps": ["x1", "y0", "z0", "br0"]
+  },
+  "doors": ["brp=NF_BR_PRE_ROUTING", "brf=NF_BR_FORWARD", "brl=NF_BR_LOCAL_IN", "in6=NF_INET_PRE_ROUTING", "ndy=NF_NETDEV_INGRESS on y0"],
+  "frames": {
+    "A": "plain, 86dd at 12..13, 80 bytes",
+    "B": "802.1Q TCI 0x0064 (vid 100), 84 bytes",
+    "C": "802.1Q TCI 0x0000 (priority tag), 84 bytes"
+  },
+  "door_census_frame_B": {"brp": 1, "brf": 2, "brl": 1, "in6": 0, "ndy": 1},
+  "door_census_frame_C": {"brp": 1, "brf": 2, "brl": 1, "in6": 1, "ndy": 1},
+  "claims": [
+    "One tagged frame (vid 100) is counted brp 1, brf 2, brl 1, ndy 1 and reaches no ip6 hook (in6 0, u6n 0).",
+    "The local copy is turned into PACKET_OTHERHOST by net/core/dev.c:6207 (vid != 0, no VLAN device) and ip6_rcv_core() returns on it at net/ipv6/ip6_input.c:196, before IPSTATS_MIB_IN at :206: Ip6InReceives, Ip6InDiscards and Ip6InDelivers all stay 0 and only rx_otherhost_dropped moves (+1 on br0, y0 and z0).",
+    "The same frame with vid 0 is delivered (in6 1, u6n 1, Ip6InReceives 3, Ip6InDiscards 2, no rx_otherhost_dropped): skb_vlan_tag_get_id() == 0 takes the other branch at dev.c:6212 and the tag is cleared.",
+    "@ll on a tagged frame is the tagged layout: 12..13 = 8100, 14..15 = the TCI, 16..17 = 86dd, 18..19 = the first two IPv6 bytes, and 0..11 are the real MACs; @nh is unaffected (hop limit 40, 60000000).",
+    "nft_payload_copy_vlan() (nft_payload.c:44, rebuild at :35-37) is why: for offset+len > 12 it rebuilds struct vlan_ethhdr from skb->vlan_proto, skb_vlan_tag_get() and skb->protocol.",
+    "A store of 0000 into the TCI at the bridge door is accepted and writes no byte of the frame (nft_payload.c:1129 returns before any write); the taps are identical to the control and the frame that was undeliverable is delivered (in6 1, u6n 1).",
+    "@ll,14,4 is refused at evaluation time: the rule's own counter is 0, it logs nothing, and the frame stays exactly as dead as the control.",
+    "@ll,12,2 = 0806 sets skb->vlan_proto only; because veth advertises NETIF_F_HW_VLAN_CTAG_TX (drivers/net/veth.c:1742) validate_xmit_vlan() pushes only non-0x8100 protos into the bytes, and that is the only arm with an 84-byte frame carrying 0806 0064 86dd at 12..17.",
+    "@ll,12,4 = 0000 0000 zeroes proto and TCI at once; skb_vlan_tag_present() is !!skb->vlan_all (include/linux/if_vlan.h:82) and __vlan_hwaccel_put_tag() stores no present bit, so the tag is deleted: the wire is 80 bytes and the frame is delivered.",
+    "A store of 0800 into @ll,16,2 writes the physical inner ethertype and does not change skb->protocol: the local copy stays IPv6 (and stays dead from vid 100) while the wire shows 0800.",
+    "A store into the destination MAC at the bridge door (@ll,0,6) makes the frame an unknown unicast: the local copy disappears (brl 0, no br0 tap) and both ports carry the new MAC.",
+    "With br0.100 up the same frame is delivered and the LL domain is four bytes earlier: 12 = 86dd, 14 = 6000, 16 = 0000, 18 = 001a; the values of the tagged layout (8100 at 12, 86dd at 16) no longer match.",
+    "Mechanism of the shift: vlan_do_receive() finds the device (vlan_core.c:18), VLAN_FLAG_REORDER_HDR is on by default (vlan.c:276) so the re-insertion branch at :41 is skipped, the tag is cleared at :61, and nft_payload_eval() falls back to skb_mac_header() - skb->data (nft_payload.c:184).",
+    "A TCI store at the bridge forward door is evaluated once per port copy (brf 2) and reaches exactly that copy: the far end reads 0000 while the local copy, which never passed that door, keeps vid 100 and stays dead."
+  ],
+  "refuted_predictions": [
+    "P16 (the tag survives as metadata through the VLAN device and @ll,16,2 stays 86dd): measured, the tag is cleared and the domain shifts four bytes earlier -- section 5",
+    "P19 (a 4-byte store at 12 sets a TPID+TCI pair): it sets both, and because presence is vlan_all != 0 with no present bit, the consequence is that the tag is deleted"
+  ],
+  "predictions": {"written": 20, "confirmed": 18, "refuted": 2},
+  "not_measured": [
+    "meta vlan / meta protocol on a tagged frame",
+    "802.1ad (0x88a8) and two tags (VLAN_MAX_DEPTH, dev.c:6217)",
+    "a VLAN device with VLAN_FLAG_REORDER_HDR cleared (vlan_dev.c:57)",
+    "a VLAN device on a port instead of on br0",
+    "a physically tagged 0x8100 frame (this veth pair cannot produce one)",
+    "@th and @nh at the ip6 door of br0.100",
+    "GSO/CHECKSUM_PARTIAL on real hardware",
+    "more than one device in one chain"
+  ],
+  "files": {
+    "summary": "findings/F52-vlan-tag/SUMMARY.md",
+    "verify_report": "findings/F52-vlan-tag/VERIFY_REPORT.md",
+    "letter": "findings/F52-vlan-tag/LETTER_SECTION_F52.txt",
+    "instrument": ["vm/differ574_add.c", "vm/build_f52_differ.sh", "vm/make_initramfs574.sh", "vm/build/differ574"],
+    "tools": ["tools/f52_run.sh", "tools/verify574.py", "tools/verify574_selftest.sh", "tools/f574_mutate.py", "tools/f574_summary.py", "tools/audit_f52_doc.py", "tools/assemble_f52.py"],
+    "predictions": "research/predictions_574.md",
+    "logs": ["logs/f52_rep1.log", "logs/f52_rep2.log"]
+  },
+  "letter_status": "NOT SENT"
+}
